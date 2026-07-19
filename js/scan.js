@@ -1,7 +1,21 @@
-// Skener čárových kódů — používá nativní BarcodeDetector (Safari 17+), s ručním zadáním jako záloha.
+// Skener čárových kódů — knihovna ZXing (funguje i v iOS Safari, kde nativní BarcodeDetector chybí).
 'use strict';
 (function () {
-  let stream = null, raf = null, detector = null, active = false;
+  let controls = null, reader = null, running = false, lastCode = '', lastAt = 0;
+
+  function makeReader() {
+    if (reader) return reader;
+    const Z = window.ZXing;
+    const hints = new Map();
+    hints.set(Z.DecodeHintType.POSSIBLE_FORMATS, [
+      Z.BarcodeFormat.EAN_13, Z.BarcodeFormat.EAN_8,
+      Z.BarcodeFormat.UPC_A, Z.BarcodeFormat.UPC_E,
+    ]);
+    reader = new Z.BrowserMultiFormatReader(hints, { delayBetweenScanAttempts: 200 });
+    return reader;
+  }
+
+  function setStatus(t) { const el = document.getElementById('scan-status'); if (el) el.textContent = t; }
 
   async function lookupEan(ean) {
     setStatus('Hledám ' + ean + '…');
@@ -11,69 +25,58 @@
       window.KAL.closeSheet('sheet-scan');
       window.KAL.openFoodDetail(res.food, { meal: window.KAL.getMeal() });
     } else if (res.notFound) {
-      setStatus('Produkt ' + ean + ' není v databázi. Zkuste jiný, nebo přidejte ručně přes ⚡ rychlý zápis.');
-      active = true; loop();
+      setStatus('Produkt ' + ean + ' není v databázi Open Food Facts. Zadejte ho přes ⚡ rychlý zápis, nebo naskenujte jiný.');
+      running = true; // pokračuj ve skenování dalšího
     } else {
-      setStatus('Chyba připojení. Zkontrolujte internet.');
-      active = true; loop();
+      setStatus('Chyba připojení k internetu. Zkuste to znovu.');
+      running = true;
     }
   }
 
-  function setStatus(t) { const el = document.getElementById('scan-status'); if (el) el.textContent = t; }
+  function onResult(result) {
+    if (!result || !running) return;
+    const code = result.getText().trim();
+    const now = Date.now();
+    if (code === lastCode && now - lastAt < 4000) return; // stejný kód nedávno → přeskoč
+    lastCode = code; lastAt = now;
+    running = false;
+    navigator.vibrate?.(60);
+    lookupEan(code);
+  }
 
   async function start() {
     const video = document.getElementById('scan-video');
-    if (!('BarcodeDetector' in window)) {
-      setStatus('Tento telefon neumí skenovat v prohlížeči. Zadejte kód ručně níže — najdete ho pod čárovým kódem na obalu.');
-      return;
+    if (!window.ZXing) { setStatus('Skener se nenačetl. Obnovte stránku a zkuste to znovu.'); return; }
+    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+      setStatus('Kamera není v tomto prohlížeči dostupná. Zadejte kód ručně níže.'); return;
     }
+    setStatus('Spouštím kameru…');
+    lastCode = ''; running = true;
     try {
-      detector = new BarcodeDetector({ formats: ['ean_13', 'ean_8', 'upc_a', 'upc_e'] });
-    } catch {
-      setStatus('Skener není dostupný. Zadejte kód ručně níže.');
-      return;
-    }
-    try {
-      stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'environment' } });
-      video.srcObject = stream;
-      await video.play();
+      const r = makeReader();
+      controls = await r.decodeFromConstraints(
+        { video: { facingMode: { ideal: 'environment' } } },
+        video,
+        (result) => onResult(result)
+      );
       setStatus('Namiřte na čárový kód výrobku.');
-      active = true;
-      loop();
     } catch (e) {
-      setStatus(e.name === 'NotAllowedError'
-        ? 'Přístup ke kameře byl odmítnut. Povolte kameru v nastavení Safari, nebo zadejte kód ručně.'
+      running = false;
+      setStatus(e && e.name === 'NotAllowedError'
+        ? 'Přístup ke kameře byl odmítnut. Povolte kameru v nastavení telefonu, nebo zadejte kód ručně.'
         : 'Kameru se nepodařilo spustit. Zadejte kód ručně níže.');
     }
   }
 
-  function loop() {
-    const video = document.getElementById('scan-video');
-    if (!active || !detector || !video) return;
-    raf = requestAnimationFrame(async () => {
-      try {
-        const codes = await detector.detect(video);
-        if (codes.length && codes[0].rawValue) {
-          active = false;
-          navigator.vibrate?.(60);
-          await lookupEan(codes[0].rawValue.trim());
-          return;
-        }
-      } catch { /* přeskočit snímek */ }
-      loop();
-    });
-  }
-
   function stop() {
-    active = false;
-    if (raf) cancelAnimationFrame(raf);
-    if (stream) { stream.getTracks().forEach(t => t.stop()); stream = null; }
+    running = false;
+    try { if (controls) controls.stop(); } catch (e) { /* ignore */ }
+    controls = null;
     const v = document.getElementById('scan-video'); if (v) v.srcObject = null;
   }
 
   document.getElementById('scan-btn').addEventListener('click', () => {
     window.KAL.openSheet('sheet-scan');
-    setStatus('Spouštím kameru…');
     start();
   });
   document.querySelector('#sheet-scan .sheet-close').addEventListener('click', stop);
@@ -81,7 +84,7 @@
   document.getElementById('ean-submit').addEventListener('click', () => {
     const ean = document.getElementById('ean-input').value.trim();
     if (ean.length < 6) { window.KAL.toast('Zadejte platný kód'); return; }
-    active = false;
+    running = false;
     lookupEan(ean);
   });
 })();

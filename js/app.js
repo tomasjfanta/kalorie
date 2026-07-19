@@ -35,6 +35,7 @@ let custom = store.get('kal.custom', []);
 let products = store.get('kal.products', []);
 let favs = store.get('kal.favs', []);
 let recent = store.get('kal.recent', []);
+let aiCfg = store.get('kal.ai', { key: '', model: 'claude-sonnet-5' });
 let viewDate = todayStr();
 
 const saveAll = () => { store.set('kal.days', days); store.set('kal.custom', custom); store.set('kal.products', products); store.set('kal.favs', favs); store.set('kal.recent', recent); };
@@ -215,7 +216,12 @@ function runSearch() {
     offTimer = setTimeout(async () => {
       const res = await offSearch(q);
       if (seq !== offSeq) return;
-      if (res === null) { box.innerHTML = '<div class="result-note">Nepodařilo se připojit. Zkontrolujte internet a zkuste to znovu.</div>'; return; }
+      if (res === null) {
+        box.innerHTML = navigator.onLine
+          ? '<div class="result-note">Databáze právě neodpovídá (nebo je přetížená). Zkuste to za chvíli znovu, nebo použijte čárový kód či rychlý zápis.</div>'
+          : '<div class="result-note">Nejste připojeni k internetu. Vyhledávání na internetu vyžaduje připojení — offline funguje vestavěná databáze.</div>';
+        return;
+      }
       box.innerHTML = res.length ? res.map(resultRow).join('') : '<div class="result-note">Nic nenalezeno. Zkuste jiný název nebo čárový kód.</div>';
       bindResults(box, res);
     }, 450);
@@ -265,11 +271,16 @@ const sleep = ms => new Promise(r => setTimeout(r, ms));
 async function fetchJson(url, tries = 2) {
   for (let i = 0; i < tries; i++) {
     try {
-      const r = await fetch(url);
+      const ctrl = new AbortController();
+      const timer = setTimeout(() => ctrl.abort(), 8000);
+      let r;
+      try { r = await fetch(url, { signal: ctrl.signal }); } finally { clearTimeout(timer); }
       if (!r.ok) throw new Error('http ' + r.status);
+      const ct = r.headers.get('content-type') || '';
+      if (!ct.includes('json')) throw new Error('not-json'); // Cloudflare výzva / HTML místo dat
       return await r.json();
     } catch (e) {
-      if (i < tries - 1) { await sleep(500); continue; }
+      if (i < tries - 1) { await sleep(700); continue; }
       return null;
     }
   }
@@ -291,42 +302,83 @@ async function offProduct(ean) {
 }
 
 /* ═══ Detail potraviny / úprava záznamu ═══ */
-let detail = null; // { food, meal, grams, editId }
+let detail = null; // { food, meal, mode:'unit'|'gram', portIdx, editId, ports }
+
+// Kolik gramů/ml aktuálně zvoleno (podle režimu).
+function detailGrams() {
+  if (!detail) return 0;
+  if (detail.mode === 'gram') return numEl('#food-grams');
+  const p = detail.ports[detail.portIdx];
+  return (p ? p[1] : 100) * (numEl('#food-count') || 0);
+}
 
 function openFoodDetail(food, opts = {}) {
-  detail = { food, meal: opts.meal || mealByHour(), grams: opts.grams || food.port?.[0]?.[1] || 100, editId: opts.editId || null };
+  const ports = [...(food.port || [])];
+  if (!ports.some(p => p[1] === 100)) ports.push(['100 ' + (food.u || 'g'), 100]);
+  const hasRealPort = !!(food.port && food.port.length);
+
+  let mode = hasRealPort ? 'unit' : 'gram', portIdx = 0, count = 1, gramVal = food.port?.[0]?.[1] || 100;
+  if (opts.grams) {  // úprava existujícího záznamu — zkus zrekonstruovat porci
+    gramVal = opts.grams;
+    const exact = ports.findIndex(p => Math.abs(p[1] - opts.grams) < 0.5 && p[1] !== 100);
+    let mult = -1;
+    if (exact < 0 && hasRealPort) {
+      mult = ports.findIndex(p => p[1] !== 100 && opts.grams / p[1] >= 1 &&
+        Math.abs(opts.grams / p[1] - Math.round(opts.grams / p[1])) < 0.02);
+    }
+    if (exact >= 0) { mode = 'unit'; portIdx = exact; count = 1; }
+    else if (mult >= 0) { mode = 'unit'; portIdx = mult; count = Math.round(opts.grams / ports[mult][1]); }
+    else { mode = 'gram'; }
+  }
+
+  detail = { food, meal: opts.meal || mealByHour(), mode, portIdx, editId: opts.editId || null, ports };
   $('#food-name').textContent = food.n;
   $('#food-sub').textContent = [food.brand, r0(food.k) + ' kcal · B ' + dec(r1(food.b)) + ' · S ' + dec(r1(food.s)) + ' · T ' + dec(r1(food.t)) + ' g (na 100 ' + (food.u || 'g') + ')'].filter(Boolean).join(' · ');
   $('#food-unit').textContent = food.u || 'g';
-  $('#food-grams').value = detail.grams;
+  $('#food-grams').value = dec(r1(gramVal));
+  $('#food-count').value = count;
   $('#food-delete').classList.toggle('hidden', !detail.editId);
   $('#food-submit').textContent = detail.editId ? 'Uložit změny' : 'Přidat';
-  const favable = food.src !== 'db' ? favs.includes(food.id) : favs.includes(food.id);
   $('#food-fav').textContent = favs.includes(food.id) ? '★' : '☆';
-  // Porce
-  const ports = [...(food.port || [])];
-  if (!ports.some(p => p[1] === 100)) ports.push(['100 ' + (food.u || 'g'), 100]);
-  $('#food-portions').innerHTML = ports.map(p => `<button class="chip ${p[1] === detail.grams ? 'on' : ''}" data-g="${p[1]}">${esc(p[0])}</button>`).join('');
+
+  $('#food-portions').innerHTML = ports.map((p, i) => `<button class="chip ${i === detail.portIdx ? 'on' : ''}" data-i="${i}">${esc(p[0])}</button>`).join('');
   $$('#food-portions .chip').forEach(c => c.addEventListener('click', () => {
-    detail.grams = +c.dataset.g; $('#food-grams').value = detail.grams;
+    detail.portIdx = +c.dataset.i;
     $$('#food-portions .chip').forEach(x => x.classList.toggle('on', x === c));
     previewFood();
   }));
   setMealSeg('#meal-seg', detail.meal);
-  previewFood();
+  setAmountMode(detail.mode);
   openSheet('sheet-food');
 }
+
+function setAmountMode(mode) {
+  detail.mode = mode;
+  $$('#amount-mode button').forEach(b => b.classList.toggle('on', b.dataset.mode === mode));
+  $('#unit-area').classList.toggle('hidden', mode !== 'unit');
+  $('#gram-area').classList.toggle('hidden', mode !== 'gram');
+  previewFood();
+}
+
 function previewFood() {
-  const g = numEl('#food-grams');
   const f = detail.food;
+  const g = detailGrams();
+  if (detail.mode === 'unit') {
+    const p = detail.ports[detail.portIdx];
+    $('#count-port').textContent = p ? p[0] : '';
+    $('#food-total-note').textContent = 'Celkem ' + dec(r1(g)) + ' ' + (f.u || 'g');
+  } else {
+    $('#food-total-note').textContent = '';
+  }
   $('#food-kcal-preview').textContent = r0(g * f.k / 100) + ' kcal';
   $('#food-macro-preview').textContent = 'B ' + dec(r1(g * f.b / 100)) + ' g · S ' + dec(r1(g * f.s / 100)) + ' g · T ' + dec(r1(g * f.t / 100)) + ' g';
 }
-$('#food-grams').addEventListener('input', () => {
-  detail.grams = numEl('#food-grams');
-  $$('#food-portions .chip').forEach(x => x.classList.toggle('on', +x.dataset.g === detail.grams));
-  previewFood();
-});
+
+$$('#amount-mode button').forEach(b => b.addEventListener('click', () => setAmountMode(b.dataset.mode)));
+$('#food-grams').addEventListener('input', previewFood);
+$('#food-count').addEventListener('input', previewFood);
+$('#count-minus').addEventListener('click', () => { $('#food-count').value = Math.max(1, Math.round((numEl('#food-count') || 1)) - 1); previewFood(); });
+$('#count-plus').addEventListener('click', () => { $('#food-count').value = Math.max(1, Math.round((numEl('#food-count') || 0)) + 1); previewFood(); });
 function setMealSeg(sel, meal) {
   $$(sel + ' button').forEach(b => b.classList.toggle('on', b.dataset.meal === meal));
 }
@@ -342,7 +394,7 @@ $('#food-fav').addEventListener('click', () => {
 
 $('#food-submit').addEventListener('click', () => {
   const f = detail.food;
-  const g = numEl('#food-grams');
+  const g = detailGrams();
   if (!g || g <= 0) { toast('Zadejte množství'); return; }
   if (detail.editId) {
     const e = day().e.find(x => x.id === detail.editId);
@@ -514,6 +566,9 @@ function fillSettings() {
   $('#set-kcal').value = settings.kcal || '';
   $('#set-prot').value = settings.prot || '';
   $('#set-water').value = settings.water || 2000;
+  $('#set-ai-key').value = aiCfg.key || '';
+  $('#set-ai-model').value = aiCfg.model || 'claude-sonnet-5';
+  $('#ai-key-note').textContent = aiCfg.key ? '✓ Klíč uložen — AI odhady jsou připravené.' : 'Bez klíče AI odhady nefungují.';
   renderCustomList();
 }
 $('#save-settings').addEventListener('click', () => {
@@ -522,6 +577,12 @@ $('#save-settings').addEventListener('click', () => {
   settings.water = +$('#set-water').value || 2000;
   store.set('kal.settings', settings);
   renderDnes(); toast('Nastavení uloženo'); showView('dnes');
+});
+$('#save-ai').addEventListener('click', () => {
+  aiCfg = { key: $('#set-ai-key').value.trim(), model: $('#set-ai-model').value };
+  store.set('kal.ai', aiCfg);
+  $('#ai-key-note').textContent = aiCfg.key ? '✓ Klíč uložen — AI odhady jsou připravené.' : 'Bez klíče AI odhady nefungují.';
+  toast('Uloženo');
 });
 
 /* Kalkulačka (Mifflin-St Jeor) */
@@ -574,12 +635,17 @@ $('#import-file').addEventListener('change', async e => {
 });
 $('#wipe-btn').addEventListener('click', () => {
   if (!confirm('Opravdu smazat úplně všechna data (deník, váhu, nastavení)? Tohle nejde vrátit.')) return;
-  ['kal.settings', 'kal.days', 'kal.custom', 'kal.products', 'kal.favs', 'kal.recent'].forEach(k => localStorage.removeItem(k));
+  ['kal.settings', 'kal.days', 'kal.custom', 'kal.products', 'kal.favs', 'kal.recent', 'kal.ai'].forEach(k => localStorage.removeItem(k));
   location.reload();
 });
 
-/* ═══ Export pro scan.js ═══ */
-window.KAL = { offProduct, openFoodDetail, openSheet, closeSheet, toast, getMeal: () => searchMeal };
+/* ═══ Export pro scan.js a ai.js ═══ */
+window.KAL = {
+  offProduct, openFoodDetail, openSheet, closeSheet, toast,
+  getMeal: () => searchMeal,
+  aiConfig: () => aiCfg,
+  openQuick,          // prefill rychlého zápisu z AI výsledku
+};
 
 /* ═══ Start ═══ */
 renderDnes();
