@@ -35,9 +35,11 @@ let custom = store.get('kal.custom', []);
 let products = store.get('kal.products', []);
 let favs = store.get('kal.favs', []);
 let recent = store.get('kal.recent', []);
-let aiCfg = store.get('kal.ai', { key: '', model: 'gemini-2.5-flash' });
+let aiCfg = store.get('kal.ai', { key: '', model: 'gemini-3.5-flash' });
 // Migrace ze starší verze, která používala Anthropic — klíč i model se liší.
-if (!aiCfg.model || aiCfg.model.startsWith('claude')) aiCfg = { key: '', model: 'gemini-2.5-flash' };
+if (!aiCfg.model || aiCfg.model.startsWith('claude')) aiCfg = { key: '', model: 'gemini-3.5-flash' };
+// Migrace: řada 2.5 už není pro nové bezplatné klíče dostupná.
+if (aiCfg.model.startsWith('gemini-2.5')) { aiCfg.model = 'gemini-3.5-flash'; store.set('kal.ai', aiCfg); }
 let viewDate = todayStr();
 
 const saveAll = () => { store.set('kal.days', days); store.set('kal.custom', custom); store.set('kal.products', products); store.set('kal.favs', favs); store.set('kal.recent', recent); };
@@ -672,7 +674,13 @@ function fillSettings() {
   $('#set-prot').value = settings.prot || '';
   $('#set-water').value = settings.water || 2000;
   $('#set-ai-key').value = aiCfg.key || '';
-  $('#set-ai-model').value = aiCfg.model || 'gemini-2.5-flash';
+  const modelSel = $('#set-ai-model');
+  if (![...modelSel.options].some(o => o.value === aiCfg.model)) {
+    // model zvolený automatickou zálohou nemusí být v nabídce — přidej ho
+    const o = document.createElement('option'); o.value = aiCfg.model; o.textContent = aiCfg.model + ' (automaticky)';
+    modelSel.appendChild(o);
+  }
+  modelSel.value = aiCfg.model || 'gemini-3.5-flash';
   $('#ai-key-note').textContent = aiCfg.key ? '✓ Klíč uložen — AI odhady jsou připravené.' : 'Bez klíče AI odhady nefungují.';
   renderCustomList();
 }
@@ -749,6 +757,7 @@ window.KAL = {
   offProduct, openFoodDetail, openSheet, closeSheet, toast,
   getMeal: () => searchMeal,
   aiConfig: () => aiCfg,
+  setAiModel: m => { aiCfg.model = m; store.set('kal.ai', aiCfg); },  // zapamatuje funkční model ze zálohy
   openQuick,          // prefill rychlého zápisu z AI výsledku
 };
 

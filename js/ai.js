@@ -14,10 +14,43 @@
     + 'uvedené, odhadni obvyklou porci a napiš odhad do pole "mnozstvi". Vycházej z běžných nutričních '
     + 'tabulek pro české potraviny.';
 
+  // Modely k vyzkoušení v pořadí — Google občas starší modely pro bezplatné klíče vypne,
+  // proto se při chybě „model není dostupný" zkusí automaticky další a ten, co funguje,
+  // se zapamatuje.
+  const MODEL_CHAIN = [
+    'gemini-3.5-flash',
+    'gemini-3.1-flash-lite',
+    'gemini-3-flash-preview',
+    'gemini-2.5-flash',
+    'gemini-2.5-flash-lite',
+  ];
+  const modelUnavailable = (status, msg) =>
+    (status === 404) || /no longer available|not available for free|not supported|not found/i.test(msg || '');
+
+  async function callModel(model, key, body) {
+    let r;
+    try {
+      r = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${encodeURIComponent(key)}`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify(body),
+      });
+    } catch (e) { return { error: 'network' }; }
+    if (!r.ok) {
+      let msg = '';
+      try { msg = (await r.json()).error?.message || ''; } catch (e) { /* ignore */ }
+      if (r.status === 400 && /api key/i.test(msg)) return { error: 'auth' };
+      if (r.status === 403) return { error: 'auth' };
+      if (modelUnavailable(r.status, msg)) return { error: 'model', status: r.status, msg };
+      if (r.status === 429) return { error: 'quota' };
+      return { error: 'api', status: r.status, msg };
+    }
+    return { response: await r.json() };
+  }
+
   async function callGemini({ text, imageBase64, imageMedia }) {
     const c = cfg();
     if (!c.key) return { error: 'nokey' };
-    const model = c.model || 'gemini-2.5-flash';
     const parts = [];
     if (imageBase64) parts.push({ inline_data: { mime_type: imageMedia, data: imageBase64 } });
     parts.push({ text: text || 'Odhadni kalorie a makra tohoto jídla z fotky.' });
@@ -27,25 +60,20 @@
       generationConfig: { responseMimeType: 'application/json', temperature: 0.2, maxOutputTokens: 1024 },
     };
 
-    let r;
-    try {
-      r = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${encodeURIComponent(c.key)}`, {
-        method: 'POST',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify(body),
-      });
-    } catch (e) { return { error: 'network' }; }
-
-    if (!r.ok) {
-      let msg = '';
-      try { msg = (await r.json()).error?.message || ''; } catch (e) { /* ignore */ }
-      if (r.status === 400 && /api key/i.test(msg)) return { error: 'auth' };
-      if (r.status === 403) return { error: 'auth' };
-      if (r.status === 429) return { error: 'quota' };
-      return { error: 'api', status: r.status, msg };
+    // Zvolený model první, pak zbytek řetězce jako záloha.
+    const chain = [c.model, ...MODEL_CHAIN.filter(m => m !== c.model)].filter(Boolean);
+    let out = null;
+    for (const model of chain) {
+      out = await callModel(model, c.key, body);
+      if (out.response) {
+        if (model !== c.model) window.KAL.setAiModel(model); // zapamatuj funkční model
+        break;
+      }
+      if (out.error !== 'model') break; // jiná chyba než „model nedostupný" → nezkoušet dál
     }
-    const data = await r.json();
-    const txt = (data.candidates?.[0]?.content?.parts || []).map(p => p.text || '').join('');
+    if (!out.response) return out;
+
+    const txt = (out.response.candidates?.[0]?.content?.parts || []).map(p => p.text || '').join('');
     const a = txt.indexOf('{'), b = txt.lastIndexOf('}');
     if (a < 0 || b < 0) return { error: 'parse' };
     try { return { result: JSON.parse(txt.slice(a, b + 1)) }; } catch (e) { return { error: 'parse' }; }
@@ -68,6 +96,7 @@
       case 'nokey': return 'Nejdřív vložte bezplatný Google API klíč v Nastavení → AI odhady.';
       case 'auth': return 'API klíč je neplatný. Zkontrolujte ho v Nastavení → AI odhady.';
       case 'quota': return 'Bezplatný limit je teď vyčerpaný (příliš požadavků). Zkuste to za minutu, případně zítra.';
+      case 'model': return 'Žádný z AI modelů teď není pro bezplatný klíč dostupný. Zkuste to později.';
       case 'network': return 'Nepodařilo se spojit s Google. Zkontrolujte připojení k internetu.';
       case 'parse': return 'Odpověď se nepodařilo přečíst. Zkuste to prosím znovu.';
       default: return 'Něco se nepovedlo (' + (e.status || '?') + '). ' + (e.msg || 'Zkuste to znovu.');
