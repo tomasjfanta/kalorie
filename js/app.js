@@ -59,6 +59,15 @@ function weightForCalc() {
   const withKg = Object.keys(days).filter(d => days[d].kg).sort();
   return withKg.length ? days[withKg[withKg.length - 1]].kg : null;
 }
+// Denní výdej (TDEE, Mifflin-St Jeor) z uložených údajů; váha vždy z posledního vážení.
+function tdeeNow() {
+  const p = settings.profile;
+  if (!p) return null;
+  const w = weightForCalc() || p.w;
+  if (!w || !p.h || !p.age) return null;
+  const bmr = 10 * w + 6.25 * p.h - 5 * p.age + (p.sex === 'm' ? 5 : -161);
+  return bmr * (p.act || 1.375);
+}
 
 /* ═══ Toast ═══ */
 let toastT;
@@ -81,6 +90,7 @@ function showView(name) {
   $('#bar-dnes').classList.toggle('hidden', !isDnes);
   $('#bar-title').classList.toggle('hidden', isDnes);
   $('#bar-title').textContent = { historie: 'Historie', vaha: 'Váha', nastaveni: 'Nastavení' }[name] || '';
+  if (name === 'dnes') renderDnes();
   if (name === 'historie') renderHistory();
   if (name === 'vaha') renderWeight();
   if (name === 'nastaveni') fillSettings();
@@ -123,6 +133,9 @@ function renderDnes() {
   $('#stat-eaten').textContent = r0(t.k);
   $('#stat-goal').textContent = goal ? goal : '–';
   $('#stat-burn').textContent = burn ? '+' + r0(burn) : '0';
+  const tdee = tdeeNow();
+  $('#stat-tdee').textContent = tdee ? r0(tdee) : '–';
+  $('#stat-tdee').parentElement.title = tdee ? 'Odhadovaný denní výdej podle vašich údajů a aktuální váhy' : 'Vyplňte údaje v Nastavení → Spočítat doporučený příjem';
 
   // Makra
   const m = $('#macros');
@@ -701,17 +714,35 @@ $('#save-ai').addEventListener('click', () => {
 /* Kalkulačka (Mifflin-St Jeor) */
 let calcSex = 'f';
 $$('#calc-sex button').forEach(b => b.addEventListener('click', () => { calcSex = b.dataset.sex; $$('#calc-sex button').forEach(x => x.classList.toggle('on', x === b)); }));
-$('#open-calc').addEventListener('click', () => { $('#calc-result').classList.add('hidden'); openSheet('sheet-calc'); });
+$('#open-calc').addEventListener('click', () => {
+  $('#calc-result').classList.add('hidden');
+  // Předvyplnit z uložených údajů; váhu z posledního vážení, když je novější.
+  const p = settings.profile;
+  if (p) {
+    calcSex = p.sex || 'f';
+    $$('#calc-sex button').forEach(x => x.classList.toggle('on', x.dataset.sex === calcSex));
+    $('#calc-age').value = p.age || '';
+    $('#calc-h').value = p.h || '';
+    $('#calc-act').value = String(p.act || 1.375);
+  }
+  const w = weightForCalc() || p?.w;
+  if (w) $('#calc-w').value = dec(w);
+  openSheet('sheet-calc');
+});
 $('#calc-run').addEventListener('click', () => {
   const age = numEl('#calc-age'), h = numEl('#calc-h'), w = numEl('#calc-w');
   if (!age || !h || !w) { toast('Vyplňte věk, výšku a váhu'); return; }
+  // Údaje si zapamatovat — na Dnes se z nich počítá denní výdej.
+  settings.profile = { sex: calcSex, age, h, w, act: +$('#calc-act').value };
+  store.set('kal.settings', settings);
   const bmr = 10 * w + 6.25 * h - 5 * age + (calcSex === 'm' ? 5 : -161);
   const tdee = bmr * +$('#calc-act').value;
   const target = Math.max(1200, Math.round((tdee + +$('#calc-goal').value) / 10) * 10);
   const prot = Math.round(w * 1.6);
   const el = $('#calc-result');
   el.classList.remove('hidden');
-  el.innerHTML = `Váš odhadovaný denní výdej je <b>${r0(tdee)} kcal</b>.<br>Pro zvolený cíl doporučujeme <b>${target} kcal</b> a asi <b>${prot} g bílkovin</b> denně.<br><button id="calc-apply" class="btn" style="margin-top:10px">Použít jako můj cíl</button>`;
+  el.innerHTML = `Váš odhadovaný denní výdej je <b>${r0(tdee)} kcal</b> — teď ho uvidíte i na hlavní obrazovce (přepočítává se podle poslední váhy).<br>Pro zvolený cíl doporučujeme <b>${target} kcal</b> a asi <b>${prot} g bílkovin</b> denně.<br><button id="calc-apply" class="btn" style="margin-top:10px">Použít jako můj cíl</button>`;
+  renderDnes();
   $('#calc-apply').addEventListener('click', () => {
     settings.kcal = target; settings.prot = prot;
     store.set('kal.settings', settings);

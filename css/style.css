@@ -94,7 +94,7 @@ main { max-width: 520px; margin: 0 auto; padding: 4px 14px 24px; }
 .ring-num { font-size: 38px; font-weight: 750; letter-spacing: -1px; }
 .ring-num.over { color: var(--red); }
 .ring-sub { font-size: 13px; color: var(--muted); }
-.ring-row { display: flex; gap: 40px; margin: 14px 0 4px; }
+.ring-row { display: flex; gap: 24px; margin: 14px 0 4px; }
 .ring-stat { text-align: center; }
 .ring-stat span { font-size: 17px; font-weight: 650; display: block; }
 .ring-stat small { color: var(--muted); font-size: 12px; }
