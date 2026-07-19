@@ -1,0 +1,327 @@
+<!DOCTYPE html>
+<html lang="cs">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <title>Kalorie</title>
+  <meta name="description" content="Jednoduché počítání kalorií — deník jídel, makra, váha a pitný režim.">
+  <meta name="theme-color" content="#f5f6f8" media="(prefers-color-scheme: light)">
+  <meta name="theme-color" content="#101214" media="(prefers-color-scheme: dark)">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="default">
+  <meta name="apple-mobile-web-app-title" content="Kalorie">
+  <link rel="manifest" href="manifest.webmanifest">
+  <link rel="apple-touch-icon" href="icons/apple-touch-icon.png">
+  <link rel="icon" type="image/png" sizes="192x192" href="icons/icon-192.png">
+  <link rel="stylesheet" href="css/style.css">
+</head>
+<body>
+
+<header class="appbar">
+  <div id="bar-dnes" class="bar-date">
+    <button id="date-prev" class="icon-btn" aria-label="Předchozí den">‹</button>
+    <button id="date-label" class="date-label">Dnes</button>
+    <button id="date-next" class="icon-btn" aria-label="Další den">›</button>
+  </div>
+  <div id="bar-title" class="bar-title hidden"></div>
+</header>
+
+<main>
+  <!-- ═══ DNES ═══ -->
+  <section id="view-dnes" class="view active">
+    <div class="card ring-card">
+      <div class="ring-wrap">
+        <svg id="ring" viewBox="0 0 120 120" width="170" height="170" aria-hidden="true">
+          <circle class="ring-track" cx="60" cy="60" r="52"></circle>
+          <circle id="ring-fill" class="ring-fill" cx="60" cy="60" r="52"></circle>
+        </svg>
+        <div class="ring-center">
+          <div id="ring-num" class="ring-num">–</div>
+          <div id="ring-sub" class="ring-sub">kcal zbývá</div>
+        </div>
+      </div>
+      <div class="ring-row">
+        <div class="ring-stat"><span id="stat-eaten">0</span><small>snědeno</small></div>
+        <div class="ring-stat"><span id="stat-goal">–</span><small>cíl</small></div>
+      </div>
+      <div id="macros" class="macros"></div>
+    </div>
+
+    <div id="goal-hint" class="card hint hidden">
+      👋 Nejdřív si nastavte denní cíl kalorií v <button class="linklike" data-goto="nastaveni">Nastavení</button>.
+    </div>
+
+    <div class="card water-card">
+      <div class="row-between">
+        <div class="card-title">💧 Pití</div>
+        <div id="water-total" class="muted">0 ml</div>
+      </div>
+      <div id="water-row" class="water-row"></div>
+    </div>
+
+    <div id="meals"></div>
+  </section>
+
+  <!-- ═══ HISTORIE ═══ -->
+  <section id="view-historie" class="view">
+    <div class="card">
+      <div class="card-title">Posledních 7 dní</div>
+      <div id="week-chart" class="week-chart"></div>
+      <div id="week-avg" class="muted center"></div>
+    </div>
+    <div class="card">
+      <div class="card-title">Dny</div>
+      <div id="day-list"></div>
+    </div>
+  </section>
+
+  <!-- ═══ VÁHA ═══ -->
+  <section id="view-vaha" class="view">
+    <div class="card">
+      <div class="card-title">Dnešní vážení</div>
+      <div class="weight-input-row">
+        <input id="weight-input" type="text" inputmode="decimal" placeholder="např. 68,5">
+        <span class="unit">kg</span>
+        <button id="weight-save" class="btn">Uložit</button>
+      </div>
+      <div id="weight-today-note" class="muted"></div>
+    </div>
+    <div class="card">
+      <div class="row-between">
+        <div class="card-title">Vývoj váhy</div>
+        <div id="weight-range" class="seg small">
+          <button data-days="30" class="on">30 dní</button>
+          <button data-days="90">90 dní</button>
+        </div>
+      </div>
+      <div id="weight-chart" class="weight-chart"><div class="muted center pad">Zatím žádná vážení.</div></div>
+      <div id="weight-stats" class="stat-row"></div>
+    </div>
+  </section>
+
+  <!-- ═══ NASTAVENÍ ═══ -->
+  <section id="view-nastaveni" class="view">
+    <div class="card">
+      <div class="card-title">Denní cíle</div>
+      <label class="field">Kalorie (kcal)
+        <input id="set-kcal" type="number" inputmode="numeric" min="800" max="6000" placeholder="např. 1800">
+      </label>
+      <label class="field">Bílkoviny (g) <span class="muted">— nepovinné</span>
+        <input id="set-prot" type="number" inputmode="numeric" min="0" max="400" placeholder="např. 90">
+      </label>
+      <label class="field">Pití (ml)
+        <input id="set-water" type="number" inputmode="numeric" min="500" max="6000" step="250" placeholder="2000">
+      </label>
+      <button id="open-calc" class="btn btn-ghost">🧮 Spočítat doporučený příjem</button>
+      <button id="save-settings" class="btn">Uložit nastavení</button>
+    </div>
+
+    <div class="card">
+      <div class="card-title">Záloha dat</div>
+      <p class="muted">Deník je uložený jen v tomto telefonu. Občas si udělejte zálohu — hlavně před výměnou telefonu.</p>
+      <div class="btn-row">
+        <button id="export-btn" class="btn btn-ghost">⬇️ Exportovat zálohu</button>
+        <button id="import-btn" class="btn btn-ghost">⬆️ Obnovit ze zálohy</button>
+      </div>
+      <input id="import-file" type="file" accept="application/json,.json" class="hidden">
+    </div>
+
+    <div class="card">
+      <div class="card-title">Moje potraviny</div>
+      <div id="custom-list" class="muted">Zatím žádné vlastní potraviny.</div>
+      <button id="add-custom" class="btn btn-ghost">＋ Přidat vlastní potravinu</button>
+    </div>
+
+    <div class="card">
+      <div class="card-title">O aplikaci</div>
+      <p class="muted">Kalorie v0.9 · data zůstávají ve vašem telefonu · hodnoty potravin na 100 g dle běžných nutričních tabulek, produkty z <a href="https://cz.openfoodfacts.org" target="_blank" rel="noopener">Open Food Facts</a>.</p>
+      <button id="wipe-btn" class="btn btn-danger-ghost">Smazat všechna data…</button>
+    </div>
+  </section>
+</main>
+
+<!-- ═══ TABBAR ═══ -->
+<nav class="tabbar">
+  <button data-view="dnes" class="tab on"><span class="t-ico">◎</span>Dnes</button>
+  <button data-view="historie" class="tab"><span class="t-ico">▤</span>Historie</button>
+  <button data-view="vaha" class="tab"><span class="t-ico">⚖︎</span>Váha</button>
+  <button data-view="nastaveni" class="tab"><span class="t-ico">⚙︎</span>Nastavení</button>
+</nav>
+
+<!-- ═══ SHEET: hledání jídla ═══ -->
+<div id="sheet-add" class="sheet hidden">
+  <div class="sheet-panel tall">
+    <div class="sheet-head">
+      <input id="search-input" type="search" placeholder="Hledat jídlo…" autocomplete="off">
+      <button class="icon-btn sheet-close" data-close="sheet-add" aria-label="Zavřít">✕</button>
+    </div>
+    <div class="seg" id="search-tabs">
+      <button data-tab="vse" class="on">Databáze</button>
+      <button data-tab="off">Internet</button>
+      <button data-tab="vlastni">Moje</button>
+    </div>
+    <div class="btn-row">
+      <button id="scan-btn" class="btn btn-ghost slim">📷 Čárový kód</button>
+      <button id="quick-btn" class="btn btn-ghost slim">⚡ Rychlý zápis</button>
+    </div>
+    <div id="search-results" class="sheet-body"></div>
+  </div>
+</div>
+
+<!-- ═══ SHEET: detail potraviny / úprava záznamu ═══ -->
+<div id="sheet-food" class="sheet hidden">
+  <div class="sheet-panel">
+    <div class="sheet-head">
+      <div>
+        <div id="food-name" class="sheet-title"></div>
+        <div id="food-sub" class="muted small-text"></div>
+      </div>
+      <button id="food-fav" class="icon-btn fav" aria-label="Oblíbené">☆</button>
+      <button class="icon-btn sheet-close" data-close="sheet-food" aria-label="Zavřít">✕</button>
+    </div>
+    <div id="food-portions" class="chips"></div>
+    <div class="amount-row">
+      <input id="food-grams" type="text" inputmode="decimal" value="100">
+      <span id="food-unit" class="unit">g</span>
+      <div id="food-kcal-preview" class="kcal-preview">0 kcal</div>
+    </div>
+    <div id="food-macro-preview" class="muted small-text"></div>
+    <div class="card-title" style="margin-top:14px">Jídlo dne</div>
+    <div class="seg" id="meal-seg">
+      <button data-meal="sn">Snídaně</button>
+      <button data-meal="ob">Oběd</button>
+      <button data-meal="ve">Večeře</button>
+      <button data-meal="sv">Svačiny</button>
+    </div>
+    <div class="btn-row">
+      <button id="food-delete" class="btn btn-danger-ghost hidden">Smazat</button>
+      <button id="food-submit" class="btn grow">Přidat</button>
+    </div>
+  </div>
+</div>
+
+<!-- ═══ SHEET: rychlý zápis ═══ -->
+<div id="sheet-quick" class="sheet hidden">
+  <div class="sheet-panel">
+    <div class="sheet-head">
+      <div class="sheet-title">⚡ Rychlý zápis</div>
+      <button class="icon-btn sheet-close" data-close="sheet-quick" aria-label="Zavřít">✕</button>
+    </div>
+    <label class="field">Název <span class="muted">— nepovinné</span>
+      <input id="quick-name" type="text" placeholder="např. oběd v restauraci">
+    </label>
+    <label class="field">Kalorie (kcal)
+      <input id="quick-kcal" type="number" inputmode="numeric" min="1" max="5000" placeholder="např. 650">
+    </label>
+    <div class="tri-row">
+      <label class="field">B (g)<input id="quick-b" type="text" inputmode="decimal"></label>
+      <label class="field">S (g)<input id="quick-s" type="text" inputmode="decimal"></label>
+      <label class="field">T (g)<input id="quick-t" type="text" inputmode="decimal"></label>
+    </div>
+    <div class="seg" id="quick-meal-seg">
+      <button data-meal="sn">Snídaně</button>
+      <button data-meal="ob">Oběd</button>
+      <button data-meal="ve">Večeře</button>
+      <button data-meal="sv">Svačiny</button>
+    </div>
+    <div class="btn-row">
+      <button id="quick-delete" class="btn btn-danger-ghost hidden">Smazat</button>
+      <button id="quick-submit" class="btn grow">Přidat</button>
+    </div>
+  </div>
+</div>
+
+<!-- ═══ SHEET: vlastní potravina ═══ -->
+<div id="sheet-custom" class="sheet hidden">
+  <div class="sheet-panel">
+    <div class="sheet-head">
+      <div class="sheet-title">Vlastní potravina</div>
+      <button class="icon-btn sheet-close" data-close="sheet-custom" aria-label="Zavřít">✕</button>
+    </div>
+    <label class="field">Název
+      <input id="cust-name" type="text" placeholder="např. Proteinový jogurt Lidl">
+    </label>
+    <div class="muted small-text" style="margin-bottom:8px">Hodnoty na 100 g / 100 ml (z obalu):</div>
+    <div class="tri-row four">
+      <label class="field">kcal<input id="cust-k" type="text" inputmode="decimal"></label>
+      <label class="field">B (g)<input id="cust-b" type="text" inputmode="decimal"></label>
+      <label class="field">S (g)<input id="cust-s" type="text" inputmode="decimal"></label>
+      <label class="field">T (g)<input id="cust-t" type="text" inputmode="decimal"></label>
+    </div>
+    <label class="field">Obvyklá porce (g) <span class="muted">— nepovinné</span>
+      <input id="cust-port" type="number" inputmode="numeric" min="1" placeholder="např. 150">
+    </label>
+    <div class="btn-row">
+      <button id="cust-delete" class="btn btn-danger-ghost hidden">Smazat</button>
+      <button id="cust-save" class="btn grow">Uložit</button>
+    </div>
+  </div>
+</div>
+
+<!-- ═══ SHEET: skener ═══ -->
+<div id="sheet-scan" class="sheet hidden">
+  <div class="sheet-panel">
+    <div class="sheet-head">
+      <div class="sheet-title">📷 Naskenujte čárový kód</div>
+      <button class="icon-btn sheet-close" data-close="sheet-scan" aria-label="Zavřít">✕</button>
+    </div>
+    <div class="scan-box"><video id="scan-video" playsinline muted></video><div class="scan-line"></div></div>
+    <div id="scan-status" class="muted center">Spouštím kameru…</div>
+    <div class="or-row"><span>nebo zadejte kód ručně</span></div>
+    <div class="amount-row">
+      <input id="ean-input" type="number" inputmode="numeric" placeholder="8594…">
+      <button id="ean-submit" class="btn slim">Hledat</button>
+    </div>
+  </div>
+</div>
+
+<!-- ═══ SHEET: kalkulačka příjmu ═══ -->
+<div id="sheet-calc" class="sheet hidden">
+  <div class="sheet-panel">
+    <div class="sheet-head">
+      <div class="sheet-title">🧮 Doporučený denní příjem</div>
+      <button class="icon-btn sheet-close" data-close="sheet-calc" aria-label="Zavřít">✕</button>
+    </div>
+    <div class="seg" id="calc-sex">
+      <button data-sex="f" class="on">Žena</button>
+      <button data-sex="m">Muž</button>
+    </div>
+    <div class="tri-row">
+      <label class="field">Věk<input id="calc-age" type="number" inputmode="numeric" min="15" max="100" placeholder="35"></label>
+      <label class="field">Výška (cm)<input id="calc-h" type="number" inputmode="numeric" min="120" max="220" placeholder="168"></label>
+      <label class="field">Váha (kg)<input id="calc-w" type="text" inputmode="decimal" placeholder="68"></label>
+    </div>
+    <label class="field">Pohyb přes den
+      <select id="calc-act">
+        <option value="1.2">Skoro žádný (sedavá práce)</option>
+        <option value="1.375" selected>Lehký (procházky, 1–2× týdně cvičení)</option>
+        <option value="1.55">Střední (sport 3–5× týdně)</option>
+        <option value="1.725">Vysoký (sport 6–7× týdně)</option>
+      </select>
+    </label>
+    <label class="field">Cíl
+      <select id="calc-goal">
+        <option value="-500">Zhubnout (−0,5 kg týdně)</option>
+        <option value="-250" selected>Pomalu zhubnout (−0,25 kg týdně)</option>
+        <option value="0">Udržet váhu</option>
+        <option value="250">Přibrat</option>
+      </select>
+    </label>
+    <button id="calc-run" class="btn">Spočítat</button>
+    <div id="calc-result" class="calc-result hidden"></div>
+  </div>
+</div>
+
+<div id="toast" class="toast hidden"></div>
+
+<script src="js/db.js"></script>
+<script src="js/app.js"></script>
+<script src="js/scan.js"></script>
+<script>
+  if ('serviceWorker' in navigator) {
+    window.addEventListener('load', () => navigator.serviceWorker.register('sw.js'));
+  }
+</script>
+</body>
+</html>
