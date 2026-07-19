@@ -57,7 +57,9 @@
     const body = {
       systemInstruction: { parts: [{ text: SYS }] },
       contents: [{ role: 'user', parts }],
-      generationConfig: { responseMimeType: 'application/json', temperature: 0.2, maxOutputTokens: 1024 },
+      // Gemini 3.x jsou „přemýšlecí" modely — interní uvažování se počítá do maxOutputTokens.
+      // S malým limitem model celý budget spotřebuje na přemýšlení a nevrátí žádný text.
+      generationConfig: { responseMimeType: 'application/json', temperature: 0.2, maxOutputTokens: 8192 },
     };
 
     // Zvolený model první, pak zbytek řetězce jako záloha.
@@ -73,7 +75,13 @@
     }
     if (!out.response) return out;
 
-    const txt = (out.response.candidates?.[0]?.content?.parts || []).map(p => p.text || '').join('');
+    const resp = out.response;
+    const cand = resp.candidates?.[0];
+    if (!cand) return { error: resp.promptFeedback?.blockReason ? 'blocked' : 'empty' };
+    // Přeskočit případné „thought" části (interní uvažování modelu) — odpověď je v běžných text částech.
+    const txt = (cand.content?.parts || []).filter(p => !p.thought).map(p => p.text || '').join('').trim();
+    if (!txt) return { error: cand.finishReason === 'MAX_TOKENS' ? 'truncated' : (cand.finishReason === 'SAFETY' ? 'blocked' : 'empty') };
+    try { return { result: JSON.parse(txt) }; } catch (e) { /* zkusit vyříznout JSON */ }
     const a = txt.indexOf('{'), b = txt.lastIndexOf('}');
     if (a < 0 || b < 0) return { error: 'parse' };
     try { return { result: JSON.parse(txt.slice(a, b + 1)) }; } catch (e) { return { error: 'parse' }; }
@@ -98,6 +106,9 @@
       case 'quota': return 'Bezplatný limit je teď vyčerpaný (příliš požadavků). Zkuste to za minutu, případně zítra.';
       case 'model': return 'Žádný z AI modelů teď není pro bezplatný klíč dostupný. Zkuste to později.';
       case 'network': return 'Nepodařilo se spojit s Google. Zkontrolujte připojení k internetu.';
+      case 'truncated': return 'Odpověď se nevešla do limitu. Zkuste to znovu, případně kratší popis.';
+      case 'blocked': return 'Google tenhle požadavek odmítl zpracovat (bezpečnostní filtr). Zkuste jinou fotku nebo popis.';
+      case 'empty': return 'Model vrátil prázdnou odpověď. Zkuste to prosím znovu.';
       case 'parse': return 'Odpověď se nepodařilo přečíst. Zkuste to prosím znovu.';
       default: return 'Něco se nepovedlo (' + (e.status || '?') + '). ' + (e.msg || 'Zkuste to znovu.');
     }
