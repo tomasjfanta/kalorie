@@ -247,6 +247,25 @@ main { max-width: 520px; margin: 0 auto; padding: 4px 14px 24px; }
 }
 .or-row { text-align: center; color: var(--muted); font-size: 13px; margin: 12px 0 8px; }
 
+/* ─── Pohyb / aktivity ─── */
+#act-search {
+  display: block; width: 100%; margin-top: 4px;
+  font-size: 16px; padding: 12px 14px;
+  background: var(--bg); color: var(--text);
+  border: 1px solid var(--border); border-radius: 12px;
+  -webkit-appearance: none; appearance: none;
+}
+#act-search:focus { outline: 2px solid var(--accent); border-color: transparent; }
+.act-list { max-height: 34vh; overflow-y: auto; margin-top: 8px; border: 1px solid var(--border); border-radius: 12px; }
+.act-row {
+  display: flex; justify-content: space-between; align-items: center; gap: 8px;
+  width: 100%; text-align: left; padding: 11px 12px; border-bottom: 1px solid var(--border);
+  font-size: 15px;
+}
+.act-row:last-child { border-bottom: none; }
+.act-row.on { background: var(--accent-soft); color: var(--accent); font-weight: 650; }
+.act-row small { color: var(--muted); font-weight: 400; white-space: nowrap; }
+
 /* ─── Kalkulačka ─── */
 .calc-result { background: var(--accent-soft); border-radius: 14px; padding: 14px; margin-top: 12px; font-size: 14.5px; line-height: 1.6; }
 .calc-result b { font-size: 17px; }

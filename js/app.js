@@ -35,7 +35,9 @@ let custom = store.get('kal.custom', []);
 let products = store.get('kal.products', []);
 let favs = store.get('kal.favs', []);
 let recent = store.get('kal.recent', []);
-let aiCfg = store.get('kal.ai', { key: '', model: 'claude-sonnet-5' });
+let aiCfg = store.get('kal.ai', { key: '', model: 'gemini-2.5-flash' });
+// Migrace ze starší verze, která používala Anthropic — klíč i model se liší.
+if (!aiCfg.model || aiCfg.model.startsWith('claude')) aiCfg = { key: '', model: 'gemini-2.5-flash' };
 let viewDate = todayStr();
 
 const saveAll = () => { store.set('kal.days', days); store.set('kal.custom', custom); store.set('kal.products', products); store.set('kal.favs', favs); store.set('kal.recent', recent); };
@@ -49,6 +51,12 @@ const vals = e => e.q
   ? { k: e.kcal || 0, b: e.b || 0, s: e.s || 0, t: e.t || 0 }
   : { k: e.g * e.k / 100, b: e.g * (e.b || 0) / 100, s: e.g * (e.s || 0) / 100, t: e.g * (e.t || 0) / 100 };
 const dayTotals = s => (days[s]?.e || []).reduce((a, e) => { const v = vals(e); a.k += v.k; a.b += v.b; a.s += v.s; a.t += v.t; return a; }, { k: 0, b: 0, s: 0, t: 0 });
+const dayBurn = s => (days[s]?.a || []).reduce((a, x) => a + (x.kcal || 0), 0);
+// Váha pro výpočet spálených kalorií: poslední zapsané vážení, jinak 70 kg.
+function weightForCalc() {
+  const withKg = Object.keys(days).filter(d => days[d].kg).sort();
+  return withKg.length ? days[withKg[withKg.length - 1]].kg : null;
+}
 
 /* ═══ Toast ═══ */
 let toastT;
@@ -91,15 +99,17 @@ function renderDnes() {
   $('#date-next').style.visibility = viewDate < todayStr() ? 'visible' : 'hidden';
   const t = dayTotals(viewDate);
   const goal = settings.kcal;
+  const burn = dayBurn(viewDate);
   $('#goal-hint').classList.toggle('hidden', !!goal);
 
   const fill = $('#ring-fill'); fill.style.strokeDasharray = CIRC;
   if (goal) {
-    const frac = Math.min(t.k / goal, 1);
+    const budget = goal + burn; // pohyb rozšiřuje denní budget → přesnější celkový deficit
+    const frac = Math.min(t.k / budget, 1);
     fill.style.strokeDashoffset = CIRC * (1 - frac);
-    const over = t.k > goal;
-    fill.style.stroke = over ? 'var(--red)' : t.k > goal * 0.9 ? 'var(--amber)' : 'var(--accent)';
-    $('#ring-num').textContent = over ? '+' + r0(t.k - goal) : r0(goal - t.k);
+    const over = t.k > budget;
+    fill.style.stroke = over ? 'var(--red)' : t.k > budget * 0.9 ? 'var(--amber)' : 'var(--accent)';
+    $('#ring-num').textContent = over ? '+' + r0(t.k - budget) : r0(budget - t.k);
     $('#ring-num').classList.toggle('over', over);
     $('#ring-sub').textContent = over ? 'kcal přes cíl' : 'kcal zbývá';
   } else {
@@ -110,6 +120,7 @@ function renderDnes() {
   }
   $('#stat-eaten').textContent = r0(t.k);
   $('#stat-goal').textContent = goal ? goal : '–';
+  $('#stat-burn').textContent = burn ? '+' + r0(burn) : '0';
 
   // Makra
   const m = $('#macros');
@@ -136,6 +147,14 @@ function renderDnes() {
     day().w = (i + 1 === cur ? i : i + 1) * 250; saveAll(); renderDnes();
   }));
 
+  // Pohyb
+  const acts = day().a || [];
+  $('#act-total').textContent = acts.length ? '+' + r0(burn) + ' kcal' : '';
+  $('#act-entries').innerHTML = acts.map(x =>
+    `<button class="entry" data-aeid="${x.id}"><span><span class="e-name">${esc(x.n)}</span><br><span class="e-sub">${x.min ? x.min + ' min' : 'ručně'}</span></span><span class="e-kcal">+${r0(x.kcal)}</span></button>`
+  ).join('');
+  $$('#act-entries .entry').forEach(b => b.addEventListener('click', () => editAct(b.dataset.aeid)));
+
   // Jídla dne
   $('#meals').innerHTML = MEALS.map(([id, label]) => {
     const es = day().e.filter(e => e.meal === id);
@@ -152,22 +171,16 @@ function renderDnes() {
 }
 const esc = s => String(s).replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
 
-/* ═══ Hledání ═══ */
-let searchTab = 'vse', searchMeal = 'ob', offTimer = null, offSeq = 0;
+/* ═══ Hledání — jeden sloučený seznam (vestavěná DB + moje + internet) ═══ */
+let searchMeal = 'ob', offTimer = null, offSeq = 0;
 
 function openSearch(meal) {
   searchMeal = meal || mealByHour();
   $('#search-input').value = '';
-  setTab('vse');
+  runSearch();
   openSheet('sheet-add');
   setTimeout(() => $('#search-input').focus(), 250);
 }
-function setTab(tab) {
-  searchTab = tab;
-  $$('#search-tabs button').forEach(b => b.classList.toggle('on', b.dataset.tab === tab));
-  runSearch();
-}
-$$('#search-tabs button').forEach(b => b.addEventListener('click', () => setTab(b.dataset.tab)));
 $('#search-input').addEventListener('input', runSearch);
 
 function allLocalFoods() { return [...custom, ...products, ...DB_FOODS]; }
@@ -201,48 +214,52 @@ function runSearch() {
   const q = $('#search-input').value.trim();
   const box = $('#search-results');
   clearTimeout(offTimer);
+  offSeq++; // zneplatní případnou běžící internetovou odpověď
 
-  if (searchTab === 'vlastni') {
-    const list = q ? custom.concat(products).filter(f => norm(f.n).includes(norm(q))) : custom.concat(products);
-    box.innerHTML = list.length ? list.map(resultRow).join('')
-      : '<div class="result-note">Zatím tu nic není.<br>Vlastní potraviny přidáte v Nastavení, produkty z internetu se sem ukládají automaticky.</div>';
-    bindResults(box, list);
-    return;
-  }
-  if (searchTab === 'off') {
-    if (!q) { box.innerHTML = '<div class="result-note">Napište název výrobku (např. „skyr vanilkový“).<br>Hledá se v databázi Open Food Facts — potřeba internet.</div>'; return; }
-    box.innerHTML = '<div class="result-note">Hledám…</div>';
-    const seq = ++offSeq;
-    offTimer = setTimeout(async () => {
-      const res = await offSearch(q);
-      if (seq !== offSeq) return;
-      if (res === null) {
-        box.innerHTML = navigator.onLine
-          ? '<div class="result-note">Databáze právě neodpovídá (nebo je přetížená). Zkuste to za chvíli znovu, nebo použijte čárový kód či rychlý zápis.</div>'
-          : '<div class="result-note">Nejste připojeni k internetu. Vyhledávání na internetu vyžaduje připojení — offline funguje vestavěná databáze.</div>';
-        return;
-      }
-      box.innerHTML = res.length ? res.map(resultRow).join('') : '<div class="result-note">Nic nenalezeno. Zkuste jiný název nebo čárový kód.</div>';
-      bindResults(box, res);
-    }, 450);
-    return;
-  }
-  // tab „vse“
+  // Prázdné pole → naposledy / oblíbené / moje
   if (!q) {
     const favFoods = favs.map(foodById).filter(Boolean);
     const recFoods = recent.slice(0, 12);
     let html = '';
     if (recFoods.length) html += '<div class="group-label">Naposledy</div>' + recFoods.map(resultRow).join('');
     if (favFoods.length) html += '<div class="group-label">Oblíbené ★</div>' + favFoods.map(resultRow).join('');
-    if (!html) html = '<div class="result-note">Začněte psát — třeba „rohlík“ nebo „jogurt“.<br>V databázi je přes 240 běžných potravin a jídel.</div>';
+    if (custom.length) html += '<div class="group-label">Moje potraviny</div>' + custom.slice(0, 8).map(resultRow).join('');
+    if (!html) html = '<div class="result-note">Začněte psát — třeba „rohlík“ nebo „skyr“.<br>Hledá se najednou ve vestavěné databázi, vašich potravinách i na internetu.</div>';
     box.innerHTML = html;
-    bindResults(box, [...recFoods, ...favFoods]);
+    bindResults(box, [...recFoods, ...favFoods, ...custom]);
     return;
   }
+
+  // 1) Místní výsledky okamžitě (vestavěná DB + moje + uložené produkty)
   const list = localSearch(q);
-  box.innerHTML = list.length ? list.map(resultRow).join('')
-    : '<div class="result-note">Nenalezeno. Zkuste záložku <b>Internet</b>, čárový kód, nebo ⚡ rychlý zápis.</div>';
+  box.innerHTML = (list.length ? list.map(resultRow).join('') : '')
+    + '<div id="off-zone"><div class="result-note">Hledám i na internetu…</div></div>';
   bindResults(box, list);
+
+  // 2) Internet (Open Food Facts) se připojí, jakmile odpoví
+  const seq = ++offSeq;
+  offTimer = setTimeout(async () => {
+    const res = await offSearch(q);
+    if (seq !== offSeq) return;
+    const zone = $('#off-zone');
+    if (!zone) return;
+    if (res === null) {
+      zone.innerHTML = list.length
+        ? '<div class="result-note">Internetová databáze teď neodpovídá — zobrazeny výsledky z telefonu.</div>'
+        : (navigator.onLine
+          ? '<div class="result-note">Nenalezeno v telefonu a internetová databáze neodpovídá. Zkuste to za chvíli, nebo použijte 📷 čárový kód, ⚡ rychlý zápis či 🤖 odhad.</div>'
+          : '<div class="result-note">Jste offline — zobrazeny jen výsledky z telefonu.</div>');
+      return;
+    }
+    const seen = new Set(list.map(f => f.id));
+    const fresh = res.filter(f => !seen.has(f.id));
+    if (!fresh.length) {
+      zone.innerHTML = list.length ? '' : '<div class="result-note">Nic nenalezeno. Zkuste jiný název, 📷 čárový kód, nebo 🤖 odhad z popisu.</div>';
+      return;
+    }
+    zone.innerHTML = '<div class="group-label">Z internetu (Open Food Facts)</div>' + fresh.map(resultRow).join('');
+    bindResults(zone, fresh);
+  }, 450);
 }
 
 /* ═══ Open Food Facts ═══ */
@@ -456,6 +473,93 @@ $('#quick-delete').addEventListener('click', () => {
   saveAll(); closeSheet('sheet-quick'); renderDnes(); toast('Smazáno');
 });
 
+/* ═══ Pohyb / aktivity ═══ */
+// Záznam: { id, n, min|null, kcal, mid } — mid je index v ACT_DB, null = ruční zápis.
+let actState = null;
+
+function openAct(entry) {
+  actState = {
+    editId: entry?.id || null,
+    mode: entry && entry.mid == null ? 'manual' : 'list',
+    sel: entry?.mid ?? 0,
+  };
+  $('#act-search').value = '';
+  $('#act-min').value = entry?.min || 30;
+  $('#act-name').value = entry && entry.mid == null ? (entry.n === 'Pohyb' ? '' : entry.n) : '';
+  $('#act-kcal').value = entry && entry.mid == null ? entry.kcal : '';
+  $('#act-min2').value = entry && entry.mid == null ? (entry.min || '') : '';
+  $('#act-delete').classList.toggle('hidden', !actState.editId);
+  $('#act-submit').textContent = actState.editId ? 'Uložit změny' : 'Přidat';
+  setActMode(actState.mode);
+  renderActList();
+  openSheet('sheet-act');
+}
+
+function setActMode(mode) {
+  actState.mode = mode;
+  $$('#act-mode button').forEach(b => b.classList.toggle('on', b.dataset.mode === mode));
+  $('#act-by-list').classList.toggle('hidden', mode !== 'list');
+  $('#act-by-manual').classList.toggle('hidden', mode !== 'manual');
+  actPreview();
+}
+
+function renderActList() {
+  const q = norm($('#act-search').value.trim());
+  const kg = weightForCalc() || 70;
+  const rows = ACT_DB.map((a, i) => ({ i, n: a[0], met: a[1], hay: norm(a[0] + ' ' + (a[2] || '')) }))
+    .filter(x => !q || x.hay.includes(q));
+  $('#act-list').innerHTML = rows.length
+    ? rows.map(x => `<button class="act-row ${x.i === actState.sel ? 'on' : ''}" data-i="${x.i}"><span>${esc(x.n)}</span><small>~${r0(x.met * kg * 0.5)} kcal / 30 min</small></button>`).join('')
+    : '<div class="result-note">Nenalezeno — použijte ruční zápis.</div>';
+  $$('#act-list .act-row').forEach(b => b.addEventListener('click', () => {
+    actState.sel = +b.dataset.i;
+    $$('#act-list .act-row').forEach(x => x.classList.toggle('on', x === b));
+    actPreview();
+  }));
+  const w = weightForCalc();
+  $('#act-weight-note').textContent = w
+    ? 'Počítáno pro váhu ' + dec(w) + ' kg (poslední vážení).'
+    : 'Počítáno pro 70 kg — zapište si váhu v záložce Váha a odhad se zpřesní.';
+  actPreview();
+}
+
+function actCurrentKcal() {
+  if (actState.mode === 'manual') return Math.round(numEl('#act-kcal'));
+  const a = ACT_DB[actState.sel];
+  const kg = weightForCalc() || 70;
+  return Math.round(a[1] * kg * (numEl('#act-min') / 60));
+}
+function actPreview() { $('#act-preview').textContent = '+' + Math.max(0, actCurrentKcal() || 0) + ' kcal'; }
+
+$('#act-add').addEventListener('click', () => openAct(null));
+$$('#act-mode button').forEach(b => b.addEventListener('click', () => setActMode(b.dataset.mode)));
+$('#act-search').addEventListener('input', renderActList);
+['#act-min', '#act-kcal', '#act-min2'].forEach(sel => $(sel).addEventListener('input', actPreview));
+
+$('#act-submit').addEventListener('click', () => {
+  const kcal = actCurrentKcal();
+  if (!kcal || kcal <= 0) { toast(actState.mode === 'manual' ? 'Zadejte spálené kalorie' : 'Zadejte dobu trvání'); return; }
+  const data = actState.mode === 'manual'
+    ? { n: $('#act-name').value.trim() || 'Pohyb', min: Math.round(numEl('#act-min2')) || null, kcal, mid: null }
+    : { n: ACT_DB[actState.sel][0], min: Math.round(numEl('#act-min')), kcal, mid: actState.sel };
+  const list = (day().a ??= []);
+  if (actState.editId) {
+    const e = list.find(x => x.id === actState.editId);
+    if (e) Object.assign(e, data);
+  } else {
+    list.push({ id: 'a' + Date.now() + Math.random().toString(36).slice(2, 6), ...data });
+  }
+  saveAll(); closeSheet('sheet-act'); renderDnes(); toast(actState.editId ? 'Upraveno' : 'Pohyb přidán: +' + kcal + ' kcal');
+});
+$('#act-delete').addEventListener('click', () => {
+  day().a = (day().a || []).filter(x => x.id !== actState.editId);
+  saveAll(); closeSheet('sheet-act'); renderDnes(); toast('Smazáno');
+});
+function editAct(id) {
+  const e = (day().a || []).find(x => x.id === id);
+  if (e) openAct(e);
+}
+
 /* ═══ Vlastní potraviny ═══ */
 let custEditId = null;
 function openCustom(food) {
@@ -508,11 +612,12 @@ function renderHistory() {
   $('#week-avg').textContent = withData.length ? 'Průměr: ' + r0(withData.reduce((a, x) => a + x.k, 0) / withData.length) + ' kcal / den' : 'Zatím žádné záznamy.';
 
   // seznam dnů (posledních 60 se záznamy)
-  const listed = Object.keys(days).filter(s => (days[s].e || []).length || days[s].kg).sort().reverse().slice(0, 60);
+  const listed = Object.keys(days).filter(s => (days[s].e || []).length || days[s].kg || (days[s].a || []).length).sort().reverse().slice(0, 60);
   $('#day-list').innerHTML = listed.length ? listed.map(s => {
     const k = dayTotals(s).k;
-    const cls = !k ? 'none' : goal ? (k > goal ? 'over' : 'ok') : 'ok';
-    const kg = days[s].kg ? ' · ' + dec(days[s].kg) + ' kg' : '';
+    const bs = dayBurn(s);
+    const cls = !k ? 'none' : goal ? (k > goal + bs ? 'over' : 'ok') : 'ok';
+    const kg = (days[s].kg ? ' · ' + dec(days[s].kg) + ' kg' : '') + (bs ? ' · 🏃 +' + r0(bs) : '');
     return `<button class="day-row" data-d="${s}"><span><span class="dot ${cls}"></span>${fmtHuman(s)}<span class="muted">${kg}</span></span><span class="d-kcal">${k ? r0(k) + ' kcal' : '—'}</span></button>`;
   }).join('') : '<div class="result-note">Historie se objeví, jakmile si zapíšete první jídlo.</div>';
   $('#day-list').querySelectorAll('.day-row').forEach(b => b.addEventListener('click', () => { viewDate = b.dataset.d; showView('dnes'); renderDnes(); }));
@@ -567,7 +672,7 @@ function fillSettings() {
   $('#set-prot').value = settings.prot || '';
   $('#set-water').value = settings.water || 2000;
   $('#set-ai-key').value = aiCfg.key || '';
-  $('#set-ai-model').value = aiCfg.model || 'claude-sonnet-5';
+  $('#set-ai-model').value = aiCfg.model || 'gemini-2.5-flash';
   $('#ai-key-note').textContent = aiCfg.key ? '✓ Klíč uložen — AI odhady jsou připravené.' : 'Bez klíče AI odhady nefungují.';
   renderCustomList();
 }

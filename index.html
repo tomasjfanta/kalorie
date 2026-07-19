@@ -44,6 +44,7 @@
       <div class="ring-row">
         <div class="ring-stat"><span id="stat-eaten">0</span><small>snědeno</small></div>
         <div class="ring-stat"><span id="stat-goal">–</span><small>cíl</small></div>
+        <div class="ring-stat"><span id="stat-burn">0</span><small>spáleno</small></div>
       </div>
       <div id="macros" class="macros"></div>
     </div>
@@ -58,6 +59,15 @@
         <div id="water-total" class="muted">0 ml</div>
       </div>
       <div id="water-row" class="water-row"></div>
+    </div>
+
+    <div class="card">
+      <div class="row-between">
+        <div class="card-title">🏃 Pohyb</div>
+        <div id="act-total" class="muted"></div>
+      </div>
+      <div id="act-entries"></div>
+      <button id="act-add" class="meal-add">＋ Přidat pohyb</button>
     </div>
 
     <div id="meals"></div>
@@ -119,19 +129,19 @@
 
     <div class="card">
       <div class="card-title">🤖 AI odhady (fotka / popis)</div>
-      <p class="muted">Odhad kalorií z fotky nebo popisu jídla používá Claude. Vložte svůj Anthropic API klíč — zůstane jen v tomto telefonu a nikam se neposílá. Klíč získáte na <a href="https://console.anthropic.com/settings/keys" target="_blank" rel="noopener">console.anthropic.com</a>.</p>
-      <label class="field">API klíč
-        <input id="set-ai-key" type="password" autocomplete="off" placeholder="sk-ant-…">
+      <p class="muted">Odhady kalorií dělá Google Gemini — <b>zdarma</b>, stačí bezplatný klíč z <a href="https://aistudio.google.com/apikey" target="_blank" rel="noopener">aistudio.google.com/apikey</a> (přihlásíte se Google účtem, žádná platební karta). Klíč zůstane jen v tomto telefonu.</p>
+      <label class="field">Google API klíč
+        <input id="set-ai-key" type="password" autocomplete="off" placeholder="AIza…">
       </label>
       <label class="field">Model
         <select id="set-ai-model">
-          <option value="claude-haiku-4-5">Claude Haiku 4.5 — nejlevnější</option>
-          <option value="claude-sonnet-5">Claude Sonnet 5 — vyvážený</option>
-          <option value="claude-opus-4-8">Claude Opus 4.8 — nejpřesnější</option>
+          <option value="gemini-2.5-flash">Gemini 2.5 Flash — doporučeno</option>
+          <option value="gemini-2.5-flash-lite">Gemini 2.5 Flash-Lite — vyšší denní limit</option>
         </select>
       </label>
       <button id="save-ai" class="btn">Uložit</button>
       <div id="ai-key-note" class="muted small-text" style="margin-top:8px"></div>
+      <p class="muted small-text" style="margin-top:8px">Pozn.: u bezplatného klíče může Google zaslaná data použít ke zlepšování svých služeb — neposílejte fotky, na kterých je něco citlivého.</p>
     </div>
 
     <div class="card">
@@ -172,11 +182,6 @@
     <div class="sheet-head">
       <input id="search-input" type="search" placeholder="Hledat jídlo…" autocomplete="off">
       <button class="icon-btn sheet-close" data-close="sheet-add" aria-label="Zavřít">✕</button>
-    </div>
-    <div class="seg" id="search-tabs">
-      <button data-tab="vse" class="on">Databáze</button>
-      <button data-tab="off">Internet</button>
-      <button data-tab="vlastni">Moje</button>
     </div>
     <div class="btn-row">
       <button id="scan-btn" class="btn btn-ghost slim">📷 Čárový kód</button>
@@ -268,6 +273,47 @@
     <div class="btn-row">
       <button id="quick-delete" class="btn btn-danger-ghost hidden">Smazat</button>
       <button id="quick-submit" class="btn grow">Přidat</button>
+    </div>
+  </div>
+</div>
+
+<!-- ═══ SHEET: pohyb / aktivita ═══ -->
+<div id="sheet-act" class="sheet hidden">
+  <div class="sheet-panel">
+    <div class="sheet-head">
+      <div class="sheet-title">🏃 Pohyb</div>
+      <button class="icon-btn sheet-close" data-close="sheet-act" aria-label="Zavřít">✕</button>
+    </div>
+    <div class="seg" id="act-mode">
+      <button data-mode="list" class="on">Podle aktivity</button>
+      <button data-mode="manual">Ručně (z hodinek)</button>
+    </div>
+    <div id="act-by-list">
+      <input id="act-search" type="search" placeholder="Hledat aktivitu… (běh, kolo, jóga)" autocomplete="off">
+      <div id="act-list" class="act-list"></div>
+      <label class="field" style="margin-top:10px">Doba (minuty)
+        <input id="act-min" type="text" inputmode="numeric" value="30">
+      </label>
+      <div id="act-weight-note" class="muted small-text"></div>
+    </div>
+    <div id="act-by-manual" class="hidden">
+      <label class="field">Název <span class="muted">— nepovinné</span>
+        <input id="act-name" type="text" placeholder="např. trénink z hodinek">
+      </label>
+      <label class="field">Spálené kalorie (kcal)
+        <input id="act-kcal" type="text" inputmode="numeric" placeholder="např. 320">
+      </label>
+      <label class="field">Doba (minuty) <span class="muted">— nepovinné</span>
+        <input id="act-min2" type="text" inputmode="numeric">
+      </label>
+    </div>
+    <div class="total-row">
+      <div></div>
+      <div id="act-preview" class="kcal-preview">0 kcal</div>
+    </div>
+    <div class="btn-row">
+      <button id="act-delete" class="btn btn-danger-ghost hidden">Smazat</button>
+      <button id="act-submit" class="btn grow">Přidat</button>
     </div>
   </div>
 </div>
