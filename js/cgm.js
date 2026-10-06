@@ -56,10 +56,12 @@
   /* ─── Nightscout ─── */
   const MG = 18.0182;
   function nsBase(url) {
-    let u = String(url || '').trim().replace(/\/+$/, '');
+    let u = String(url || '').trim().replace(/[?#].*$/, '').replace(/\/+$/, '');
     if (u && !/^https?:\/\//i.test(u)) u = 'https://' + u;
     return u;
   }
+  // Odkaz s tokenem z Admin Tools (…/?token=kalorie-…) — vytáhnout token.
+  const nsTokenFromUrl = url => { const m = /[?&]token=([^&#\s]+)/.exec(String(url || '')); return m ? decodeURIComponent(m[1]) : ''; };
   async function nsFetch(cfg, path, params) {
     const qs = new URLSearchParams(params);
     if (cfg.token) qs.set('token', cfg.token);
@@ -100,5 +102,5 @@
       lastSet: p.settings[p.settings.length - 1] || null, unit: p.unit };
   }
 
-  window.CGM = { put, range, get, del, lastKey, clearAll, nsSync, nsFetch, nsBase, importCareLink, MG };
+  window.CGM = { put, range, get, del, lastKey, clearAll, nsSync, nsFetch, nsBase, nsTokenFromUrl, importCareLink, MG };
 })();

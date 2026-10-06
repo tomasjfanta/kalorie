@@ -1,7 +1,7 @@
 // Service worker — aplikace funguje offline. Data (deník) jsou v localStorage, tady cachujeme jen kód.
 // Strategie: network-first pro vlastní soubory (online vždy nejnovější verze),
 // s cache jako záložkou pro offline režim.
-const CACHE = 'kalorie-v9';
+const CACHE = 'kalorie-v10';
 const ASSETS = [
   './',
   './index.html',
@@ -39,8 +39,10 @@ self.addEventListener('fetch', e => {
   if (url.origin !== location.origin) return;
 
   // Vlastní soubory: nejdřív síť (aktuální verze), při výpadku cache.
+  // cache: 'no-cache' = vždy ověřit u serveru (levné 304), jinak by HTTP cache prohlížeče
+  // mohla ještě několik minut po nasazení vracet starý kód.
   e.respondWith(
-    fetch(e.request)
+    fetch(e.request, { cache: 'no-cache' })
       .then(res => {
         if (res && res.ok) { const copy = res.clone(); caches.open(CACHE).then(c => c.put(e.request, copy)); }
         return res;

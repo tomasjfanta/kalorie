@@ -498,7 +498,8 @@
   });
 
   $('#ns-test').addEventListener('click', async () => {
-    const cfg = { url: CGM.nsBase($('#ns-url').value), token: $('#ns-token').value.trim() };
+    const cfg = { url: CGM.nsBase($('#ns-url').value), token: $('#ns-token').value.trim() || CGM.nsTokenFromUrl($('#ns-url').value) };
+    $('#ns-url').value = cfg.url; $('#ns-token').value = cfg.token;
     if (!cfg.url) { $('#ns-status').textContent = 'Zadejte adresu.'; return; }
     $('#ns-status').textContent = 'Zkouším spojení…';
     try {
