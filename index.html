@@ -60,7 +60,7 @@
       👋 Nejdřív si nastavte denní cíl kalorií v <button class="linklike" data-goto="nastaveni">Nastavení</button>.
     </div>
 
-    <div class="card water-card">
+    <div class="card water-card kcal-only">
       <div class="row-between">
         <div class="card-title">💧 Pití</div>
         <div id="water-total" class="muted">0 ml</div>
@@ -77,7 +77,21 @@
       <button id="act-add" class="meal-add">＋ Přidat pohyb</button>
     </div>
 
-    <div id="meals"></div>
+    <div id="meals" class="kcal-only"></div>
+
+    <div class="carb-only">
+      <button id="cphoto-btn" class="btn btn-ai photo-big">📷 Vyfotit jídlo</button>
+      <input id="cphoto-input" type="file" accept="image/*" class="hidden">
+      <div class="card">
+        <div class="card-title">Jídla</div>
+        <div id="ctimeline"></div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ═══ UČENÍ (režim sacharidů) ═══ -->
+  <section id="view-uceni" class="view">
+    <div id="learn-body"></div>
   </section>
 
   <!-- ═══ HISTORIE ═══ -->
@@ -151,7 +165,56 @@
       <p class="muted small-text" style="margin-top:8px">Orientační odhad pro přehled — nenahrazuje měření glykémie ani doporučení diabetologa k dávkování inzulinu.</p>
     </div>
 
-    <div class="card">
+    <div class="card carb-only">
+      <div class="card-title">Moje léčba</div>
+      <p class="muted small-text">Z těchto údajů a glykémie po jídle aplikace zpětně odvodí, kolik sacharidů jídlo skutečně mělo, a učí se tím zpřesňovat odhady z fotek. Inzulinová rezistence se projevuje v poměru a citlivosti — proto lze zadat různé hodnoty pro různé části dne (ráno bývá rezistence vyšší).</p>
+      <label class="field">Léčba
+        <select id="th-type">
+          <option value="aid">Pumpa s automatickými korekcemi (např. MiniMed 780G)</option>
+          <option value="insulin">Inzulin k jídlu (pero, nebo pumpa bez automatiky)</option>
+          <option value="none">Bez inzulinu k jídlu</option>
+        </select>
+      </label>
+      <label class="field th-ins">Inzulin k jídlu
+        <select id="th-insulin">
+          <option value="rapid">Rychlý (NovoRapid, Humalog, Apidra)</option>
+          <option value="ultra">Ultrarychlý (Fiasp, Lyumjev)</option>
+        </select>
+      </label>
+      <label class="field">Jednotky glykémie
+        <select id="th-unit">
+          <option value="mmol">mmol/l</option>
+          <option value="mgdl">mg/dl</option>
+        </select>
+      </label>
+      <div class="th-ins">
+        <div class="card-title" style="margin-top:6px">Poměr a citlivost podle části dne</div>
+        <div class="seg-head muted small-text"><span>od</span><span>poměr (g/U)</span><span>citlivost (<span class="u-lbl">mmol/l</span> na 1 U)</span><span></span></div>
+        <div id="th-segs"></div>
+        <button id="th-add" class="btn btn-ghost slim">＋ Přidat úsek dne</button>
+        <div id="th-pump-note" class="muted small-text" style="margin-top:8px"></div>
+      </div>
+      <button id="th-save" class="btn">Uložit</button>
+    </div>
+
+    <div class="card carb-only">
+      <div class="card-title">Data z CGM a pumpy</div>
+      <p class="muted small-text">Medtronic nemá veřejné rozhraní pro jiné aplikace. Automaticky to jde přes <b>Nightscout</b> (CareLink → xDrip+ nebo nightscout-connect → Nightscout); v Nightscoutu je potřeba do proměnné ENABLE přidat <code>cors</code>. Bez nastavování stačí <b>export z CareLinku</b> (Reporty → Export dat CSV) — načte i bolusy a nastavení pumpy.</p>
+      <label class="field">Adresa Nightscoutu
+        <input id="ns-url" type="url" autocomplete="off" placeholder="https://moje-glykemie.example.com">
+      </label>
+      <label class="field">Token (role „readable")
+        <input id="ns-token" type="password" autocomplete="off" placeholder="aplikace-1a2b3c4d5e6f7g8h">
+      </label>
+      <button id="ns-test" class="btn btn-ghost">Otestovat a uložit</button>
+      <div id="ns-status" class="muted small-text" style="margin-top:6px"></div>
+      <div class="or-row"><span>nebo</span></div>
+      <button id="cl-import" class="btn btn-ghost">⬆️ Nahrát export z CareLinku (CSV)</button>
+      <input id="cl-file" type="file" accept=".csv,text/csv,text/plain" class="hidden">
+      <div id="cl-status" class="muted small-text" style="margin-top:6px"></div>
+    </div>
+
+    <div class="card kcal-only">
       <div class="card-title">Denní cíle</div>
       <label class="field kcal-only">Kalorie (kcal)
         <input id="set-kcal" type="number" inputmode="numeric" min="800" max="6000" placeholder="např. 1800">
@@ -193,7 +256,7 @@
       <input id="import-file" type="file" accept="application/json,.json" class="hidden">
     </div>
 
-    <div class="card">
+    <div class="card kcal-only">
       <div class="card-title">Moje potraviny</div>
       <div id="custom-list" class="muted">Zatím žádné vlastní potraviny.</div>
       <button id="add-custom" class="btn btn-ghost">＋ Přidat vlastní potravinu</button>
@@ -211,7 +274,8 @@
 <nav class="tabbar">
   <button data-view="dnes" class="tab on"><span class="t-ico">◎</span>Dnes</button>
   <button data-view="historie" class="tab"><span class="t-ico">▤</span>Historie</button>
-  <button data-view="vaha" class="tab"><span class="t-ico">⚖︎</span>Váha</button>
+  <button data-view="vaha" class="tab kcal-only"><span class="t-ico">⚖︎</span>Váha</button>
+  <button data-view="uceni" class="tab carb-only"><span class="t-ico">📈</span>Učení</button>
   <button data-view="nastaveni" class="tab"><span class="t-ico">⚙︎</span>Nastavení</button>
 </nav>
 
@@ -466,6 +530,45 @@
   </div>
 </div>
 
+<!-- ═══ SHEET: nové jídlo z fotky (režim sacharidů) ═══ -->
+<div id="sheet-cnew" class="sheet hidden">
+  <div class="sheet-panel">
+    <div class="sheet-head">
+      <div class="sheet-title">📷 Jídlo</div>
+      <button class="icon-btn sheet-close" data-close="sheet-cnew" aria-label="Zavřít">✕</button>
+    </div>
+    <img id="cnew-img" class="ai-photo-preview" alt="">
+    <div id="cnew-status" class="muted center"></div>
+    <div id="cnew-form" class="hidden">
+      <label class="field">Co to je
+        <input id="cnew-name" type="text">
+      </label>
+      <label class="field">Sacharidy (g)
+        <input id="cnew-carbs" type="text" inputmode="decimal">
+      </label>
+      <div id="cnew-ai" class="muted small-text"></div>
+      <div id="cnew-conf" class="conf-box"></div>
+      <div class="tri-row">
+        <label class="field">Čas jídla<input id="cnew-time" type="time"></label>
+        <label class="field cnew-ins">Inzulin (U) <span class="muted">— nepovinné</span><input id="cnew-units" type="text" inputmode="decimal" placeholder="z pumpy"></label>
+      </div>
+      <button id="cnew-save" class="btn">Uložit</button>
+    </div>
+    <button id="cnew-retry" class="btn btn-ghost hidden">Zkusit znovu</button>
+  </div>
+</div>
+
+<!-- ═══ SHEET: detail jídla + ověření glykémií ═══ -->
+<div id="sheet-cmeal" class="sheet hidden">
+  <div class="sheet-panel">
+    <div class="sheet-head">
+      <div class="sheet-title" id="cmeal-title">Jídlo</div>
+      <button class="icon-btn sheet-close" data-close="sheet-cmeal" aria-label="Zavřít">✕</button>
+    </div>
+    <div id="cmeal-body"></div>
+  </div>
+</div>
+
 <!-- ═══ SHEET: jistota odhadu (rozhodovací vrstva) ═══ -->
 <div id="sheet-conf" class="sheet hidden">
   <div class="sheet-panel">
@@ -487,10 +590,13 @@
 
 <script src="js/db.js"></script>
 <script src="js/conf.js"></script>
+<script src="js/learn.js"></script>
 <script src="js/app.js"></script>
 <script src="js/vendor/zxing.min.js"></script>
 <script src="js/scan.js"></script>
 <script src="js/ai.js"></script>
+<script src="js/cgm.js"></script>
+<script src="js/carb.js"></script>
 <script>
   if ('serviceWorker' in navigator) {
     window.addEventListener('load', () => navigator.serviceWorker.register('sw.js'));

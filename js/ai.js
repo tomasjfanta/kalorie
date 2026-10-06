@@ -10,7 +10,10 @@
     + 'jakéhokoliv dalšího textu, přesně ve tvaru: {"nazev": "krátký český název jídla", "mnozstvi": "odhad '
     + 'porce, např. 1 talíř ~350 g", "kcal": číslo, "bilkoviny": číslo v g, "sacharidy": číslo v g, "tuky": '
     + 'číslo v g, "sacharidy_min": číslo v g, "sacharidy_max": číslo v g, "jistota": "nízká"|"střední"|"vysoká", '
-    + '"poznamka": "krátká poznámka nebo prázdný řetězec"}. "sacharidy_min" a "sacharidy_max" je rozsah, ve kterém '
+    + '"kategorie": "pecivo"|"prilohy"|"hotove"|"fastfood"|"sladke"|"ovoce"|"mlecne"|"napoje"|"ostatni", '
+    + '"poznamka": "krátká poznámka nebo prázdný řetězec"}. "kategorie" = převažující zdroj sacharidů (prilohy = rýže, '
+    + 'těstoviny, brambory, knedlíky; hotove = jídlo s omáčkou nebo masem; fastfood = pizza, burger, smažené). '
+    + '"sacharidy_min" a "sacharidy_max" je rozsah, ve kterém '
     + 'skutečné sacharidy leží s 90% pravděpodobností — buď poctivý, u nejasné porce nebo receptu ho rozšiř. '
     + 'Všechny číselné hodnoty platí pro CELOU popsanou/zobrazenou porci, NE na 100 g. Pokud množství není '
     + 'uvedené, odhadni obvyklou porci a napiš odhad do pole "mnozstvi". Vycházej z běžných nutričních '
@@ -53,14 +56,14 @@
     return { response: await r.json() };
   }
 
-  async function callGemini({ text, imageBase64, imageMedia }) {
+  async function callGemini({ text, imageBase64, imageMedia, extra }) {
     const c = cfg();
     if (!c.key) return { error: 'nokey' };
     const parts = [];
     if (imageBase64) parts.push({ inline_data: { mime_type: imageMedia, data: imageBase64 } });
     parts.push({ text: text || 'Odhadni kalorie a makra tohoto jídla z fotky.' });
     const body = {
-      systemInstruction: { parts: [{ text: SYS + (window.KAL.isCarb() ? SYS_CARB : '') }] },
+      systemInstruction: { parts: [{ text: SYS + (window.KAL.isCarb() ? SYS_CARB : '') + (extra || '') }] },
       contents: [{ role: 'user', parts }],
       // Gemini 3.x jsou „přemýšlecí" modely — interní uvažování se počítá do maxOutputTokens.
       // S malým limitem model celý budget spotřebuje na přemýšlení a nevrátí žádný text.
@@ -184,4 +187,6 @@
       img.src = url;
     });
   }
+
+  window.AI = { callGemini, downscale, errMsg };
 })();

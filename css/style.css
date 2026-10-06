@@ -363,3 +363,42 @@ button.ring-row:active { background: var(--track); }
 .conf-how { margin-top: 12px; font-size: 13px; color: var(--muted); line-height: 1.55; }
 .conf-how summary { cursor: pointer; font-weight: 600; color: var(--text); padding: 6px 0; }
 .conf-how p { margin-top: 6px; }
+
+/* ─── Režim sacharidů: fotky, časová osa, ověření glykémií ─── */
+.photo-big { font-size: 18px; padding: 18px; margin: 0 0 14px; border-radius: 16px; }
+.ctl-row { display: flex; align-items: center; gap: 12px; width: 100%; text-align: left; padding: 10px 0; border-bottom: 1px solid var(--border); }
+.ctl-row:last-child { border-bottom: none; }
+.ctl-thumb { width: 54px; height: 54px; border-radius: 10px; object-fit: cover; background: var(--track); flex: none; }
+.ctl-thumb.empty { visibility: hidden; }
+.ctl-mid { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 2px; }
+.ctl-name { font-size: 15px; font-weight: 600; overflow: hidden; text-overflow: ellipsis; }
+.ctl-sub { font-size: 12.5px; color: var(--muted); }
+.cmeal-photo { display: block; width: 100%; max-height: 220px; object-fit: cover; border-radius: 14px; margin-bottom: 10px; }
+.cmeal-head { display: flex; justify-content: space-between; align-items: flex-start; gap: 10px; margin-bottom: 4px; }
+.bg-chart { width: 100%; height: auto; display: block; margin-top: 12px; }
+.bg-band { fill: var(--accent-soft); }
+.bg-base { stroke: var(--muted); stroke-dasharray: 4 3; stroke-width: 1; }
+.bg-meal { stroke: var(--amber); stroke-width: 1.5; }
+.bg-line { fill: none; stroke: var(--blue); stroke-width: 2.2; stroke-linejoin: round; }
+.bg-dot { fill: var(--blue); }
+.bg-bolus { fill: #a86fc9; }
+.bg-tick { font-size: 9px; fill: var(--muted); }
+.bg-lbl { font-size: 9px; fill: var(--text); }
+.ev-metrics { font-size: 13px; margin-top: 6px; }
+.ev-box { background: var(--track); border-radius: 12px; padding: 10px 12px; margin-top: 10px; font-size: 14px; line-height: 1.5; }
+.ev-box.ok { background: var(--c-ok-bg); }
+.ev-actions { display: flex; align-items: center; gap: 8px; margin-top: 10px; }
+.ev-actions input, .ev-actions select { width: 80px; font-size: 16px; padding: 10px; background: var(--bg); color: var(--text); border: 1px solid var(--border); border-radius: 10px; }
+.ev-actions.excl select { width: auto; flex: 1; }
+.ev-actions .btn { margin-top: 0; }
+.learn-steps { margin: 8px 0 0 20px; font-size: 14px; line-height: 1.55; }
+.learn-steps li { margin-bottom: 6px; }
+.learn-row { display: flex; justify-content: space-between; align-items: center; gap: 10px; width: 100%; text-align: left; padding: 10px 0; border-bottom: 1px solid var(--border); font-size: 14.5px; }
+.learn-row:last-child { border-bottom: none; }
+.learn-row b { white-space: nowrap; }
+.warn { color: var(--c-low); font-weight: 600; }
+.seg-head, .seg-row { display: grid; grid-template-columns: 1.1fr 1fr 1.3fr 36px; gap: 6px; align-items: center; }
+.seg-head { margin: 4px 0; }
+.seg-row { margin-bottom: 6px; }
+.seg-row input { width: 100%; font-size: 16px; padding: 10px 8px; background: var(--bg); color: var(--text); border: 1px solid var(--border); border-radius: 10px; -webkit-appearance: none; appearance: none; }
+code { font-size: 12.5px; background: var(--track); padding: 1px 5px; border-radius: 5px; }

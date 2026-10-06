@@ -54,9 +54,16 @@
     let sigma, driver = info.kind;
     if (info.kind === 'ai-text' || info.kind === 'ai-photo') {
       const tab = AI_SD[info.kind];
-      const floor = tab[info.jist] ?? tab['střední'];
-      const rangeSd = info.sMax > info.sMin ? (info.sMax - info.sMin) / (2 * Z90) : 0;
-      sigma = Math.max(rangeSd, C * floor);
+      if (info.learnedSd) {
+        // Po zpětné vazbě z CGM známe skutečnou osobní přesnost AI — ta nahrazuje obecné odhady.
+        const mult = { 'vysoká': 0.8, 'střední': 1.0, 'nízká': 1.4 }[info.jist] ?? 1;
+        sigma = C * info.learnedSd * mult;
+        driver = 'learned';
+      } else {
+        const floor = tab[info.jist] ?? tab['střední'];
+        const rangeSd = info.sMax > info.sMin ? (info.sMax - info.sMin) / (2 * Z90) : 0;
+        sigma = Math.max(rangeSd, C * floor);
+      }
     } else if (info.kind === 'manual') {
       sigma = C * SRC_SD.manual;
     } else {
@@ -70,6 +77,9 @@
   }
 
   const probWithin = (sigma, T) => sigma <= 0 ? 1 : erf(T / (sigma * Math.SQRT2));
+  // Totéž, ale když nejlepší odhad skutečnosti leží o `shift` g jinde než zapsaná hodnota.
+  const probWithinShift = (sigma, T, shift) => sigma <= 0 ? (Math.abs(shift) <= T ? 1 : 0)
+    : 0.5 * (erf((T - shift) / (sigma * Math.SQRT2)) + erf((T + shift) / (sigma * Math.SQRT2)));
 
   // items: [{C, sigma}] → souhrn jídla nebo dne.
   function combine(items, T) {
@@ -97,12 +107,15 @@
     'ai-text': 'Odhad z popisu — uveďte gramy nebo konkrétní velikost porce.',
     manual: 'Ruční zápis — ověřte hodnotu na obalu, nebo naskenujte čárový kód.',
     db: 'Tabulková hodnota se liší podle výrobce — máte-li obal, naskenujte čárový kód.',
+    learned: 'Nejistota vychází z vašich minulých jídel ověřených glykémií — s dalšími jídly se zpřesní.',
+    confirmed: 'Ověřeno glykémií a potvrzeno vámi.',
+    cgm: 'Upřesněno podle glykémie po jídle — otevřete jídlo a skutečnou hodnotu potvrďte.',
     label: 'Hodnota z obalu je přesná — zbývající nejistota je hlavně v množství.',
     custom: 'Hodnota z obalu je přesná — zbývající nejistota je hlavně v množství.',
   };
 
   root.CONF = {
-    erf, portionKind, kindForFood, entrySigma, probWithin, combine, level, pct, Z90,
+    erf, portionKind, kindForFood, entrySigma, probWithin, probWithinShift, combine, level, pct, Z90,
     LEVEL_LABEL, KIND_LABEL, PORTION_LABEL, TIP, DISH_CATS,
   };
   if (typeof module !== 'undefined') module.exports = root.CONF;
