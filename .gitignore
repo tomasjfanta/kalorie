@@ -5,3 +5,6 @@ Thumbs.db
 
 # Nightscout secrets — never publish
 nightscout-setup/
+
+# AI server dependencies
+ai-server/node_modules/

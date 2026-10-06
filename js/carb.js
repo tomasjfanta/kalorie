@@ -43,7 +43,7 @@
     }).filter(Boolean);
   }
   function cal() { if (!calCache) calCache = LEARN.calibrate(samples(), Date.now()); return calCache; }
-  const invalidate = () => { calCache = null; };
+  const invalidate = () => { calCache = null; vwCache = null; };
 
   // Bez inzulinu: osobní reakce glykémie na 1 g sacharidů (z potvrzených, jinak z AI odhadů → jen relativní).
   function kNone() {
@@ -212,8 +212,18 @@
     return ex.length ? ' Jídla tohoto uživatele, jejichž skutečné sacharidy byly ověřeny glykémií — použij je k rozpoznání jeho obvyklých jídel a velikostí porcí: ' + ex.join('; ') + '.' : '';
   }
 
-  const RUNS = 5; // nezávislých odhadů na fotku — medián je stabilnější než jeden odhad
+  // Nezávislých odhadů na fotku: Gemini (zdarma) 5×, Claude (předplatné, je-li nastavený) 2×.
+  const PLAN = { gemini: 5, claude: 2 };
   const JIST = ['nízká', 'střední', 'vysoká'];
+  let vwCache = null;
+  // Váhy AI podle jejich ověřené přesnosti u vás (viz LEARN.vendorWeights).
+  function vw() {
+    if (!vwCache) vwCache = LEARN.vendorWeights(photoEntries().filter(e => !e.excl && e.aiRuns?.length).map(e => ({
+      ts: e.ts, runs: e.aiRuns,
+      label: e.conf != null ? e.conf : e.ev?.implied && (e.ev.quality === 'good' || e.ev.quality === 'fair') ? e.ev.implied : null,
+    })), Date.now());
+    return vwCache;
+  }
   // Jedna odpověď modelu → { c, min, max, jist (0–2), kat, j, model }
   function parseRun({ result: j, model }) {
     const jt = String(j.jistota || '').toLowerCase();
@@ -225,14 +235,15 @@
   }
 
   async function analyze() {
-    const status = (k, n) => { $('#cnew-status').textContent = `Odhaduji sacharidy… ${k}/${n} (pár vteřin)`; };
-    status(0, RUNS);
-    const res = await AI.callGeminiRuns(
-      { imageBase64: pending.img.base64, imageMedia: 'image/jpeg', extra: examplesText() }, RUNS, status);
+    const plan = { gemini: K.aiConfig().key ? PLAN.gemini : 0, claude: AI.claudeReady() ? PLAN.claude : 0 };
+    const status = (k, n) => { $('#cnew-status').textContent = `Odhaduji sacharidy… ${k}/${n}${plan.claude ? ' (Claude chvíli přemýšlí)' : ' (pár vteřin)'}`; };
+    status(0, plan.gemini + plan.claude);
+    const res = plan.gemini + plan.claude ? await AI.callRuns(
+      { imageBase64: pending.img.base64, imageMedia: 'image/jpeg', extra: examplesText() }, plan, status) : { error: 'nokey' };
     if (!pending) return;
     if (res.error) { $('#cnew-status').textContent = AI.errMsg(res); $('#cnew-retry').classList.remove('hidden'); return; }
     const runs = res.runs.map(parseRun);
-    const E = LEARN.ensemble(runs);
+    const E = LEARN.ensemble(runs, vw());
     const j = E.rep.j;
     const aiRaw = E.c, kat = E.kat;
     const c = LEARN.applyCal(aiRaw, kat, cal());
@@ -249,8 +260,13 @@
     $$('.cnew-ins').forEach(x => x.classList.toggle('hidden', therapy().type === 'none'));
     const calTxt = Math.abs(c.factor - 1) > 0.02
       ? ` → podle vašich ověřených jídel (${LEARN.CATS[kat].short}) ×${dec(Math.round(c.factor * 100) / 100)} = <b>${r0(c.C)} g</b>` : '';
-    const runsTxt = E.n > 1 ? ` <span class="muted">(medián z ${E.n} odhadů: ${E.values.map(r0).join(' · ')} g)</span>` : '';
-    $('#cnew-ai').innerHTML = `AI odhad: ${r0(aiRaw)} g${runsTxt}${calTxt}${j.poznamka ? '<br>' + esc(j.poznamka) : ''}`;
+    // Po AI: „Gemini 48 g (5×: 44 · 47 · 48 · 50 · 55)“; u více AI i jejich váha.
+    const multi = E.vendors.length > 1;
+    const runsTxt = E.n > 1 ? '<br><span class="muted small-text">' + E.vendors.map(x =>
+      `${x.label} ${r0(x.c)} g${x.n > 1 ? ` (${x.n}×: ${x.values.map(r0).join(' · ')})` : ''}${multi ? ` · váha ${Math.round(x.share * 100)} %` : ''}`).join('<br>') + '</span>' : '';
+    const failTxt = Object.entries(res.errors || {}).map(([v, e]) =>
+      `<br><span class="muted small-text">⚠️ ${LEARN.VENDOR_LABEL[v]} tentokrát neodpověděl: ${esc(AI.errMsg(e))}</span>`).join('');
+    $('#cnew-ai').innerHTML = `AI odhad: ${r0(aiRaw)} g${calTxt}${runsTxt}${failTxt}${j.poznamka ? '<br>' + esc(j.poznamka) : ''}`;
     newConf();
     $('#cnew-status').textContent = '';
     $('#cnew-form').classList.remove('hidden');
@@ -458,6 +474,14 @@
     if (cats.length) {
       h += '<div class="card"><div class="card-title">Podle druhu jídla</div>' + cats.map(([k, v]) =>
         `<div class="learn-row"><span>${LEARN.CATS[k].label}<br><span class="muted small-text">${v.n} ověř.</span></span><b>${Math.abs(v.factor - 1) < 0.03 ? 'přesné' : 'korekce ' + pctTxt(v.factor)}</b></div>`).join('') + '</div>';
+    }
+    const w = vw(), used = [...new Set([...Object.keys(w), ...(K.aiConfig().key ? ['gemini'] : []), ...(AI.claudeReady() ? ['claude'] : [])])];
+    if (used.length > 1 || Object.keys(w).length) {
+      const sh = LEARN.vendorShares(w, used);
+      h += '<div class="card"><div class="card-title">AI modely</div>' + used.map(v =>
+        `<div class="learn-row"><span>${LEARN.VENDOR_LABEL[v]}<br><span class="muted small-text">${w[v]
+          ? `${w[v].n} ověř. · typická chyba ±${Math.round((Math.exp(w[v].rmse) - 1) * 100)} %` : 'zatím bez ověřených jídel'}</span></span><b>váha ${Math.round(sh[v] * 100)} %</b></div>`).join('')
+        + '<p class="muted small-text">Odhad fotky je vážený průměr AI. Váhy se posouvají k té, která u vašich jídel ověřených glykémií chybuje méně; dokud je dat málo, jsou vyrovnané.</p></div>';
     }
     const ns = K.store.get('kal.ns', null), nsLast = K.store.get('kal.nsLast', null), cl = K.store.get('kal.clImport', null), nsErr = K.store.get('kal.nsErr', null);
     h += '<div class="card"><div class="card-title">Zdroj glykémie</div>';

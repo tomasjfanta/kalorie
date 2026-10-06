@@ -253,13 +253,56 @@
     return out;
   }
 
-  /* ─── Několik odhadů téže fotky → jeden ─── */
-  // runs: [{ c, min, max, jist (0 nízká – 2 vysoká), kat, ... }] → medián sacharidů, výběrová SD,
-  // reprezentativní odhad (nejblíž mediánu — z něj název a poznámka) a většinová kategorie.
-  // SD má smysl až od 3 odhadů.
-  function ensemble(runs) {
+  /* ─── Několik odhadů téže fotky (i od různých AI) → jeden ─── */
+  const vendorOf = m => /^claude/i.test(m || '') ? 'claude' : 'gemini';
+  const VENDOR_LABEL = { gemini: 'Gemini', claude: 'Claude' };
+  // Předpoklad o přesnosti AI, dokud o ní nejsou data: typická log-chyba ~35 %.
+  const VW_PRIOR = 0.35 ** 2, VW_K = 4;
+  // Váha každé AI podle toho, jak blízko byly její odhady (medián jejích běhů) skutečnosti
+  // ověřené glykémií: 1 / střední kvadratická log-chyba, smrštěná k předpokladu (VW_K jídel),
+  // takže s málo daty jsou váhy vyrovnané a teprve s ověřenými jídly se rozcházejí.
+  // samples: [{ ts, label, runs: [{ m, c }] }]
+  function vendorWeights(samples, now) {
+    const acc = {};
+    for (const s of samples) {
+      if (!(s.label > 0) || !s.runs?.length) continue;
+      const decay = Math.pow(0.5, Math.max(0, (now - s.ts) / 86400000) / HALF_LIFE_D);
+      const by = {};
+      for (const r of s.runs) if (r.c > 0) (by[vendorOf(r.m)] ??= []).push(r.c);
+      for (const [v, xs] of Object.entries(by)) {
+        const e = Math.log(s.label / median(xs));
+        const a = acc[v] ??= { w: 0, se: 0, n: 0 };
+        a.w += decay; a.se += decay * e * e; a.n++;
+      }
+    }
+    const out = {};
+    for (const [v, a] of Object.entries(acc))
+      out[v] = { n: a.n, rmse: Math.sqrt(a.se / a.w), weight: (a.w + VW_K) / (a.se + VW_K * VW_PRIOR) };
+    return out;
+  }
+
+  // Podíly vah pro dané AI (bez dat = předpoklad, tedy vyrovnané).
+  function vendorShares(vw, list) {
+    const ws = list.map(v => vw[v]?.weight ?? 1 / VW_PRIOR), W = ws.reduce((a, b) => a + b, 0);
+    return Object.fromEntries(list.map((v, i) => [v, ws[i] / W]));
+  }
+
+  // runs: [{ c, model, min, max, jist (0 nízká – 2 vysoká), kat, ... }] → výsledek:
+  // každá AI zvlášť medián svých běhů (potlačí náhodný šum), AI mezi sebou vážený průměr
+  // (různé AI chybují jinde, takže se chyby částečně ruší); vw = vendorWeights().
+  // SD přes všechny běhy (od 3) zahrnuje i neshodu mezi AI. Reprezentativní odhad
+  // (nejblíž výsledku) dá název a poznámku, kategorie je většinová.
+  function ensemble(runs, vw = {}) {
     const xs = runs.map(r => r.c).sort((a, b) => a - b), n = xs.length;
-    const c = median(xs);
+    const by = {};
+    for (const r of runs) (by[vendorOf(r.model)] ??= []).push(r.c);
+    const vendors = Object.entries(by).map(([v, a]) => ({
+      v, label: VENDOR_LABEL[v], c: median(a), n: a.length, values: [...a].sort((p, q) => p - q),
+      w: vw[v]?.weight ?? 1 / VW_PRIOR,
+    }));
+    const W = vendors.reduce((s, x) => s + x.w, 0);
+    for (const x of vendors) x.share = x.w / W;
+    const c = vendors.reduce((s, x) => s + x.share * x.c, 0);
     const mean = xs.reduce((a, x) => a + x, 0) / n;
     const sd = n >= 3 ? Math.sqrt(xs.reduce((a, x) => a + (x - mean) ** 2, 0) / (n - 1)) : null;
     const rep = runs.reduce((b, r) => Math.abs(r.c - c) < Math.abs(b.c - c) ? r : b);
@@ -269,12 +312,12 @@
     const kat = votes[rep.kat] === top ? rep.kat : Object.keys(votes).find(k => votes[k] === top);
     const ranged = runs.filter(r => isFinite(r.min) && isFinite(r.max));
     return {
-      c, sd, n, values: xs, rep, kat, jist: Math.round(median(runs.map(r => r.jist))),
+      c, sd, n, values: xs, vendors, rep, kat, jist: Math.round(median(runs.map(r => r.jist))),
       min: ranged.length ? median(ranged.map(r => r.min)) : undefined,
       max: ranged.length ? median(ranged.map(r => r.max)) : undefined,
     };
   }
 
-  root.LEARN = { CATS, catKey, ensemble, insulinActed, segmentAt, evaluateMeal, calibrate, applyCal, estimateKNone, combine, parseCareLink, REL_SD, MIN };
+  root.LEARN = { CATS, catKey, ensemble, vendorWeights, vendorShares, vendorOf, VENDOR_LABEL, insulinActed, segmentAt, evaluateMeal, calibrate, applyCal, estimateKNone, combine, parseCareLink, REL_SD, MIN };
   if (typeof module !== 'undefined') module.exports = root.LEARN;
 })(typeof window !== 'undefined' ? window : globalThis);

@@ -1,0 +1,8 @@
+{
+  "name": "kalorie-ai",
+  "private": true,
+  "description": "Kalorie: carb estimate from a meal photo via the Claude Code CLI on the owner's Claude subscription",
+  "scripts": { "start": "node server.js" },
+  "engines": { "node": ">=22" },
+  "dependencies": { "@anthropic-ai/claude-code": "2.1.292" }
+}

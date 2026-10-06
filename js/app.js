@@ -852,6 +852,7 @@ function fillSettings() {
   $('#set-prot').value = settings.prot || '';
   $('#set-water').value = settings.water || 2000;
   $('#set-ai-key').value = aiCfg.key || '';
+  $('#set-claude-url').value = aiCfg.claudeUrl || '';
   const modelSel = $('#set-ai-model');
   if (![...modelSel.options].some(o => o.value === aiCfg.model)) {
     // model zvolený automatickou zálohou nemusí být v nabídce — přidej ho
@@ -884,7 +885,8 @@ $('#save-carb').addEventListener('click', () => {
   renderDnes(); toast('Uloženo');
 });
 $('#save-ai').addEventListener('click', () => {
-  aiCfg = { key: $('#set-ai-key').value.trim(), model: $('#set-ai-model').value };
+  aiCfg = { key: $('#set-ai-key').value.trim(), model: $('#set-ai-model').value,
+    claudeUrl: $('#set-claude-url').value.trim().replace(/\/+$/, '') };
   store.set('kal.ai', aiCfg);
   $('#ai-key-note').textContent = aiCfg.key ? '✓ Klíč uložen — AI odhady jsou připravené.' : 'Bez klíče AI odhady nefungují.';
   toast('Uloženo');

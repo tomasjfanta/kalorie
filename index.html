@@ -242,6 +242,12 @@
           <option value="gemini-3.5-flash">Gemini 3.5 Flash — starší</option>
         </select>
       </label>
+      <div class="carb-only">
+        <label class="field">Claude — adresa serveru <span class="muted">— nepovinné</span>
+          <input id="set-claude-url" type="url" autocomplete="off" placeholder="https://kalorie-ai-….up.railway.app">
+        </label>
+        <p class="muted small-text">Ke každé fotce přidá 2 nezávislé odhady od Claude přes vaše předplatné Claude. Přístup se ověřuje tokenem Nightscoutu z karty „Data z CGM a pumpy“.</p>
+      </div>
       <button id="save-ai" class="btn">Uložit</button>
       <div id="ai-key-note" class="muted small-text" style="margin-top:8px"></div>
       <p class="muted small-text" style="margin-top:8px">Pozn.: u bezplatného klíče může Google zaslaná data použít ke zlepšování svých služeb — neposílejte fotky, na kterých je něco citlivého.</p>

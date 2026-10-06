@@ -92,17 +92,43 @@
     return parsed.result ? { ...parsed, model: used } : parsed;
   }
 
-  // Několik nezávislých odhadů téže fotky najednou (souběžně, takže skoro stejně rychle jako jeden).
-  // Jediný odhad z jedné fotky se při opakování znatelně liší — medián je stabilnější a rozptyl
-  // odhadů ukazuje, jak nejistá je právě tahle fotka. Vrací { runs: [{ result, model }] }
-  // s úspěšnými odhady, nebo chybu, když neuspěl žádný.
-  async function callGeminiRuns(args, n, onProgress) {
+  // Claude přes vlastní server (ai-server/ na Railway): ten spouští `claude -p` na předplatném
+  // Claude uživatele. Přístup ověří tokenem Nightscoutu, který aplikace už má.
+  const claudeReady = () => !!(cfg().claudeUrl && window.KAL.store.get('kal.ns', null)?.token);
+  async function callClaude({ imageBase64, imageMedia, extra }) {
+    const url = String(cfg().claudeUrl || '').trim().replace(/\/+$/, '');
+    const token = window.KAL.store.get('kal.ns', null)?.token;
+    if (!url || !token) return { error: 'noclaude' };
+    let r;
+    try {
+      r = await fetch(url + '/estimate', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', authorization: 'Bearer ' + token },
+        body: JSON.stringify({ system: SYS + SYS_CARB + (extra || ''), prompt: 'Odhadni sacharidy tohoto jídla z fotky.',
+          image: imageBase64, media: imageMedia }),
+        signal: AbortSignal.timeout(170000),
+      });
+    } catch (e) { return { error: 'network' }; }
+    const j = await r.json().catch(() => ({}));
+    if (r.ok && j.result) return { result: j.result, model: j.model };
+    return { error: r.status === 401 ? 'claude-auth' : j.error === 'not-logged-in' ? 'claude-login'
+      : r.status === 429 ? 'quota' : 'api', status: r.status, msg: j.detail || j.error };
+  }
+
+  // Několik nezávislých odhadů téže fotky najednou, i od různých AI (souběžně, takže skoro stejně
+  // rychle jako jeden). Jediný odhad z jedné fotky se při opakování znatelně liší — medián je
+  // stabilnější a rozptyl ukazuje, jak nejistá je právě tahle fotka. plan: { gemini: 5, claude: 2 }.
+  // Vrací { runs: [{ result, model }], errors: { gemini?, claude? } }, nebo chybu, když neuspělo nic.
+  async function callRuns(args, plan, onProgress) {
+    const jobs = [];
+    for (let i = 0; i < (plan.gemini || 0); i++) jobs.push(['gemini', () => callGemini({ ...args, temperature: null })]);
+    for (let i = 0; i < (plan.claude || 0); i++) jobs.push(['claude', () => callClaude(args)]);
     let done = 0;
-    const one = () => callGemini({ ...args, temperature: null })
-      .then(r => { onProgress?.(++done, n); return r; });
-    const all = await Promise.all(Array.from({ length: n }, one));
-    const ok = all.filter(r => r.result);
-    return ok.length ? { runs: ok } : all[0];
+    const all = await Promise.all(jobs.map(([v, run]) => run().then(r => { onProgress?.(++done, jobs.length); return { ...r, v }; })));
+    const ok = all.filter(r => r.result), errors = {};
+    // Chyba se hlásí jen u AI, která neodpověděla ani jednou (jeden vypadlý běh z pěti nevadí).
+    for (const r of all) if (!r.result && !errors[r.v] && !ok.some(o => o.v === r.v)) errors[r.v] = r;
+    return ok.length ? { runs: ok, errors } : (errors.gemini || errors.claude || { error: 'empty' });
   }
 
   function parseAnswer(resp) {
@@ -138,6 +164,9 @@
   function errMsg(e) {
     switch (e.error) {
       case 'nokey': return 'Nejdřív vložte bezplatný Google API klíč v Nastavení → AI odhady.';
+      case 'noclaude': return 'Claude není nastavený (Nastavení → AI odhady → adresa serveru Claude a token Nightscoutu).';
+      case 'claude-auth': return 'Server Claude nepřijal token Nightscoutu — zkontrolujte ho v Nastavení → Data z CGM a pumpy.';
+      case 'claude-login': return 'Server Claude není přihlášený k vašemu předplatnému (proměnná CLAUDE_CODE_OAUTH_TOKEN na Railway).';
       case 'auth': return 'API klíč je neplatný. Zkontrolujte ho v Nastavení → AI odhady.';
       case 'quota': return 'Bezplatný limit je teď vyčerpaný (příliš požadavků). Zkuste to za minutu, případně zítra.';
       case 'model': return 'Žádný z AI modelů teď není pro bezplatný klíč dostupný. Zkuste to později.';
@@ -210,5 +239,5 @@
     });
   }
 
-  window.AI = { callGemini, callGeminiRuns, downscale, errMsg };
+  window.AI = { callGemini, callClaude, callRuns, claudeReady, downscale, errMsg };
 })();

@@ -1,7 +1,7 @@
 // Service worker — aplikace funguje offline. Data (deník) jsou v localStorage, tady cachujeme jen kód.
 // Strategie: network-first pro vlastní soubory (online vždy nejnovější verze),
 // s cache jako záložkou pro offline režim.
-const CACHE = 'kalorie-v11';
+const CACHE = 'kalorie-v12';
 const ASSETS = [
   './',
   './index.html',
