@@ -25,12 +25,14 @@
   // Modely k vyzkoušení v pořadí — Google občas starší modely pro bezplatné klíče vypne,
   // proto se při chybě „model není dostupný" zkusí automaticky další a ten, co funguje,
   // se zapamatuje.
+  // (Bezplatné modely podle ai.google.dev/gemini-api/docs/pricing, říjen 2026.)
   const MODEL_CHAIN = [
+    'gemini-3.8-flash',
+    'gemini-3.7-flash',
+    'gemini-3.6-flash',
     'gemini-3.5-flash',
-    'gemini-3.1-flash-lite',
     'gemini-3-flash-preview',
     'gemini-2.5-flash',
-    'gemini-2.5-flash-lite',
   ];
   const modelUnavailable = (status, msg) =>
     (status === 404) || /no longer available|not available for free|not supported|not found/i.test(msg || '');
@@ -42,6 +44,7 @@
         method: 'POST',
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify(body),
+        signal: AbortSignal.timeout(60000), // zaseknutý požadavek nesmí blokovat ostatní odhady
       });
     } catch (e) { return { error: 'network' }; }
     if (!r.ok) {
@@ -56,7 +59,7 @@
     return { response: await r.json() };
   }
 
-  async function callGemini({ text, imageBase64, imageMedia, extra }) {
+  async function callGemini({ text, imageBase64, imageMedia, extra, temperature = 0.2 }) {
     const c = cfg();
     if (!c.key) return { error: 'nokey' };
     const parts = [];
@@ -67,23 +70,42 @@
       contents: [{ role: 'user', parts }],
       // Gemini 3.x jsou „přemýšlecí" modely — interní uvažování se počítá do maxOutputTokens.
       // S malým limitem model celý budget spotřebuje na přemýšlení a nevrátí žádný text.
-      generationConfig: { responseMimeType: 'application/json', temperature: 0.2, maxOutputTokens: 8192 },
+      // temperature: null = výchozí hodnota modelu (u Gemini 3 je 1,0 a Google ji doporučuje neměnit).
+      generationConfig: { responseMimeType: 'application/json', maxOutputTokens: 8192,
+        ...(temperature != null ? { temperature } : {}) },
     };
 
     // Zvolený model první, pak zbytek řetězce jako záloha.
     const chain = [c.model, ...MODEL_CHAIN.filter(m => m !== c.model)].filter(Boolean);
-    let out = null;
+    let out = null, used = null;
     for (const model of chain) {
       out = await callModel(model, c.key, body);
       if (out.response) {
+        used = model;
         if (model !== c.model) window.KAL.setAiModel(model); // zapamatuj funkční model
         break;
       }
       if (out.error !== 'model') break; // jiná chyba než „model nedostupný" → nezkoušet dál
     }
     if (!out.response) return out;
+    const parsed = parseAnswer(out.response);
+    return parsed.result ? { ...parsed, model: used } : parsed;
+  }
 
-    const resp = out.response;
+  // Několik nezávislých odhadů téže fotky najednou (souběžně, takže skoro stejně rychle jako jeden).
+  // Jediný odhad z jedné fotky se při opakování znatelně liší — medián je stabilnější a rozptyl
+  // odhadů ukazuje, jak nejistá je právě tahle fotka. Vrací { runs: [{ result, model }] }
+  // s úspěšnými odhady, nebo chybu, když neuspěl žádný.
+  async function callGeminiRuns(args, n, onProgress) {
+    let done = 0;
+    const one = () => callGemini({ ...args, temperature: null })
+      .then(r => { onProgress?.(++done, n); return r; });
+    const all = await Promise.all(Array.from({ length: n }, one));
+    const ok = all.filter(r => r.result);
+    return ok.length ? { runs: ok } : all[0];
+  }
+
+  function parseAnswer(resp) {
     const cand = resp.candidates?.[0];
     if (!cand) return { error: resp.promptFeedback?.blockReason ? 'blocked' : 'empty' };
     // Přeskočit případné „thought" části (interní uvažování modelu) — odpověď je v běžných text částech.
@@ -188,5 +210,5 @@
     });
   }
 
-  window.AI = { callGemini, downscale, errMsg };
+  window.AI = { callGemini, callGeminiRuns, downscale, errMsg };
 })();

@@ -64,6 +64,10 @@
         const rangeSd = info.sMax > info.sMin ? (info.sMax - info.sMin) / (2 * Z90) : 0;
         sigma = Math.max(rangeSd, C * floor);
       }
+      // Rozptyl několika nezávislých odhadů téže fotky: když se neshodnou, je fotka nejistá.
+      // Shoda ale přesnost nedokazuje (všechny odhady sdílí stejnou chybu modelu),
+      // proto rozptyl nejistotu jen zvyšuje, nikdy nesnižuje.
+      if (info.sSd > sigma) { sigma = info.sSd; driver = 'spread'; }
     } else if (info.kind === 'manual') {
       sigma = C * SRC_SD.manual;
     } else {
@@ -108,6 +112,7 @@
     manual: 'Ruční zápis — ověřte hodnotu na obalu, nebo naskenujte čárový kód.',
     db: 'Tabulková hodnota se liší podle výrobce — máte-li obal, naskenujte čárový kód.',
     learned: 'Nejistota vychází z vašich minulých jídel ověřených glykémií — s dalšími jídly se zpřesní.',
+    spread: 'Opakované odhady AI se u této fotky hodně liší. Pomůže vyfotit celý talíř shora, nebo přílohu zvážit a hodnotu upravit.',
     confirmed: 'Ověřeno glykémií a potvrzeno vámi.',
     cgm: 'Upřesněno podle glykémie po jídle — otevřete jídlo a skutečnou hodnotu potvrďte.',
     label: 'Hodnota z obalu je přesná — zbývající nejistota je hlavně v množství.',

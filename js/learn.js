@@ -253,6 +253,28 @@
     return out;
   }
 
-  root.LEARN = { CATS, catKey, insulinActed, segmentAt, evaluateMeal, calibrate, applyCal, estimateKNone, combine, parseCareLink, REL_SD, MIN };
+  /* ─── Několik odhadů téže fotky → jeden ─── */
+  // runs: [{ c, min, max, jist (0 nízká – 2 vysoká), kat, ... }] → medián sacharidů, výběrová SD,
+  // reprezentativní odhad (nejblíž mediánu — z něj název a poznámka) a většinová kategorie.
+  // SD má smysl až od 3 odhadů.
+  function ensemble(runs) {
+    const xs = runs.map(r => r.c).sort((a, b) => a - b), n = xs.length;
+    const c = median(xs);
+    const mean = xs.reduce((a, x) => a + x, 0) / n;
+    const sd = n >= 3 ? Math.sqrt(xs.reduce((a, x) => a + (x - mean) ** 2, 0) / (n - 1)) : null;
+    const rep = runs.reduce((b, r) => Math.abs(r.c - c) < Math.abs(b.c - c) ? r : b);
+    const votes = {};
+    for (const r of runs) votes[r.kat] = (votes[r.kat] || 0) + 1;
+    const top = Math.max(...Object.values(votes));
+    const kat = votes[rep.kat] === top ? rep.kat : Object.keys(votes).find(k => votes[k] === top);
+    const ranged = runs.filter(r => isFinite(r.min) && isFinite(r.max));
+    return {
+      c, sd, n, values: xs, rep, kat, jist: Math.round(median(runs.map(r => r.jist))),
+      min: ranged.length ? median(ranged.map(r => r.min)) : undefined,
+      max: ranged.length ? median(ranged.map(r => r.max)) : undefined,
+    };
+  }
+
+  root.LEARN = { CATS, catKey, ensemble, insulinActed, segmentAt, evaluateMeal, calibrate, applyCal, estimateKNone, combine, parseCareLink, REL_SD, MIN };
   if (typeof module !== 'undefined') module.exports = root.LEARN;
 })(typeof window !== 'undefined' ? window : globalThis);

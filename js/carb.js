@@ -212,22 +212,35 @@
     return ex.length ? ' Jídla tohoto uživatele, jejichž skutečné sacharidy byly ověřeny glykémií — použij je k rozpoznání jeho obvyklých jídel a velikostí porcí: ' + ex.join('; ') + '.' : '';
   }
 
+  const RUNS = 5; // nezávislých odhadů na fotku — medián je stabilnější než jeden odhad
+  const JIST = ['nízká', 'střední', 'vysoká'];
+  // Jedna odpověď modelu → { c, min, max, jist (0–2), kat, j, model }
+  function parseRun({ result: j, model }) {
+    const jt = String(j.jistota || '').toLowerCase();
+    let min = +j.sacharidy_min, max = +j.sacharidy_max;
+    if (!(isFinite(min) && isFinite(max)) || min < 0) { min = undefined; max = undefined; }
+    else if (min > max) [min, max] = [max, min];
+    return { c: Math.max(0, +j.sacharidy || 0), min, max, kat: LEARN.catKey(j.kategorie), j, model,
+      jist: /vys|high/.test(jt) ? 2 : /níz|niz|low/.test(jt) ? 0 : 1 };
+  }
+
   async function analyze() {
-    $('#cnew-status').textContent = 'Odhaduji sacharidy… (pár vteřin)';
-    const res = await AI.callGemini({ imageBase64: pending.img.base64, imageMedia: 'image/jpeg', extra: examplesText() });
+    const status = (k, n) => { $('#cnew-status').textContent = `Odhaduji sacharidy… ${k}/${n} (pár vteřin)`; };
+    status(0, RUNS);
+    const res = await AI.callGeminiRuns(
+      { imageBase64: pending.img.base64, imageMedia: 'image/jpeg', extra: examplesText() }, RUNS, status);
     if (!pending) return;
     if (res.error) { $('#cnew-status').textContent = AI.errMsg(res); $('#cnew-retry').classList.remove('hidden'); return; }
-    const j = res.result;
-    const aiRaw = Math.max(0, +j.sacharidy || 0);
-    const kat = LEARN.catKey(j.kategorie);
+    const runs = res.runs.map(parseRun);
+    const E = LEARN.ensemble(runs);
+    const j = E.rep.j;
+    const aiRaw = E.c, kat = E.kat;
     const c = LEARN.applyCal(aiRaw, kat, cal());
-    const jt = String(j.jistota || '').toLowerCase();
-    const jist = /vys|high/.test(jt) ? 'vysoká' : /níz|niz|low/.test(jt) ? 'nízká' : 'střední';
-    let sMin = +j.sacharidy_min, sMax = +j.sacharidy_max;
-    if (!(isFinite(sMin) && isFinite(sMax)) || sMin < 0) { sMin = undefined; sMax = undefined; }
-    else { if (sMin > sMax) [sMin, sMax] = [sMax, sMin]; sMin *= c.factor; sMax *= c.factor; }
+    const sMin = E.min != null ? E.min * c.factor : undefined, sMax = E.max != null ? E.max * c.factor : undefined;
     const name = (j.nazev || 'Jídlo').trim() + (j.mnozstvi ? ' (' + String(j.mnozstvi).trim() + ')' : '');
-    pending.ai = { name, aiRaw, kat, factor: c.factor, jist, sMin, sMax, fat: Math.max(0, +j.tuky || 0),
+    pending.ai = { name, aiRaw, kat, factor: c.factor, jist: JIST[E.jist], sMin, sMax,
+      sSd: E.sd != null ? E.sd * c.factor : undefined,
+      runs: runs.map(r => ({ m: r.model, c: r.c })), values: E.values, fat: Math.max(0, +j.tuky || 0),
       kcal: Math.round(+j.kcal || 0), b: Math.round(+j.bilkoviny || 0), t: Math.round(+j.tuky || 0) };
     $('#cnew-name').value = name;
     $('#cnew-carbs').value = r0(c.C);
@@ -236,7 +249,8 @@
     $$('.cnew-ins').forEach(x => x.classList.toggle('hidden', therapy().type === 'none'));
     const calTxt = Math.abs(c.factor - 1) > 0.02
       ? ` → podle vašich ověřených jídel (${LEARN.CATS[kat].short}) ×${dec(Math.round(c.factor * 100) / 100)} = <b>${r0(c.C)} g</b>` : '';
-    $('#cnew-ai').innerHTML = `AI odhad: ${r0(aiRaw)} g${calTxt}${j.poznamka ? '<br>' + esc(j.poznamka) : ''}`;
+    const runsTxt = E.n > 1 ? ` <span class="muted">(medián z ${E.n} odhadů: ${E.values.map(r0).join(' · ')} g)</span>` : '';
+    $('#cnew-ai').innerHTML = `AI odhad: ${r0(aiRaw)} g${runsTxt}${calTxt}${j.poznamka ? '<br>' + esc(j.poznamka) : ''}`;
     newConf();
     $('#cnew-status').textContent = '';
     $('#cnew-form').classList.remove('hidden');
@@ -245,10 +259,11 @@
     if (!pending?.ai) return;
     const C = K.num($('#cnew-carbs').value);
     const a = pending.ai;
-    const r = CONF.entrySigma({ C, kind: 'ai-photo', jist: a.jist, sMin: a.sMin, sMax: a.sMax, learnedSd: cal().sd });
+    const r = CONF.entrySigma({ C, kind: 'ai-photo', jist: a.jist, sMin: a.sMin, sMax: a.sMax, sSd: a.sSd, learnedSd: cal().sd });
     const p = CONF.probWithin(r.sigma, K.TOL());
     $('#cnew-conf').innerHTML = `Jistota na ±${K.TOL()} g: ${K.badge(p)} · nejspíš ${r0(Math.max(0, C - CONF.Z90 * r.sigma))}–${r0(C + CONF.Z90 * r.sigma)} g${K.vjTxt(C)}`
-      + (cal().sd ? '<br>Počítá s vaší ověřenou přesností AI (±' + r0(cal().sd * 100) + ' %).' : '');
+      + (r.driver === 'spread' ? '<br>💡 ' + CONF.TIP.spread
+        : cal().sd ? '<br>Počítá s vaší ověřenou přesností AI (±' + r0(cal().sd * 100) + ' %).' : '');
   }
   $('#cnew-carbs').addEventListener('input', newConf);
 
@@ -270,8 +285,8 @@
     const id = 'p' + Date.now() + Math.random().toString(36).slice(2, 6);
     const C = K.num($('#cnew-carbs').value);
     const e = { id, n: $('#cnew-name').value.trim() || 'Jídlo', q: 1, s: C, kcal: a.kcal, b: a.b, t: a.t,
-      cs: 'ai-photo', jist: a.jist, sMin: a.sMin, sMax: a.sMax, meal: 'sv', ts, kat: a.kat, fat: a.fat,
-      aiRaw: a.aiRaw, calF: a.factor };
+      cs: 'ai-photo', jist: a.jist, sMin: a.sMin, sMax: a.sMax, sSd: a.sSd, meal: 'sv', ts, kat: a.kat, fat: a.fat,
+      aiRaw: a.aiRaw, calF: a.factor, aiRuns: a.runs };
     if (units > 0) e.units = units;
     K.day(K.dstr(new Date(ts))).e.push(e);
     K.saveAll();
@@ -343,7 +358,7 @@
       }
       const pendingWin = Date.now() < e.ts + POST;
       if (ev?.implied && LEARN.REL_SD[ev.quality]) {
-        const prior = CONF.entrySigma({ C: e.s, kind: 'ai-photo', jist: e.jist, sMin: e.sMin, sMax: e.sMax, learnedSd: cal().sd }).sigma;
+        const prior = CONF.entrySigma({ C: e.s, kind: 'ai-photo', jist: e.jist, sMin: e.sMin, sMax: e.sMax, sSd: e.sSd, learnedSd: cal().sd }).sigma;
         const post = LEARN.combine(e.s, prior, ev.implied, ev.quality);
         h += `<div class="ev-box">Podle glykémie a inzulinu mělo jídlo nejspíš <b>~${r0(ev.implied)} g</b> sacharidů (spolehlivost výpočtu: ${QLBL[ev.quality]}).<br>Spojeno s odhadem z fotky: <b>${r0(post.C)} g</b> (±${r0(CONF.Z90 * post.sigma)} g).</div>`;
         if (e.conf == null && !e.excl) h += `<div class="ev-actions"><input id="cm-conf" type="text" inputmode="decimal" value="${r0(post.C)}"><span class="unit">g</span><button id="cm-confirm" class="btn slim">✓ Potvrdit jako skutečnost</button></div>`;
