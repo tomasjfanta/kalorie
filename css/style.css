@@ -317,3 +317,49 @@ main { max-width: 520px; margin: 0 auto; padding: 4px 14px 24px; }
   padding: 10px 18px; border-radius: 22px; font-size: 14.5px; font-weight: 550;
   z-index: 60; white-space: nowrap; animation: up .2s ease;
 }
+
+/* ─── Režim: kalorie / sacharidy ─── */
+body.mode-carb .kcal-only { display: none !important; }
+body:not(.mode-carb) .carb-only { display: none !important; }
+button.ring-row { cursor: pointer; border-radius: 12px; padding: 4px 6px; }
+button.ring-row:active { background: var(--track); }
+
+/* ─── Jistota odhadu (rozhodovací vrstva) ─── */
+:root { --c-ok: #2fa96e; --c-mid: #d99124; --c-low: #d95d4e; --c-ok-bg: #e3f4ea; --c-mid-bg: #fbf0dc; --c-low-bg: #fbe5e2; }
+@media (prefers-color-scheme: dark) {
+  :root { --c-ok: #3cbd7f; --c-mid: #e8a13c; --c-low: #e57366; --c-ok-bg: #1c3227; --c-mid-bg: #3a2e18; --c-low-bg: #3d2220; }
+}
+.cbadge {
+  display: inline-block; font-size: 11.5px; font-weight: 700; padding: 2px 7px; border-radius: 8px;
+  font-variant-numeric: tabular-nums; vertical-align: middle; white-space: nowrap;
+}
+.cbadge.ok { color: var(--c-ok); background: var(--c-ok-bg); }
+.cbadge.mid { color: var(--c-mid); background: var(--c-mid-bg); }
+.cbadge.low { color: var(--c-low); background: var(--c-low-bg); }
+.e-carb { display: flex; flex-direction: column; align-items: flex-end; gap: 3px; }
+.meal-decision {
+  display: block; width: 100%; text-align: left; font-size: 13px; line-height: 1.45;
+  border-radius: 10px; padding: 8px 10px; margin: 2px 0 6px;
+}
+.meal-decision.mid { background: var(--c-mid-bg); color: var(--text); }
+.meal-decision.low { background: var(--c-low-bg); color: var(--text); }
+.meal-decision b { font-weight: 700; }
+.conf-box { font-size: 13px; line-height: 1.5; margin-top: 8px; color: var(--muted); }
+.conf-box:empty { display: none; }
+.conf-row {
+  display: flex; justify-content: space-between; gap: 10px; align-items: flex-start;
+  padding: 10px 0; border-bottom: 1px solid var(--border);
+}
+.conf-row:last-child { border-bottom: none; }
+.conf-row .cr-name { font-size: 14.5px; font-weight: 600; }
+.conf-row .cr-sub { font-size: 12.5px; color: var(--muted); margin-top: 2px; }
+.conf-row .cr-tip { font-size: 12.5px; margin-top: 4px; }
+.conf-row .cr-right { text-align: right; white-space: nowrap; }
+.conf-row .cr-right b { display: block; font-size: 15px; font-variant-numeric: tabular-nums; }
+.conf-summary { border-radius: 12px; padding: 12px; margin-bottom: 8px; font-size: 14px; line-height: 1.5; }
+.conf-summary.ok { background: var(--c-ok-bg); }
+.conf-summary.mid { background: var(--c-mid-bg); }
+.conf-summary.low { background: var(--c-low-bg); }
+.conf-how { margin-top: 12px; font-size: 13px; color: var(--muted); line-height: 1.55; }
+.conf-how summary { cursor: pointer; font-weight: 600; color: var(--text); padding: 6px 0; }
+.conf-how p { margin-top: 6px; }

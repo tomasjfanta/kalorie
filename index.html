@@ -41,16 +41,22 @@
           <div id="ring-sub" class="ring-sub">kcal zbývá</div>
         </div>
       </div>
-      <div class="ring-row">
+      <div class="ring-row kcal-only">
         <div class="ring-stat"><span id="stat-eaten">0</span><small>snědeno</small></div>
         <div class="ring-stat"><span id="stat-goal">–</span><small>cíl</small></div>
         <div class="ring-stat"><span id="stat-burn">0</span><small>spáleno</small></div>
         <div class="ring-stat"><span id="stat-tdee">–</span><small>výdej</small></div>
       </div>
-      <div id="macros" class="macros"></div>
+      <button class="ring-row carb-only conf-open" data-conf="day">
+        <div class="ring-stat"><span id="cstat-eaten">0</span><small>sacharidy</small></div>
+        <div class="ring-stat"><span id="cstat-goal">–</span><small>cíl</small></div>
+        <div class="ring-stat"><span id="cstat-conf">–</span><small>Ø jistota</small></div>
+        <div class="ring-stat"><span id="cstat-range">–</span><small>rozsah 90 %</small></div>
+      </button>
+      <div id="macros" class="macros kcal-only"></div>
     </div>
 
-    <div id="goal-hint" class="card hint hidden">
+    <div id="goal-hint" class="card hint hidden kcal-only">
       👋 Nejdřív si nastavte denní cíl kalorií v <button class="linklike" data-goto="nastaveni">Nastavení</button>.
     </div>
 
@@ -62,7 +68,7 @@
       <div id="water-row" class="water-row"></div>
     </div>
 
-    <div class="card">
+    <div class="card kcal-only">
       <div class="row-between">
         <div class="card-title">🏃 Pohyb</div>
         <div id="act-total" class="muted"></div>
@@ -114,17 +120,49 @@
   <!-- ═══ NASTAVENÍ ═══ -->
   <section id="view-nastaveni" class="view">
     <div class="card">
+      <div class="card-title">Režim aplikace</div>
+      <div class="seg" id="mode-seg">
+        <button data-mode="kcal">🔥 Kalorie</button>
+        <button data-mode="carb">🩸 Sacharidy (diabetes)</button>
+      </div>
+      <p class="muted small-text">Režim platí jen pro tento telefon. V režimu Sacharidy aplikace sleduje pouze sacharidy a u každého údaje ukazuje, s jakou pravděpodobností odpovídá skutečnosti.</p>
+    </div>
+
+    <div class="card carb-only">
+      <div class="card-title">Sacharidy</div>
+      <label class="field">Denní cíl sacharidů (g) <span class="muted">— nepovinné</span>
+        <input id="set-carb" type="number" inputmode="numeric" min="20" max="600" placeholder="např. 180">
+      </label>
+      <label class="field">Tolerance „správného" odhadu
+        <select id="set-tol">
+          <option value="5">±5 g — přísná</option>
+          <option value="10">±10 g — doporučeno</option>
+          <option value="15">±15 g — volnější</option>
+        </select>
+      </label>
+      <label class="field">Zobrazovat i výměnné jednotky
+        <select id="set-vj">
+          <option value="0">Ne, jen gramy</option>
+          <option value="10">Ano, 1 VJ = 10 g</option>
+          <option value="12">Ano, 1 VJ = 12 g</option>
+        </select>
+      </label>
+      <button id="save-carb" class="btn">Uložit</button>
+      <p class="muted small-text" style="margin-top:8px">Orientační odhad pro přehled — nenahrazuje měření glykémie ani doporučení diabetologa k dávkování inzulinu.</p>
+    </div>
+
+    <div class="card">
       <div class="card-title">Denní cíle</div>
-      <label class="field">Kalorie (kcal)
+      <label class="field kcal-only">Kalorie (kcal)
         <input id="set-kcal" type="number" inputmode="numeric" min="800" max="6000" placeholder="např. 1800">
       </label>
-      <label class="field">Bílkoviny (g) <span class="muted">— nepovinné</span>
+      <label class="field kcal-only">Bílkoviny (g) <span class="muted">— nepovinné</span>
         <input id="set-prot" type="number" inputmode="numeric" min="0" max="400" placeholder="např. 90">
       </label>
       <label class="field">Pití (ml)
         <input id="set-water" type="number" inputmode="numeric" min="500" max="6000" step="250" placeholder="2000">
       </label>
-      <button id="open-calc" class="btn btn-ghost">🧮 Spočítat doporučený příjem</button>
+      <button id="open-calc" class="btn btn-ghost kcal-only">🧮 Spočítat doporučený příjem</button>
       <button id="save-settings" class="btn">Uložit nastavení</button>
     </div>
 
@@ -232,7 +270,8 @@
       <div id="food-total-note" class="muted small-text"></div>
       <div id="food-kcal-preview" class="kcal-preview">0 kcal</div>
     </div>
-    <div id="food-macro-preview" class="muted small-text"></div>
+    <div id="food-macro-preview" class="muted small-text kcal-only"></div>
+    <div id="food-conf" class="conf-box carb-only"></div>
     <div class="card-title" style="margin-top:14px">Jídlo dne</div>
     <div class="seg" id="meal-seg">
       <button data-meal="sn">Snídaně</button>
@@ -257,14 +296,15 @@
     <label class="field">Název <span class="muted">— nepovinné</span>
       <input id="quick-name" type="text" placeholder="např. oběd v restauraci">
     </label>
-    <label class="field">Kalorie (kcal)
+    <label class="field kcal-only">Kalorie (kcal)
       <input id="quick-kcal" type="number" inputmode="numeric" min="1" max="5000" placeholder="např. 650">
     </label>
     <div class="tri-row">
-      <label class="field">B (g)<input id="quick-b" type="text" inputmode="decimal"></label>
-      <label class="field">S (g)<input id="quick-s" type="text" inputmode="decimal"></label>
-      <label class="field">T (g)<input id="quick-t" type="text" inputmode="decimal"></label>
+      <label class="field kcal-only">B (g)<input id="quick-b" type="text" inputmode="decimal"></label>
+      <label class="field"><span class="kcal-only">S (g)</span><span class="carb-only">Sacharidy (g)</span><input id="quick-s" type="text" inputmode="decimal"></label>
+      <label class="field kcal-only">T (g)<input id="quick-t" type="text" inputmode="decimal"></label>
     </div>
+    <div id="quick-conf" class="conf-box carb-only"></div>
     <div class="seg" id="quick-meal-seg">
       <button data-meal="sn">Snídaně</button>
       <button data-meal="ob">Oběd</button>
@@ -328,7 +368,7 @@
     </div>
     <p class="muted small-text">Napište, co jste snědli, a množství. Čím konkrétnější, tím přesnější odhad.</p>
     <textarea id="ai-text-input" rows="4" placeholder="např. omáčka z polotučného mléka a škrobu s kari, kurkumou, solí, pepřem a mraženou zeleninou, 100 ml"></textarea>
-    <button id="ai-text-submit" class="btn">Odhadnout kalorie</button>
+    <button id="ai-text-submit" class="btn">Odhadnout</button>
     <div id="ai-text-status" class="muted center" style="margin-top:10px"></div>
   </div>
 </div>
@@ -426,9 +466,27 @@
   </div>
 </div>
 
+<!-- ═══ SHEET: jistota odhadu (rozhodovací vrstva) ═══ -->
+<div id="sheet-conf" class="sheet hidden">
+  <div class="sheet-panel">
+    <div class="sheet-head">
+      <div class="sheet-title" id="conf-title">Jistota odhadu</div>
+      <button class="icon-btn sheet-close" data-close="sheet-conf" aria-label="Zavřít">✕</button>
+    </div>
+    <div id="conf-body"></div>
+    <details class="conf-how">
+      <summary>Jak se jistota počítá</summary>
+      <p>Jistota = pravděpodobnost <b>jevu „skutečné sacharidy se od odhadu liší nejvýš o <span class="tol-val">±10</span> g"</b>. Tolerance ±10 g na jídlo vychází ze studie Smart et al. (Diabetic Medicine, 2009): chyba v tomto rozsahu glykémii po jídle měřitelně nezměnila, chyba ±20 g ano.</p>
+      <p>Každý údaj má odhadnutý rozptyl podle <b>zdroje</b> (obal z čárového kódu ~10 %, vlastní potravina z obalu ~7 %, tabulková hodnota 6–20 % podle druhu, hotové jídlo 20–30 %, AI z popisu 15–40 %, AI z fotky 25–50 % podle jistoty, kterou AI sama uvede) a podle <b>určení množství</b> (zváženo ~4 %, dáno obalem ~3 %, počet kusů ~12 %, porce od oka ~25 %). Rozptyly položek se u jídla sčítají jako nezávislé chyby.</p>
+      <p>Jde o kalibrovaný odhad z typických odchylek, ne o měření. Nenahrazuje měření glykémie ani doporučení diabetologa.</p>
+    </details>
+  </div>
+</div>
+
 <div id="toast" class="toast hidden"></div>
 
 <script src="js/db.js"></script>
+<script src="js/conf.js"></script>
 <script src="js/app.js"></script>
 <script src="js/vendor/zxing.min.js"></script>
 <script src="js/scan.js"></script>

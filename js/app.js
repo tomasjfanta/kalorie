@@ -69,6 +69,40 @@ function tdeeNow() {
   return bmr * (p.act || 1.375);
 }
 
+/* ═══ Režim sacharidy + rozhodovací vrstva jistoty ═══ */
+const isCarb = () => settings.mode === 'carb';
+const TOL = () => settings.carbTol || 10;
+function applyMode() {
+  document.body.classList.toggle('mode-carb', isCarb());
+  document.title = isCarb() ? 'Sacharidy' : 'Kalorie';
+}
+// Sacharidy pod 10 g s desetinou, jinak celé gramy.
+const fmtC = c => (c >= 10 ? r0(c) : dec(r1(c))) + ' g';
+const vjTxt = c => settings.vj ? ' · ' + dec(r1(c / settings.vj)) + ' VJ' : '';
+const badge = p => `<span class="cbadge ${CONF.level(p)}">${CONF.pct(p)}</span>`;
+
+// Záznam → podklady pro odhad nejistoty (starší záznamy bez metadat se dopočítají).
+function entryInfo(e) {
+  const C = vals(e).s;
+  if (e.q) return { C, kind: e.cs || 'manual', jist: e.jist, sMin: e.sMin, sMax: e.sMax };
+  let kind = e.cs, cat = e.cat;
+  if (!kind) {
+    const f = foodById(e.fid);
+    kind = f ? CONF.kindForFood(f) : 'db';
+    cat = cat || f?.cat;
+  }
+  return { C, kind, cat, pk: e.pk || 'unknown' };
+}
+function entryConf(e) {
+  const info = entryInfo(e);
+  const r = CONF.entrySigma(info);
+  return { ...info, ...r, n: e.n, p: CONF.probWithin(r.sigma, TOL()) };
+}
+function groupConf(entries) {
+  const items = entries.map(entryConf);
+  return { items, ...CONF.combine(items, TOL()) };
+}
+
 /* ═══ Toast ═══ */
 let toastT;
 function toast(msg) {
@@ -171,7 +205,7 @@ function renderDnes() {
   $$('#act-entries .entry').forEach(b => b.addEventListener('click', () => editAct(b.dataset.aeid)));
 
   // Jídla dne
-  $('#meals').innerHTML = MEALS.map(([id, label]) => {
+  $('#meals').innerHTML = isCarb() ? carbMealsHTML() : MEALS.map(([id, label]) => {
     const es = day().e.filter(e => e.meal === id);
     const kc = es.reduce((a, e) => a + vals(e).k, 0);
     const rows = es.map(e => {
@@ -183,7 +217,96 @@ function renderDnes() {
   }).join('');
   $$('.meal-add').forEach(b => b.addEventListener('click', () => openSearch(b.dataset.meal)));
   $$('.entry').forEach(b => b.addEventListener('click', () => editEntry(b.dataset.eid)));
+  if (isCarb()) renderCarbRing();
 }
+
+// Prstenec a souhrn dne v režimu sacharidů.
+function renderCarbRing() {
+  const all = groupConf(day().e);
+  const C = all.C, goal = settings.carbGoal;
+  const fill = $('#ring-fill');
+  if (goal) {
+    fill.style.strokeDashoffset = CIRC * (1 - Math.min(C / goal, 1));
+    const over = C > goal;
+    fill.style.stroke = over ? 'var(--red)' : C > goal * 0.9 ? 'var(--amber)' : 'var(--accent)';
+    $('#ring-num').textContent = over ? '+' + r0(C - goal) : r0(goal - C);
+    $('#ring-num').classList.toggle('over', over);
+    $('#ring-sub').textContent = over ? 'g sacharidů přes cíl' : 'g sacharidů zbývá';
+  } else {
+    fill.style.strokeDashoffset = CIRC;
+    $('#ring-num').textContent = r0(C);
+    $('#ring-num').classList.remove('over');
+    $('#ring-sub').textContent = 'g sacharidů' + vjTxt(C);
+  }
+  // Ø jistota = průměr pravděpodobností jednotlivých jídel vážený jejich sacharidy
+  // (jídlo je jednotka, ke které se vztahuje dávka inzulinu).
+  const meals = MEALS.map(([id]) => groupConf(day().e.filter(e => e.meal === id))).filter(m => m.items.length);
+  const sumC = meals.reduce((a, m) => a + m.C, 0);
+  const avgP = sumC > 0 ? meals.reduce((a, m) => a + m.p * m.C, 0) / sumC : null;
+  $('#cstat-eaten').textContent = fmtC(C);
+  $('#cstat-goal').textContent = goal ? goal + ' g' : '–';
+  $('#cstat-conf').innerHTML = avgP == null ? '–' : badge(avgP);
+  $('#cstat-range').textContent = C > 0 ? '±' + r0(CONF.Z90 * all.sigma) + ' g' : '–';
+}
+
+function carbMealsHTML() {
+  return MEALS.map(([id, label]) => {
+    const es = day().e.filter(e => e.meal === id);
+    const m = groupConf(es);
+    const rows = es.map((e, i) => {
+      const c = m.items[i];
+      const sub = (e.q ? '' : r0(e.g) + ' ' + (e.u || 'g') + ' · ') + CONF.KIND_LABEL[c.kind];
+      return `<button class="entry" data-eid="${e.id}"><span><span class="e-name">${esc(e.n)}</span><br><span class="e-sub">${sub}</span></span><span class="e-carb"><span class="e-kcal">${fmtC(c.C)}</span>${badge(c.p)}</span></button>`;
+    }).join('');
+    let decision = '';
+    const lvl = CONF.level(m.p);
+    if (es.length && lvl !== 'ok') {
+      const top = m.items.reduce((a, x) => x.sigma > a.sigma ? x : a, m.items[0]);
+      decision = `<button class="meal-decision ${lvl} conf-open" data-conf="meal" data-meal="${id}">⚠ Odhad ${CONF.LEVEL_LABEL[lvl]} — skutečnost nejspíš <b>${r0(m.lo)}–${r0(m.hi)} g</b>. Nejvíc nejistoty: <b>${esc(top.n)}</b>. ${CONF.TIP[top.driver] || ''}</button>`;
+    }
+    const head = es.length ? `${fmtC(m.C)}${vjTxt(m.C)} ${badge(m.p)}` : '';
+    return `<div class="card meal-card"><div class="meal-head"><span class="meal-name">${label}</span><span class="meal-kcal">${head}</span></div>${decision}${rows}<button class="meal-add" data-meal="${id}">＋ Přidat jídlo</button></div>`;
+  }).join('');
+}
+
+/* ═══ Rozhodovací vrstva — detail jistoty dne nebo jídla ═══ */
+function openConf(scope, meal) {
+  const T = TOL();
+  $$('.tol-val').forEach(x => { x.textContent = '±' + T; });
+  const label = MEALS.find(m => m[0] === meal)?.[1];
+  const es = scope === 'meal' ? day().e.filter(e => e.meal === meal) : day().e;
+  $('#conf-title').textContent = scope === 'meal' ? 'Jistota: ' + label : 'Jistota odhadu — ' + fmtHuman(viewDate);
+  const body = $('#conf-body');
+  if (!es.length) { body.innerHTML = '<div class="result-note">Zatím žádné záznamy.</div>'; openSheet('sheet-conf'); return; }
+
+  let html = '';
+  const summarize = (g, name) => {
+    const lvl = CONF.level(g.p);
+    return `<div class="conf-summary ${lvl}">${name ? '<b>' + name + '</b>: ' : ''}odhad <b>${fmtC(g.C)}</b>, skutečnost s 90% pravděpodobností <b>${r0(g.lo)}–${r0(g.hi)} g</b>.<br>Pravděpodobnost, že odhad sedí na ±${T} g: <b>${CONF.pct(g.p)}</b> (${CONF.LEVEL_LABEL[lvl]}).</div>`;
+  };
+  if (scope === 'meal') html += summarize(groupConf(es));
+  else MEALS.forEach(([id, name]) => {
+    const me = es.filter(e => e.meal === id);
+    if (me.length) html += summarize(groupConf(me), name);
+  });
+
+  // Položky seřazené podle podílu na nejistotě — kde se vyplatí zpřesnit.
+  const g = groupConf(es);
+  const totalVar = g.items.reduce((a, x) => a + x.sigma * x.sigma, 0) || 1;
+  const sorted = g.items.map(x => ({ ...x, share: x.sigma * x.sigma / totalVar })).sort((a, b) => b.share - a.share);
+  html += '<div class="group-label">Položky podle podílu na nejistotě</div>';
+  html += sorted.map((x, i) => {
+    const how = CONF.KIND_LABEL[x.kind] + (x.pk ? ' · ' + CONF.PORTION_LABEL[x.pk] : '');
+    const tip = (i === 0 || CONF.level(x.p) !== 'ok') && CONF.TIP[x.driver] ? `<div class="cr-tip">💡 ${CONF.TIP[x.driver]}</div>` : '';
+    return `<div class="conf-row"><div><div class="cr-name">${esc(x.n)}</div><div class="cr-sub">${how} · ±${r0(CONF.Z90 * x.sigma)} g · podíl na nejistotě ${r0(x.share * 100)} %</div>${tip}</div><div class="cr-right"><b>${fmtC(x.C)}</b>${badge(x.p)}</div></div>`;
+  }).join('');
+  body.innerHTML = html;
+  openSheet('sheet-conf');
+}
+document.addEventListener('click', e => {
+  const c = e.target.closest('.conf-open');
+  if (c) openConf(c.dataset.conf, c.dataset.meal);
+});
 const esc = s => String(s).replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
 
 /* ═══ Hledání — jeden sloučený seznam (vestavěná DB + moje + internet) ═══ */
@@ -215,6 +338,11 @@ function localSearch(q) {
 }
 
 function resultRow(f) {
+  if (isCarb()) {
+    const subC = [f.brand, 'S ' + dec(r1(f.s || 0)) + ' g / 100 ' + (f.u || 'g')].filter(Boolean).join(' · ');
+    const per = f.port?.length ? fmtC((f.s || 0) * f.port[0][1] / 100) + ' <small>/' + esc(f.port[0][0]) + '</small>' : '';
+    return `<button class="result" data-fid="${esc(f.id)}"><span><span class="r-name">${esc(f.n)}</span><br><span class="r-sub">${subC}</span></span><span class="r-kcal">${per}</span></button>`;
+  }
   const sub = [f.brand, r0(f.k) + ' kcal / 100 ' + (f.u || 'g')].filter(Boolean).join(' · ');
   return `<button class="result" data-fid="${esc(f.id)}"><span><span class="r-name">${esc(f.n)}</span><br><span class="r-sub">${sub}</span></span><span class="r-kcal">${f.port?.length ? r0(f.k * f.port[0][1] / 100) + ' <small>/' + esc(f.port[0][0]) + '</small>' : ''}</span></button>`;
 }
@@ -365,7 +493,9 @@ function openFoodDetail(food, opts = {}) {
 
   detail = { food, meal: opts.meal || mealByHour(), mode, portIdx, editId: opts.editId || null, ports };
   $('#food-name').textContent = food.n;
-  $('#food-sub').textContent = [food.brand, r0(food.k) + ' kcal · B ' + dec(r1(food.b)) + ' · S ' + dec(r1(food.s)) + ' · T ' + dec(r1(food.t)) + ' g (na 100 ' + (food.u || 'g') + ')'].filter(Boolean).join(' · ');
+  $('#food-sub').textContent = isCarb()
+    ? [food.brand, 'Sacharidy ' + dec(r1(food.s || 0)) + ' g na 100 ' + (food.u || 'g')].filter(Boolean).join(' · ')
+    : [food.brand, r0(food.k) + ' kcal · B ' + dec(r1(food.b)) + ' · S ' + dec(r1(food.s)) + ' · T ' + dec(r1(food.t)) + ' g (na 100 ' + (food.u || 'g') + ')'].filter(Boolean).join(' · ');
   $('#food-unit').textContent = food.u || 'g';
   $('#food-grams').value = dec(r1(gramVal));
   $('#food-count').value = count;
@@ -404,6 +534,25 @@ function previewFood() {
   }
   $('#food-kcal-preview').textContent = r0(g * f.k / 100) + ' kcal';
   $('#food-macro-preview').textContent = 'B ' + dec(r1(g * f.b / 100)) + ' g · S ' + dec(r1(g * f.s / 100)) + ' g · T ' + dec(r1(g * f.t / 100)) + ' g';
+  if (isCarb()) {
+    const C = g * (f.s || 0) / 100;
+    $('#food-kcal-preview').textContent = fmtC(C);
+    const pk = detailPk();
+    const r = CONF.entrySigma({ C, kind: CONF.kindForFood(f), cat: f.cat, pk });
+    const p = CONF.probWithin(r.sigma, TOL());
+    const tip = CONF.level(p) !== 'ok' && CONF.TIP[r.driver] ? `<br>💡 ${CONF.TIP[r.driver]}` : '';
+    $('#food-conf').innerHTML = `Jistota na ±${TOL()} g: ${badge(p)} · nejspíš ${r0(Math.max(0, C - CONF.Z90 * r.sigma))}–${r0(C + CONF.Z90 * r.sigma)} g${vjTxt(C)}<br>Zdroj: ${CONF.KIND_LABEL[CONF.kindForFood(f)]} · ${CONF.PORTION_LABEL[pk]}${tip}`;
+  }
+}
+
+// Jak bylo určeno množství: zváženo (gramy), porce daná obalem, počet kusů, nebo od oka.
+function detailPk() {
+  if (detail.mode === 'gram') return 'weighed';
+  const p = detail.ports[detail.portIdx];
+  if (!p) return 'unknown';
+  if (p[1] === 100 && /^100 /.test(p[0])) return 'weighed';
+  if (detail.food.src === 'off' || detail.food.src === 'custom') return 'pack';
+  return CONF.portionKind(p[0]);
 }
 
 $$('#amount-mode button').forEach(b => b.addEventListener('click', () => setAmountMode(b.dataset.mode)));
@@ -428,12 +577,14 @@ $('#food-submit').addEventListener('click', () => {
   const f = detail.food;
   const g = detailGrams();
   if (!g || g <= 0) { toast('Zadejte množství'); return; }
+  const pk = detailPk();
   if (detail.editId) {
     const e = day().e.find(x => x.id === detail.editId);
-    if (e) { e.g = g; e.meal = detail.meal; }
+    if (e) { e.g = g; e.meal = detail.meal; e.pk = pk; }
     toast('Upraveno');
   } else {
-    day().e.push({ id: 'e' + Date.now() + Math.random().toString(36).slice(2, 6), n: f.n, meal: detail.meal, g, u: f.u || 'g', k: f.k, b: f.b, s: f.s, t: f.t, fid: f.id });
+    day().e.push({ id: 'e' + Date.now() + Math.random().toString(36).slice(2, 6), n: f.n, meal: detail.meal, g, u: f.u || 'g', k: f.k, b: f.b, s: f.s, t: f.t, fid: f.id,
+      cs: CONF.kindForFood(f), cat: f.cat, pk });
     // paměť posledních + auto-uložení internetových produktů
     recent = [{ ...f, port: f.port, _q: undefined }, ...recent.filter(x => x.id !== f.id)].slice(0, 25);
     if (f.src === 'off' && !products.some(p => p.id === f.id)) products.unshift(f);
@@ -458,23 +609,41 @@ function editEntry(eid) {
 
 /* ═══ Rychlý zápis ═══ */
 let quickEditId = null;
+// Původ hodnot rychlého zápisu (ruční / AI) — z něj se počítá jistota.
+let quickMeta = { cs: 'manual' };
 function openQuick(entry) {
   quickEditId = entry?.id || null;
+  quickMeta = entry?.cs ? { cs: entry.cs, jist: entry.jist, sMin: entry.sMin, sMax: entry.sMax } : { cs: 'manual' };
   $('#quick-name').value = entry?.n && entry.n !== 'Rychlý zápis' ? entry.n : '';
   $('#quick-kcal').value = entry?.kcal || '';
-  $('#quick-b').value = entry?.b || ''; $('#quick-s').value = entry?.s || ''; $('#quick-t').value = entry?.t || '';
+  $('#quick-b').value = entry?.b || ''; $('#quick-s').value = entry?.s ?? ''; $('#quick-t').value = entry?.t || '';
   setMealSeg('#quick-meal-seg', entry?.meal || searchMeal || mealByHour());
   $('#quick-delete').classList.toggle('hidden', !quickEditId);
   $('#quick-submit').textContent = quickEditId ? 'Uložit změny' : 'Přidat';
+  quickConfPreview();
   openSheet('sheet-quick');
 }
+function quickConfPreview() {
+  if (!isCarb()) return;
+  const raw = $('#quick-s').value.trim();
+  if (raw === '') { $('#quick-conf').innerHTML = ''; return; }
+  const C = numEl('#quick-s');
+  const r = CONF.entrySigma({ C, kind: quickMeta.cs, jist: quickMeta.jist, sMin: quickMeta.sMin, sMax: quickMeta.sMax });
+  const p = CONF.probWithin(r.sigma, TOL());
+  const ai = quickMeta.cs.startsWith('ai') ? ` · AI jistota: ${quickMeta.jist || 'střední'}${quickMeta.sMax > quickMeta.sMin ? ` (AI rozsah ${r0(quickMeta.sMin)}–${r0(quickMeta.sMax)} g)` : ''}` : '';
+  const tip = CONF.level(p) !== 'ok' && CONF.TIP[r.driver] ? `<br>💡 ${CONF.TIP[r.driver]}` : '';
+  $('#quick-conf').innerHTML = `${CONF.KIND_LABEL[quickMeta.cs]}${ai}<br>Jistota na ±${TOL()} g: ${badge(p)} · nejspíš ${r0(Math.max(0, C - CONF.Z90 * r.sigma))}–${r0(C + CONF.Z90 * r.sigma)} g${vjTxt(C)}${tip}`;
+}
+$('#quick-s').addEventListener('input', quickConfPreview);
 $('#quick-btn').addEventListener('click', () => openQuick(null));
 $$('#quick-meal-seg button').forEach(b => b.addEventListener('click', () => setMealSeg('#quick-meal-seg', b.dataset.meal)));
 $('#quick-submit').addEventListener('click', () => {
   const kcal = numEl('#quick-kcal');
-  if (!kcal || kcal <= 0) { toast('Zadejte kalorie'); return; }
+  if (isCarb()) {
+    if ($('#quick-s').value.trim() === '') { toast('Zadejte sacharidy'); return; }
+  } else if (!kcal || kcal <= 0) { toast('Zadejte kalorie'); return; }
   const meal = $('#quick-meal-seg button.on')?.dataset.meal || mealByHour();
-  const data = { n: $('#quick-name').value.trim() || 'Rychlý zápis', meal, q: 1, kcal, b: numEl('#quick-b'), s: numEl('#quick-s'), t: numEl('#quick-t') };
+  const data = { n: $('#quick-name').value.trim() || 'Rychlý zápis', meal, q: 1, kcal, b: numEl('#quick-b'), s: numEl('#quick-s'), t: numEl('#quick-t'), ...quickMeta };
   if (quickEditId) {
     const e = day().e.find(x => x.id === quickEditId);
     if (e) Object.assign(e, data);
@@ -590,7 +759,7 @@ $('#add-custom').addEventListener('click', () => openCustom(null));
 $('#cust-save').addEventListener('click', () => {
   const n = $('#cust-name').value.trim();
   const k = numEl('#cust-k');
-  if (!n || !k) { toast('Vyplňte název a kalorie'); return; }
+  if (!n || (isCarb() ? $('#cust-s').value.trim() === '' : !k)) { toast(isCarb() ? 'Vyplňte název a sacharidy' : 'Vyplňte název a kalorie'); return; }
   const port = numEl('#cust-port');
   const f = {
     id: custEditId || 'c' + Date.now(), n, k, b: numEl('#cust-b'), s: numEl('#cust-s'), t: numEl('#cust-t'),
@@ -608,32 +777,35 @@ const runSearchSafe = () => { if (!$('#sheet-add').classList.contains('hidden'))
 function renderCustomList() {
   const el = $('#custom-list');
   if (!custom.length) { el.textContent = 'Zatím žádné vlastní potraviny.'; return; }
-  el.innerHTML = custom.map(f => `<button class="result" data-cid="${f.id}"><span><span class="r-name">${esc(f.n)}</span><br><span class="r-sub">${r0(f.k)} kcal / 100 g</span></span><span class="r-kcal">upravit ›</span></button>`).join('');
+  el.innerHTML = custom.map(f => `<button class="result" data-cid="${f.id}"><span><span class="r-name">${esc(f.n)}</span><br><span class="r-sub">${isCarb() ? 'S ' + dec(r1(f.s || 0)) + ' g' : r0(f.k) + ' kcal'} / 100 g</span></span><span class="r-kcal">upravit ›</span></button>`).join('');
   el.querySelectorAll('.result').forEach(b => b.addEventListener('click', () => openCustom(custom.find(x => x.id === b.dataset.cid))));
 }
 
 /* ═══ Historie ═══ */
 function renderHistory() {
   const today = todayStr();
-  const goal = settings.kcal;
+  const carb = isCarb();
+  const goal = carb ? settings.carbGoal : settings.kcal;
+  const metric = s => carb ? dayTotals(s).s : dayTotals(s).k;
+  const unit = carb ? 'g sacharidů' : 'kcal';
   const last7 = Array.from({ length: 7 }, (_, i) => addDays(today, i - 6));
-  const tot = last7.map(s => ({ s, k: dayTotals(s).k, has: (days[s]?.e || []).length > 0 }));
+  const tot = last7.map(s => ({ s, k: metric(s), has: (days[s]?.e || []).length > 0 }));
   const maxV = Math.max(goal ? goal * 1.15 : 0, ...tot.map(x => x.k), 100);
   const chart = $('#week-chart');
   chart.innerHTML = (goal ? `<div class="wc-goal" style="bottom:${goal / maxV * 100}%"></div>` : '') +
     tot.map(x => `<button class="wc-col" data-d="${x.s}"><div class="wc-bar ${!x.has ? 'empty' : goal && x.k > goal ? 'over' : ''}" style="height:${Math.max(2, x.k / maxV * 100)}%"></div><span class="wc-day">${fmtHuman(x.s).slice(0, 5)}</span></button>`).join('');
   chart.querySelectorAll('.wc-col').forEach(b => b.addEventListener('click', () => { viewDate = b.dataset.d; showView('dnes'); renderDnes(); }));
   const withData = tot.filter(x => x.has);
-  $('#week-avg').textContent = withData.length ? 'Průměr: ' + r0(withData.reduce((a, x) => a + x.k, 0) / withData.length) + ' kcal / den' : 'Zatím žádné záznamy.';
+  $('#week-avg').textContent = withData.length ? 'Průměr: ' + r0(withData.reduce((a, x) => a + x.k, 0) / withData.length) + ' ' + unit + ' / den' : 'Zatím žádné záznamy.';
 
   // seznam dnů (posledních 60 se záznamy)
   const listed = Object.keys(days).filter(s => (days[s].e || []).length || days[s].kg || (days[s].a || []).length).sort().reverse().slice(0, 60);
   $('#day-list').innerHTML = listed.length ? listed.map(s => {
-    const k = dayTotals(s).k;
-    const bs = dayBurn(s);
+    const k = metric(s);
+    const bs = carb ? 0 : dayBurn(s);
     const cls = !k ? 'none' : goal ? (k > goal + bs ? 'over' : 'ok') : 'ok';
     const kg = (days[s].kg ? ' · ' + dec(days[s].kg) + ' kg' : '') + (bs ? ' · 🏃 +' + r0(bs) : '');
-    return `<button class="day-row" data-d="${s}"><span><span class="dot ${cls}"></span>${fmtHuman(s)}<span class="muted">${kg}</span></span><span class="d-kcal">${k ? r0(k) + ' kcal' : '—'}</span></button>`;
+    return `<button class="day-row" data-d="${s}"><span><span class="dot ${cls}"></span>${fmtHuman(s)}<span class="muted">${kg}</span></span><span class="d-kcal">${k ? r0(k) + (carb ? ' g' : ' kcal') : '—'}</span></button>`;
   }).join('') : '<div class="result-note">Historie se objeví, jakmile si zapíšete první jídlo.</div>';
   $('#day-list').querySelectorAll('.day-row').forEach(b => b.addEventListener('click', () => { viewDate = b.dataset.d; showView('dnes'); renderDnes(); }));
 }
@@ -683,6 +855,10 @@ function renderWeight() {
 
 /* ═══ Nastavení ═══ */
 function fillSettings() {
+  $$('#mode-seg button').forEach(b => b.classList.toggle('on', b.dataset.mode === (settings.mode || 'kcal')));
+  $('#set-carb').value = settings.carbGoal || '';
+  $('#set-tol').value = String(settings.carbTol || 10);
+  $('#set-vj').value = String(settings.vj || 0);
   $('#set-kcal').value = settings.kcal || '';
   $('#set-prot').value = settings.prot || '';
   $('#set-water').value = settings.water || 2000;
@@ -703,6 +879,19 @@ $('#save-settings').addEventListener('click', () => {
   settings.water = +$('#set-water').value || 2000;
   store.set('kal.settings', settings);
   renderDnes(); toast('Nastavení uloženo'); showView('dnes');
+});
+$$('#mode-seg button').forEach(b => b.addEventListener('click', () => {
+  settings.mode = b.dataset.mode;
+  store.set('kal.settings', settings);
+  applyMode(); fillSettings(); renderDnes();
+  toast(isCarb() ? 'Režim: sacharidy' : 'Režim: kalorie');
+}));
+$('#save-carb').addEventListener('click', () => {
+  settings.carbGoal = +$('#set-carb').value || null;
+  settings.carbTol = +$('#set-tol').value || 10;
+  settings.vj = +$('#set-vj').value || 0;
+  store.set('kal.settings', settings);
+  renderDnes(); toast('Uloženo');
 });
 $('#save-ai').addEventListener('click', () => {
   aiCfg = { key: $('#set-ai-key').value.trim(), model: $('#set-ai-model').value };
@@ -787,10 +976,12 @@ $('#wipe-btn').addEventListener('click', () => {
 window.KAL = {
   offProduct, openFoodDetail, openSheet, closeSheet, toast,
   getMeal: () => searchMeal,
+  isCarb,
   aiConfig: () => aiCfg,
   setAiModel: m => { aiCfg.model = m; store.set('kal.ai', aiCfg); },  // zapamatuje funkční model ze zálohy
   openQuick,          // prefill rychlého zápisu z AI výsledku
 };
 
 /* ═══ Start ═══ */
+applyMode();
 renderDnes();

@@ -9,10 +9,15 @@
     + 'popsaného nebo vyfoceného jídla. Odpověz VÝHRADNĚ jedním validním JSON objektem, bez markdownu a bez '
     + 'jakéhokoliv dalšího textu, přesně ve tvaru: {"nazev": "krátký český název jídla", "mnozstvi": "odhad '
     + 'porce, např. 1 talíř ~350 g", "kcal": číslo, "bilkoviny": číslo v g, "sacharidy": číslo v g, "tuky": '
-    + 'číslo v g, "jistota": "nízká"|"střední"|"vysoká", "poznamka": "krátká poznámka nebo prázdný řetězec"}. '
+    + 'číslo v g, "sacharidy_min": číslo v g, "sacharidy_max": číslo v g, "jistota": "nízká"|"střední"|"vysoká", '
+    + '"poznamka": "krátká poznámka nebo prázdný řetězec"}. "sacharidy_min" a "sacharidy_max" je rozsah, ve kterém '
+    + 'skutečné sacharidy leží s 90% pravděpodobností — buď poctivý, u nejasné porce nebo receptu ho rozšiř. '
     + 'Všechny číselné hodnoty platí pro CELOU popsanou/zobrazenou porci, NE na 100 g. Pokud množství není '
     + 'uvedené, odhadni obvyklou porci a napiš odhad do pole "mnozstvi". Vycházej z běžných nutričních '
-    + 'tabulek pro české potraviny.';
+    + 'tabulek pro české potraviny. Sacharidy uváděj jako využitelné sacharidy bez vlákniny (jako na obalech v EU).';
+  // V režimu sacharidů (uživatel s diabetem) je přesnost sacharidů to hlavní.
+  const SYS_CARB = ' Uživatel má diabetes: sacharidy jsou nejdůležitější údaj — započítej i skryté sacharidy '
+    + '(zahušťovadla v omáčkách, strouhanku a těstíčko, slazené nápoje, dresinky, cukr v pečivu).';
 
   // Modely k vyzkoušení v pořadí — Google občas starší modely pro bezplatné klíče vypne,
   // proto se při chybě „model není dostupný" zkusí automaticky další a ten, co funguje,
@@ -55,7 +60,7 @@
     if (imageBase64) parts.push({ inline_data: { mime_type: imageMedia, data: imageBase64 } });
     parts.push({ text: text || 'Odhadni kalorie a makra tohoto jídla z fotky.' });
     const body = {
-      systemInstruction: { parts: [{ text: SYS }] },
+      systemInstruction: { parts: [{ text: SYS + (window.KAL.isCarb() ? SYS_CARB : '') }] },
       contents: [{ role: 'user', parts }],
       // Gemini 3.x jsou „přemýšlecí" modely — interní uvažování se počítá do maxOutputTokens.
       // S malým limitem model celý budget spotřebuje na přemýšlení a nevrátí žádný text.
@@ -87,9 +92,15 @@
     try { return { result: JSON.parse(txt.slice(a, b + 1)) }; } catch (e) { return { error: 'parse' }; }
   }
 
-  function toEntry(j) {
+  function toEntry(j, kind) {
     const name = (j.nazev || 'Odhad jídla').trim();
+    const jt = String(j.jistota || '').toLowerCase();
+    const jist = /vys|high/.test(jt) ? 'vysoká' : /níz|niz|low/.test(jt) ? 'nízká' : 'střední';
+    let sMin = +j.sacharidy_min, sMax = +j.sacharidy_max;
+    if (!(isFinite(sMin) && isFinite(sMax)) || sMin < 0) { sMin = undefined; sMax = undefined; }
+    else if (sMin > sMax) [sMin, sMax] = [sMax, sMin];
     return {
+      cs: kind, jist, sMin, sMax,
       n: name + (j.mnozstvi ? ' (' + String(j.mnozstvi).trim() + ')' : ''),
       meal: window.KAL.getMeal(),
       kcal: Math.max(0, Math.round(+j.kcal || 0)),
@@ -131,7 +142,7 @@
     if (res.error) { $('ai-text-status').textContent = errMsg(res); return; }
     window.KAL.closeSheet('sheet-aitext');
     $('ai-text-input').value = '';
-    window.KAL.openQuick(toEntry(res.result));
+    window.KAL.openQuick(toEntry(res.result, 'ai-text'));
   });
 
   /* ── Odhad z fotky ── */
@@ -151,7 +162,7 @@
     const res = await callGemini({ imageBase64: img.base64, imageMedia: 'image/jpeg' });
     if (res.error) { $('ai-photo-status').textContent = errMsg(res); return; }
     window.KAL.closeSheet('sheet-aiphoto');
-    window.KAL.openQuick(toEntry(res.result));
+    window.KAL.openQuick(toEntry(res.result, 'ai-photo'));
   });
 
   // Zmenší fotku na max 1024 px a JPEG ~0.8 — rychlejší odeslání, stejná přesnost odhadu.
