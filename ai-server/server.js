@@ -33,13 +33,37 @@ const SCHEMA = {
     sacharidy_max: { type: 'number' },
     jistota: { type: 'string', enum: ['nízká', 'střední', 'vysoká'] },
     kategorie: { type: 'string', enum: ['pecivo', 'prilohy', 'hotove', 'fastfood', 'sladke', 'ovoce', 'mlecne', 'napoje', 'ostatni'] },
+    gi: { type: 'string', enum: ['nízký', 'střední', 'vysoký'] },
     poznamka: { type: 'string' },
   },
-  required: ['nazev', 'mnozstvi', 'kcal', 'bilkoviny', 'sacharidy', 'tuky', 'sacharidy_min', 'sacharidy_max', 'jistota', 'kategorie', 'poznamka'],
+  required: ['nazev', 'mnozstvi', 'kcal', 'bilkoviny', 'sacharidy', 'tuky', 'sacharidy_min', 'sacharidy_max', 'jistota', 'kategorie', 'gi', 'poznamka'],
   additionalProperties: false,
 };
 
 const log = (...a) => console.log(new Date().toISOString(), ...a);
+
+/* ─── Deník AI z aplikace (oba režimy): každý pokus o odhad, bez fotek a klíčů ───
+   POST /diag  — pole záznamů z telefonu (bez přihlášení, jen z adresy aplikace, s limity).
+   GET  /diag?since=ISO&limit=N — čtení pro rozbor; hlavička x-admin = sha1(API_SECRET Nightscoutu). */
+const fs = require('fs');
+const crypto = require('crypto');
+const DIAG_DIR = process.env.DIAG_DIR || '/data';
+const DIAG_FILE = path.join(DIAG_DIR, 'diag.jsonl');
+const ADMIN = process.env.NS_API_SECRET ? crypto.createHash('sha1').update(process.env.NS_API_SECRET).digest('hex') : null;
+const diagRate = new Map(); // ip → { min, n }
+const DIAG_KEYS = ['at', 'dev', 'v', 'mode', 'flow', 'job', 'attempt', 'kb', 'vendor', 'model', 'ok', 'err', 'status', 'msg', 'ms', 'finish', 'tok', 'snippet'];
+function cleanDiag(x) {
+  if (!x || typeof x !== 'object') return null;
+  const o = {};
+  for (const k of DIAG_KEYS) {
+    const v = x[k];
+    if (v == null) continue;
+    if (typeof v === 'string') o[k] = v.replace(/AIza[0-9A-Za-z_\-]{20,}|sk-ant-[0-9A-Za-z_\-]+/g, '<key>').slice(0, 400);
+    else if (typeof v === 'number' || typeof v === 'boolean') o[k] = v;
+    else if (k === 'tok') o[k] = Object.fromEntries(Object.entries(v).filter(([, n]) => typeof n === 'number').slice(0, 6));
+  }
+  return o.at ? o : null;
+}
 
 /* ─── Přístup: token Nightscoutu s právem čtení ─── */
 const authCache = new Map(); // token → platnost do (ms)
@@ -143,6 +167,34 @@ http.createServer(async (req, res) => {
   if (req.method === 'GET' && url.pathname === '/health') {
     return send(res, 200, { ok: true, model: MODEL, effort: EFFORT, loggedIn: !!process.env.CLAUDE_CODE_OAUTH_TOKEN,
       nightscout: !!NS_URL, cli: require('fs').existsSync(CLAUDE_CMD[0]) || !!process.env.CLAUDE_CMD });
+  }
+  if (url.pathname === '/diag' && req.method === 'POST') {
+    const ip = String(req.headers['x-forwarded-for'] || req.socket.remoteAddress || '').split(',')[0].trim();
+    const m = Math.floor(Date.now() / 60000), r = diagRate.get(ip);
+    if (r && r.min === m && r.n > 300) return send(res, 429, { error: 'rate' });
+    diagRate.set(ip, r && r.min === m ? { min: m, n: r.n + 1 } : { min: m, n: 1 });
+    let arr;
+    try { arr = JSON.parse(await readBody(req)); } catch (e) { return send(res, 400, { error: 'body' }); }
+    if (!Array.isArray(arr) || arr.length > 100) return send(res, 400, { error: 'body' });
+    const rows = arr.map(cleanDiag).filter(Boolean).map(o => JSON.stringify({ ...o, rx: Date.now() }));
+    if (rows.length) {
+      try { fs.mkdirSync(DIAG_DIR, { recursive: true }); fs.appendFileSync(DIAG_FILE, rows.join('\n') + '\n'); }
+      catch (e) { log('diag write failed', e.message); }
+      const bad = arr.filter(x => x && x.ok === false).length;
+      if (bad) log(`diag ${rows.length} rows, ${bad} failures`);
+    }
+    return send(res, 200, { ok: true, n: rows.length });
+  }
+  if (url.pathname === '/diag' && req.method === 'GET') {
+    if (!ADMIN || req.headers['x-admin'] !== ADMIN) return send(res, 401, { error: 'auth' });
+    const since = Date.parse(url.searchParams.get('since') || '') || 0, limit = Math.min(+url.searchParams.get('limit') || 2000, 20000);
+    let lines = [];
+    try { lines = fs.readFileSync(DIAG_FILE, 'utf8').trim().split('\n'); } catch (e) { /* zatím prázdné */ }
+    const out = [];
+    for (let i = lines.length - 1; i >= 0 && out.length < limit; i--) {
+      try { const o = JSON.parse(lines[i]); if ((o.at || 0) >= since) out.push(o); } catch (e) { /* vadný řádek */ }
+    }
+    return send(res, 200, out.reverse());
   }
   if (req.method !== 'POST' || url.pathname !== '/estimate') return send(res, 404, { error: 'not found' });
 

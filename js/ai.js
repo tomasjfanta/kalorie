@@ -11,8 +11,12 @@
     + 'porce, např. 1 talíř ~350 g", "kcal": číslo, "bilkoviny": číslo v g, "sacharidy": číslo v g, "tuky": '
     + 'číslo v g, "sacharidy_min": číslo v g, "sacharidy_max": číslo v g, "jistota": "nízká"|"střední"|"vysoká", '
     + '"kategorie": "pecivo"|"prilohy"|"hotove"|"fastfood"|"sladke"|"ovoce"|"mlecne"|"napoje"|"ostatni", '
+    + '"gi": "nízký"|"střední"|"vysoký", '
     + '"poznamka": "krátká poznámka nebo prázdný řetězec"}. "kategorie" = převažující zdroj sacharidů (prilohy = rýže, '
     + 'těstoviny, brambory, knedlíky; hotove = jídlo s omáčkou nebo masem; fastfood = pizza, burger, smažené). '
+    + '"gi" = glykemický index jídla jako celku, tj. jak rychle se jeho sacharidy vstřebají: vysoký (bílé pečivo, '
+    + 'sladké nápoje, brambory na kaši, sladkosti), střední (rýže, těstoviny vařené na skus, běžné obědy), nízký '
+    + '(luštěniny, celozrnné, hodně tuku, bílkovin nebo vlákniny — tuk a bílkoviny vstřebávání zpomalují). '
     + '"sacharidy_min" a "sacharidy_max" je rozsah, ve kterém '
     + 'skutečné sacharidy leží s 90% pravděpodobností — buď poctivý, u nejasné porce nebo receptu ho rozšiř. '
     + 'Všechny číselné hodnoty platí pro CELOU popsanou/zobrazenou porci, NE na 100 g. Pokud množství není '
@@ -59,9 +63,14 @@
     return { response: await r.json() };
   }
 
-  async function callGemini({ text, imageBase64, imageMedia, extra, temperature = 0.2 }) {
+  // Zápis pokusu do deníku AI (jobs.js) — každý model zvlášť, s dobou trvání a důvodem chyby.
+  const diag = (args, ev) => window.JOBS?.logAi({ flow: args.diag?.flow || (args.imageBase64 ? 'photo' : 'text'),
+    job: args.diag?.job, attempt: args.diag?.attempt, kb: args.imageBase64 ? Math.round(args.imageBase64.length * 0.75 / 1024) : undefined, ...ev });
+
+  async function callGemini(args) {
+    const { text, imageBase64, imageMedia, extra, temperature = 0.2 } = args;
     const c = cfg();
-    if (!c.key) return { error: 'nokey' };
+    if (!c.key) { diag(args, { vendor: 'gemini', ok: false, err: 'nokey' }); return { error: 'nokey' }; }
     const parts = [];
     if (imageBase64) parts.push({ inline_data: { mime_type: imageMedia, data: imageBase64 } });
     parts.push({ text: text || 'Odhadni kalorie a makra tohoto jídla z fotky.' });
@@ -77,28 +86,37 @@
 
     // Zvolený model první, pak zbytek řetězce jako záloha.
     const chain = [c.model, ...MODEL_CHAIN.filter(m => m !== c.model)].filter(Boolean);
-    let out = null, used = null;
+    let out = null, used = null, retired = false, hops = 0;
     for (const model of chain) {
+      const t0 = Date.now();
       out = await callModel(model, c.key, body);
       if (out.response) {
         used = model;
-        if (model !== c.model) window.KAL.setAiModel(model); // zapamatuj funkční model
-        break;
+        if (model !== c.model && retired) window.KAL.setAiModel(model); // zapamatuj funkční model
+        const parsed = parseAnswer(out.response);
+        diag(args, { vendor: 'gemini', model, ok: !!parsed.result, err: parsed.error, ms: Date.now() - t0,
+          finish: parsed.finish, tok: parsed.tok, snippet: parsed.snippet, msg: parsed.block });
+        return parsed.result ? { ...parsed, model: used } : parsed;
       }
-      if (out.error !== 'model') break; // jiná chyba než „model nedostupný" → nezkoušet dál
+      diag(args, { vendor: 'gemini', model, ok: false, err: out.error, status: out.status, msg: out.msg, ms: Date.now() - t0 });
+      if (out.error === 'model') { retired = true; continue; }
+      // Přetížený model (503/500/504) nebo vyčerpaný limit jednoho modelu → zkusit další model
+      // v řetězci (každý má vlastní limit); zvolený model se kvůli tomu nemění.
+      if ((out.error === 'api' && [500, 503, 504].includes(out.status)) || out.error === 'quota') { if (++hops <= 2) continue; }
+      break; // klíč, síť apod. — další model by nepomohl
     }
-    if (!out.response) return out;
-    const parsed = parseAnswer(out.response);
-    return parsed.result ? { ...parsed, model: used } : parsed;
+    return out;
   }
 
   // Claude přes vlastní server (ai-server/ na Railway): ten spouští `claude -p` na předplatném
   // Claude uživatele. Přístup ověří tokenem Nightscoutu, který aplikace už má.
   const claudeReady = () => !!(cfg().claudeUrl && window.KAL.store.get('kal.ns', null)?.token);
-  async function callClaude({ imageBase64, imageMedia, extra }) {
+  async function callClaude(args) {
+    const { imageBase64, imageMedia, extra } = args;
     const url = String(cfg().claudeUrl || '').trim().replace(/\/+$/, '');
     const token = window.KAL.store.get('kal.ns', null)?.token;
     if (!url || !token) return { error: 'noclaude' };
+    const t0 = Date.now();
     let r;
     try {
       r = await fetch(url + '/estimate', {
@@ -108,11 +126,19 @@
           image: imageBase64, media: imageMedia }),
         signal: AbortSignal.timeout(170000),
       });
-    } catch (e) { return { error: 'network' }; }
+    } catch (e) {
+      diag(args, { vendor: 'claude', ok: false, err: 'network', msg: e.name, ms: Date.now() - t0 });
+      return { error: 'network' };
+    }
     const j = await r.json().catch(() => ({}));
-    if (r.ok && j.result) return { result: j.result, model: j.model };
-    return { error: r.status === 401 ? 'claude-auth' : j.error === 'not-logged-in' ? 'claude-login'
+    if (r.ok && j.result) {
+      diag(args, { vendor: 'claude', model: j.model, ok: true, ms: Date.now() - t0, tok: j.usage });
+      return { result: j.result, model: j.model };
+    }
+    const out = { error: r.status === 401 ? 'claude-auth' : j.error === 'not-logged-in' ? 'claude-login'
       : r.status === 429 ? 'quota' : 'api', status: r.status, msg: j.detail || j.error };
+    diag(args, { vendor: 'claude', ok: false, err: out.error, status: r.status, msg: out.msg, ms: Date.now() - t0 });
+    return out;
   }
 
   // Několik nezávislých odhadů téže fotky najednou, i od různých AI (souběžně, takže skoro stejně
@@ -131,16 +157,21 @@
     return ok.length ? { runs: ok, errors } : (errors.gemini || errors.claude || { error: 'empty' });
   }
 
+  // Přečte odpověď Gemini. Pro deník chyb vrací i důvod konce, spotřebu tokenů (včetně
+  // přemýšlení) a začátek textu, když se ho nepodaří přečíst.
   function parseAnswer(resp) {
+    const u = resp.usageMetadata || {};
+    const tok = { in: u.promptTokenCount, out: u.candidatesTokenCount, think: u.thoughtsTokenCount };
     const cand = resp.candidates?.[0];
-    if (!cand) return { error: resp.promptFeedback?.blockReason ? 'blocked' : 'empty' };
+    if (!cand) return { error: resp.promptFeedback?.blockReason ? 'blocked' : 'empty', block: resp.promptFeedback?.blockReason, tok };
+    const finish = cand.finishReason;
     // Přeskočit případné „thought" části (interní uvažování modelu) — odpověď je v běžných text částech.
     const txt = (cand.content?.parts || []).filter(p => !p.thought).map(p => p.text || '').join('').trim();
-    if (!txt) return { error: cand.finishReason === 'MAX_TOKENS' ? 'truncated' : (cand.finishReason === 'SAFETY' ? 'blocked' : 'empty') };
-    try { return { result: JSON.parse(txt) }; } catch (e) { /* zkusit vyříznout JSON */ }
+    if (!txt) return { error: finish === 'MAX_TOKENS' ? 'truncated' : (finish === 'SAFETY' ? 'blocked' : 'empty'), finish, tok };
+    try { return { result: JSON.parse(txt), finish, tok }; } catch (e) { /* zkusit vyříznout JSON */ }
     const a = txt.indexOf('{'), b = txt.lastIndexOf('}');
-    if (a < 0 || b < 0) return { error: 'parse' };
-    try { return { result: JSON.parse(txt.slice(a, b + 1)) }; } catch (e) { return { error: 'parse' }; }
+    if (a >= 0 && b > a) { try { return { result: JSON.parse(txt.slice(a, b + 1)), finish, tok }; } catch (e) { /* níže */ } }
+    return { error: finish === 'MAX_TOKENS' ? 'truncated' : 'parse', finish, tok, snippet: txt.slice(0, 300) };
   }
 
   function toEntry(j, kind) {
@@ -170,13 +201,53 @@
       case 'auth': return 'API klíč je neplatný. Zkontrolujte ho v Nastavení → AI odhady.';
       case 'quota': return 'Bezplatný limit je teď vyčerpaný (příliš požadavků). Zkuste to za minutu, případně zítra.';
       case 'model': return 'Žádný z AI modelů teď není pro bezplatný klíč dostupný. Zkuste to později.';
-      case 'network': return 'Nepodařilo se spojit s Google. Zkontrolujte připojení k internetu.';
+      case 'network': return 'Nepodařilo se spojit se serverem AI (síť nebo vypršel čas). Zkontrolujte připojení k internetu.';
+      case 'app': return 'Chyba v aplikaci při odhadu' + (e.msg ? ' (' + e.msg + ')' : '') + '.';
       case 'truncated': return 'Odpověď se nevešla do limitu. Zkuste to znovu, případně kratší popis.';
       case 'blocked': return 'Google tenhle požadavek odmítl zpracovat (bezpečnostní filtr). Zkuste jinou fotku nebo popis.';
       case 'empty': return 'Model vrátil prázdnou odpověď. Zkuste to prosím znovu.';
       case 'parse': return 'Odpověď se nepodařilo přečíst. Zkuste to prosím znovu.';
       default: return 'Něco se nepovedlo (' + (e.status || '?') + '). ' + (e.msg || 'Zkuste to znovu.');
     }
+  }
+
+  /* ── Režim kalorií: odhady přes frontu (jobs.js) — fotka ani popis se při chybě neztratí ── */
+  const sheetOpen = id => !$(id).classList.contains('hidden');
+  let shown = { aitext: null, aiphoto: null }; // id úlohy, kterou ukazuje otevřené okno
+  // Denní jídlo podle času, kdy se jedlo (ne podle toho, kdy odhad doběhl).
+  const mealAt = ts => { const d = new Date(ts), h = d.getHours() + d.getMinutes() / 60; return h < 10 ? 'sn' : h < 11.5 ? 'sv' : h < 14.5 ? 'ob' : h < 17.5 ? 'sv' : 've'; };
+  const pad = n => String(n).padStart(2, '0');
+  const dkey = ts => { const d = new Date(ts); return d.getFullYear() + '-' + pad(d.getMonth() + 1) + '-' + pad(d.getDate()); };
+  const hm = ts => new Date(ts).toLocaleTimeString('cs-CZ', { hour: '2-digit', minute: '2-digit' });
+
+  for (const [kind, cs, sheet, statusEl] of [['kcal-text', 'ai-text', 'aitext', 'ai-text-status'], ['kcal-photo', 'ai-photo', 'aiphoto', 'ai-photo-status']]) {
+    window.JOBS.register(kind, {
+      label: j => kind === 'kcal-text' ? '„' + String(j.text).slice(0, 40) + '"' : 'Fotka jídla',
+      run: j => callGemini(kind === 'kcal-text' ? { text: j.text, diag: { flow: 'text', job: j.id, attempt: j.attempts } }
+        : { imageBase64: j.img, imageMedia: 'image/jpeg', diag: { flow: 'photo', job: j.id, attempt: j.attempts } }),
+      // Okno je otevřené → výsledek do rychlého zápisu (uživatel ho potvrdí) a úloha končí.
+      present: j => {
+        if (shown[sheet] !== j.id || !sheetOpen('sheet-' + sheet)) return false;
+        shown[sheet] = null;
+        window.KAL.closeSheet('sheet-' + sheet);
+        if (kind === 'kcal-text') { $('ai-text-input').value = ''; $('ai-text-submit').disabled = false; }
+        window.KAL.openQuick({ ...toEntry(j.result.result, cs), meal: j.meal || mealAt(j.ts) });
+        window.JOBS.remove(j.id);
+        return true;
+      },
+      // Okno je zavřené → jídlo se uloží samo k času, kdy se jedlo.
+      save: async j => {
+        const e = { id: 'e' + Date.now() + Math.random().toString(36).slice(2, 6), ...toEntry(j.result.result, cs), meal: j.meal || mealAt(j.ts), auto: true };
+        window.KAL.day(dkey(j.ts)).e.push(e);
+        window.KAL.saveAll(); window.KAL.renderDnes();
+        window.KAL.toast(`Odhad z ${hm(j.ts)} doběhl: ${e.kcal} kcal — uloženo (můžete upravit)`);
+      },
+      failed: j => {
+        if (shown[sheet] !== j.id || !sheetOpen('sheet-' + sheet)) return;
+        if (kind === 'kcal-text') $('ai-text-submit').disabled = false;
+        $(statusEl).innerHTML = window.KAL.esc(j.lastErr) + `<br><b>📌 ${kind === 'kcal-text' ? 'Popis' : 'Fotka'} je uložený v telefonu.</b> Zkusím to znovu sám v ${hm(j.nextAt)} — okno můžete zavřít, jídlo se po odhadu uloží samo.`;
+      },
+    });
   }
 
   /* ── Odhad z popisu (text) ── */
@@ -191,12 +262,9 @@
     if (!text) { window.KAL.toast('Napište, co jste snědli'); return; }
     $('ai-text-status').textContent = 'Odhaduji… (pár vteřin)';
     $('ai-text-submit').disabled = true;
-    const res = await callGemini({ text });
-    $('ai-text-submit').disabled = false;
-    if (res.error) { $('ai-text-status').textContent = errMsg(res); return; }
-    window.KAL.closeSheet('sheet-aitext');
-    $('ai-text-input').value = '';
-    window.KAL.openQuick(toEntry(res.result, 'ai-text'));
+    const j = await window.JOBS.add({ kind: 'kcal-text', ts: Date.now(), text, meal: window.KAL.getMeal() });
+    shown.aitext = j.id;
+    window.JOBS.attempt(j.id);
   });
 
   /* ── Odhad z fotky ── */
@@ -208,16 +276,33 @@
   $('ai-photo-input').addEventListener('change', async e => {
     const file = e.target.files[0];
     if (!file) return;
+    const now = Date.now();
+    // Fotka z galerie nese čas pořízení — jídlo se zapíše k času, kdy se jedlo.
+    const ts = file.lastModified && file.lastModified <= now && now - file.lastModified < 864e5 ? file.lastModified : now;
     let img;
     try { img = await downscale(file); } catch (err) { window.KAL.toast('Fotku se nepodařilo načíst'); return; }
     $('ai-photo-preview').src = img.dataUrl;
     $('ai-photo-status').textContent = 'Analyzuji fotku… (pár vteřin)';
     window.KAL.openSheet('sheet-aiphoto');
-    const res = await callGemini({ imageBase64: img.base64, imageMedia: 'image/jpeg' });
-    if (res.error) { $('ai-photo-status').textContent = errMsg(res); return; }
-    window.KAL.closeSheet('sheet-aiphoto');
-    window.KAL.openQuick(toEntry(res.result, 'ai-photo'));
+    const j = await window.JOBS.add({ kind: 'kcal-photo', ts, img: img.base64, thumb: await thumbOf(img.dataUrl), meal: window.KAL.getMeal() });
+    shown.aiphoto = j.id;
+    window.JOBS.attempt(j.id);
   });
+
+  // Malý náhled do přehledu čekajících fotek.
+  function thumbOf(dataUrl) {
+    return new Promise(resolve => {
+      const im = new Image();
+      im.onload = () => {
+        const s = 160 / Math.max(im.naturalWidth, im.naturalHeight), cv = document.createElement('canvas');
+        cv.width = Math.round(im.naturalWidth * s); cv.height = Math.round(im.naturalHeight * s);
+        cv.getContext('2d').drawImage(im, 0, 0, cv.width, cv.height);
+        resolve(cv.toDataURL('image/jpeg', 0.7));
+      };
+      im.onerror = () => resolve(null);
+      im.src = dataUrl;
+    });
+  }
 
   // Zmenší fotku na max 1024 px a JPEG ~0.8 — rychlejší odeslání, stejná přesnost odhadu.
   function downscale(file) {
@@ -239,5 +324,5 @@
     });
   }
 
-  window.AI = { callGemini, callClaude, callRuns, claudeReady, downscale, errMsg };
+  window.AI = { callGemini, callClaude, callRuns, claudeReady, downscale, errMsg, thumbOf };
 })();

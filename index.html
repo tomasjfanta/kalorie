@@ -30,6 +30,7 @@
 <main>
   <!-- ═══ DNES ═══ -->
   <section id="view-dnes" class="view active">
+    <div id="jobs-strip" class="card jobs-strip hidden"></div>
     <div class="card ring-card">
       <div class="ring-wrap">
         <svg id="ring" viewBox="0 0 120 120" width="170" height="170" aria-hidden="true">
@@ -251,6 +252,12 @@
       <button id="save-ai" class="btn">Uložit</button>
       <div id="ai-key-note" class="muted small-text" style="margin-top:8px"></div>
       <p class="muted small-text" style="margin-top:8px">Pozn.: u bezplatného klíče může Google zaslaná data použít ke zlepšování svých služeb — neposílejte fotky, na kterých je něco citlivého.</p>
+    </div>
+
+    <div class="card">
+      <div class="card-title">🩺 Diagnostika AI</div>
+      <p class="muted small-text">Každý pokus o odhad (který model, jak dlouho trval, proč případně selhal) se zapisuje, aby šlo chyby rozebrat a opravit.</p>
+      <div id="diag-body"></div>
     </div>
 
     <div class="card">
@@ -559,9 +566,16 @@
         <label class="field">Čas jídla<input id="cnew-time" type="time"></label>
         <label class="field cnew-ins">Inzulin (U) <span class="muted">— nepovinné</span><input id="cnew-units" type="text" inputmode="decimal" placeholder="z pumpy"></label>
       </div>
+      <label class="field">Rychlost vstřebání (glykemický index)
+        <select id="cnew-gi"><option value="vysoky">rychlá — vysoký GI</option><option value="stredni">střední GI</option><option value="nizky">pomalá — nízký GI (tuk, luštěniny, celozrnné)</option></select>
+      </label>
       <button id="cnew-save" class="btn">Uložit</button>
     </div>
-    <button id="cnew-retry" class="btn btn-ghost hidden">Zkusit znovu</button>
+    <div class="btn-row">
+      <button id="cnew-retry" class="btn btn-ghost hidden">Zkusit hned</button>
+      <button id="cnew-discard" class="btn btn-danger-ghost">Zahodit fotku</button>
+    </div>
+    <p class="muted small-text center">Fotka je uložená v telefonu. Když okno zavřete, odhad doběhne sám a jídlo se uloží.</p>
   </div>
 </div>
 
@@ -601,8 +615,9 @@
 <script src="js/app.js"></script>
 <script src="js/vendor/zxing.min.js"></script>
 <script src="js/scan.js"></script>
-<script src="js/ai.js"></script>
 <script src="js/cgm.js"></script>
+<script src="js/jobs.js"></script>
+<script src="js/ai.js"></script>
 <script src="js/carb.js"></script>
 <script>
   if ('serviceWorker' in navigator) {

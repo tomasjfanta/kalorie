@@ -2,8 +2,9 @@
 // Medtronic nemá veřejné API — automaticky jen přes Nightscout (plněný xDrip+ nebo nightscout-connect).
 'use strict';
 (function () {
-  const DB_NAME = 'kalorie', DB_VER = 1;
-  const STORES = { cgm: 't', bolus: 't', pumpset: 't', thumbs: 'id' };
+  const DB_NAME = 'kalorie', DB_VER = 2;
+  // basal = automatický bazál pumpy (U/h po 5 min), jobs = fotky a popisy čekající na odhad AI.
+  const STORES = { cgm: 't', bolus: 't', pumpset: 't', thumbs: 'id', basal: 't', jobs: 'id' };
   let dbp = null;
   function db() {
     if (dbp) return dbp;
@@ -46,6 +47,16 @@
     const rq = tx.objectStore(store).openCursor(null, 'prev');
     return new Promise((res, rej) => { rq.onsuccess = () => res(rq.result ? rq.result.value : null); rq.onerror = () => rej(rq.error); });
   }
+  async function all(store) {
+    const tx = (await db()).transaction(store, 'readonly');
+    const rq = tx.objectStore(store).getAll();
+    return new Promise((res, rej) => { rq.onsuccess = () => res(rq.result); rq.onerror = () => rej(rq.error); });
+  }
+  async function clear(store) {
+    const tx = (await db()).transaction(store, 'readwrite');
+    tx.objectStore(store).clear();
+    await done(tx);
+  }
   async function clearAll() {
     const d = await db();
     const tx = d.transaction(Object.keys(STORES), 'readwrite');
@@ -72,35 +83,57 @@
     if (!r.ok) throw new Error('http ' + r.status);
     return r.json();
   }
-  // Stáhne glykémie a bolusy za období a uloží je; vrací počty.
+  // Klíče, které slučují duplicity z uploaderu (stejná dávka s časem posunutým o sekundy):
+  // bolus = minuta + dávka v setinách U (různé dávky ve stejné minutě zůstanou zvlášť),
+  // bazál = 5minutový úsek pumpy.
+  const bolusKey = (t, u) => Math.round(t / 60000) * 60000 + Math.round(u * 100) % 1000;
+  const basalKey = t => Math.round(t / 300000) * 300000;
+  const normBolus = b => ({ ...b, t: bolusKey(b.t, b.u), t0: b.t });
+
+  // Stáhne glykémie, bolusy a automatický bazál za období a uloží je; vrací počty.
   async function nsSync(cfg, from, to) {
     const sgv = await nsFetch(cfg, '/api/v1/entries/sgv.json', {
-      'find[date][$gte]': String(from), 'find[date][$lte]': String(to), count: '2000',
+      'find[date][$gte]': String(from), 'find[date][$lte]': String(to), count: '5000',
     });
     const readings = (sgv || []).filter(x => x.sgv > 0 && x.date).map(x => ({ t: x.date, v: x.sgv / MG }));
     await put('cgm', readings);
-    let boluses = [];
+    const win = { 'find[created_at][$gte]': new Date(from).toISOString(), 'find[created_at][$lte]': new Date(to).toISOString() };
+    let boluses = [], basal = [];
     try {
-      const tr = await nsFetch(cfg, '/api/v1/treatments.json', {
-        'find[created_at][$gte]': new Date(from).toISOString(), 'find[created_at][$lte]': new Date(to).toISOString(), count: '1000',
-      });
-      boluses = (tr || []).filter(x => x.insulin > 0).map(x => ({ t: Date.parse(x.created_at), u: +x.insulin, src: 'ns:' + (x.eventType || '') }))
+      const tr = await nsFetch(cfg, '/api/v1/treatments.json', { ...win, 'find[insulin][$gt]': '0', count: '3000' });
+      boluses = (tr || []).filter(x => x.insulin > 0).map(x => normBolus({ t: Date.parse(x.created_at), u: +x.insulin, src: 'ns:' + (x.eventType || '') }))
         .filter(b => isFinite(b.t));
       await put('bolus', boluses);
     } catch (e) { /* ošetření nejsou povinná — glykémie stačí pro náhled */ }
-    return { readings: readings.length, boluses: boluses.length, last: readings.reduce((a, r) => r.t > (a?.t || 0) ? r : a, null) };
+    try {
+      const tb = await nsFetch(cfg, '/api/v1/treatments.json', { ...win, 'find[eventType]': 'Temp Basal', count: '5000' });
+      basal = (tb || []).filter(x => x.absolute != null && isFinite(Date.parse(x.created_at)))
+        .map(x => ({ t: basalKey(Date.parse(x.created_at)), r: +x.absolute }));
+      await put('basal', basal);
+    } catch (e) { /* bez automatického bazálu se počítá jako dřív */ }
+    return { readings: readings.length, boluses: boluses.length, basal: basal.length, last: readings.reduce((a, r) => r.t > (a?.t || 0) ? r : a, null) };
+  }
+
+  // Jednorázově: bolusy uložené dřívější verzí (s duplicitami) přeuložit pod nové klíče.
+  async function migrateBoluses() {
+    const old = await all('bolus');
+    const seen = new Map();
+    for (const b of old.sort((a, c) => a.t - c.t)) { const n = normBolus({ ...b, t: b.t0 ?? b.t }); if (!seen.has(n.t)) seen.set(n.t, n); }
+    await clear('bolus');
+    await put('bolus', [...seen.values()]);
+    return { before: old.length, after: seen.size };
   }
 
   /* ─── Export z CareLinku ─── */
   async function importCareLink(text) {
     const p = LEARN.parseCareLink(text);
     await put('cgm', p.readings);
-    await put('bolus', p.boluses);
+    await put('bolus', p.boluses.map(normBolus));
     await put('pumpset', p.settings);
     const first = p.readings[0]?.t, last = p.readings[p.readings.length - 1]?.t;
     return { readings: p.readings.length, boluses: p.boluses.length, settings: p.settings.length, first, last,
       lastSet: p.settings[p.settings.length - 1] || null, unit: p.unit };
   }
 
-  window.CGM = { put, range, get, del, lastKey, clearAll, nsSync, nsFetch, nsBase, nsTokenFromUrl, importCareLink, MG };
+  window.CGM = { put, range, get, del, all, clear, lastKey, clearAll, nsSync, nsFetch, nsBase, nsTokenFromUrl, importCareLink, migrateBoluses, MG };
 })();

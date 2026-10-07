@@ -1,0 +1,484 @@
+"""cl2ns - Carelink Cloud API Client
+
+Lightweight, async client for Medtronic Carelink Cloud API.
+"""
+
+import base64
+import json
+import logging
+import os
+from datetime import datetime, timedelta, timezone
+import aiofiles
+import httpx
+
+_LOGGER = logging.getLogger("cl2ns.carelink")
+
+DISCOVERY_URL = "https://clcloud.minimed.eu/connect/carepartner/v13/discover/android/3.6"
+TOKEN_EXPIRY_MARGIN_SEC = 600  # 10 minutes margin before token expiration
+HTTP_TIMEOUT_SEC = 30.0
+USER_AGENT = "Dalvik/2.1.0 (Linux; U; Android 10; Nexus 5X Build/QQ3A.200805.001)"
+
+
+class CarelinkError(Exception):
+    """Base exception for Carelink API errors."""
+    pass
+
+
+class CarelinkAuthError(CarelinkError):
+    """Authentication or token refresh failure."""
+    pass
+
+
+class CarelinkConnectionError(CarelinkError):
+    """Network, DNS, or connectivity failure."""
+    pass
+
+
+class CarelinkClient:
+    """Carelink API Client with automatic token management and persistence."""
+
+    def __init__(
+        self,
+        access_token: str = None,
+        refresh_token: str = None,
+        client_id: str = None,
+        client_secret: str = None,
+        mag_identifier: str = None,
+        patient_id: str = None,
+        data_dir: str = "/data",
+    ):
+        self.access_token = access_token
+        self.refresh_token = refresh_token
+        self.client_id = client_id
+        self.client_secret = client_secret
+        self.mag_identifier = mag_identifier
+        self.patient_id = patient_id
+        self.data_dir = data_dir
+        self.token_file_path = os.path.join(data_dir, "carelink_tokens.json")
+
+        # Keep original environment credentials for startup fallback
+        self._env_access_token = access_token
+        self._env_refresh_token = refresh_token
+        self._env_client_id = client_id
+        self._env_client_secret = client_secret
+        self._env_mag_identifier = mag_identifier
+
+        self.username = None
+        self.country = None
+        self.role = None
+        self.token_expires_at = None
+        self.config = None
+        self._http_client = None
+        self._initialized = False
+
+    def _apply_env_tokens(self):
+        """Restore tokens and credentials from environment variables."""
+        self.access_token = self._env_access_token
+        self.refresh_token = self._env_refresh_token
+        self.client_id = self._env_client_id
+        self.client_secret = self._env_client_secret
+        self.mag_identifier = self._env_mag_identifier
+        self.token_expires_at = None
+        self.username = None
+        self.country = None
+        self.role = None
+        self.config = None
+
+    def _are_env_tokens_new(self, volume_access_token: str = None) -> bool:
+        """Check if environment tokens are present, valid, and newer than volume tokens."""
+        if not self._env_access_token or not self._env_refresh_token:
+            return False
+
+        if volume_access_token and self._env_access_token == volume_access_token:
+            return False
+
+        try:
+            env_payload = self._parse_jwt(self._env_access_token)
+        except Exception:
+            return False
+
+        env_iat = env_payload.get("iat", 0)
+        env_exp = env_payload.get("exp", 0)
+
+        if volume_access_token:
+            try:
+                vol_payload = self._parse_jwt(volume_access_token)
+                vol_iat = vol_payload.get("iat", 0)
+                vol_exp = vol_payload.get("exp", 0)
+
+                # Prefer iat (issued-at) timestamp comparison
+                if env_iat and vol_iat:
+                    return env_iat > vol_iat
+                # Otherwise compare expiration timestamp
+                if env_exp and vol_exp:
+                    return env_exp > vol_exp
+            except Exception:
+                # Volume token was not a parseable JWT
+                pass
+
+        # If volume token had no valid timestamps, only accept env token if not expired
+        now_ts = datetime.now(timezone.utc).timestamp()
+        return env_exp > now_ts
+
+    async def _get_client(self) -> httpx.AsyncClient:
+        if self._http_client is None or self._http_client.is_closed:
+            self._http_client = httpx.AsyncClient(
+                headers={
+                    "User-Agent": USER_AGENT,
+                    "Accept": "application/json",
+                },
+                timeout=HTTP_TIMEOUT_SEC,
+                follow_redirects=True,
+            )
+        return self._http_client
+
+    async def close(self):
+        """Close the HTTP client session."""
+        if self._http_client and not self._http_client.is_closed:
+            await self._http_client.aclose()
+            self._http_client = None
+
+    async def load_tokens(self) -> bool:
+        """Load stored tokens from data directory if available."""
+        if not os.path.exists(self.token_file_path):
+            return False
+
+        try:
+            async with aiofiles.open(self.token_file_path, "r") as f:
+                content = await f.read()
+                if not content.strip():
+                    return False
+                data = json.loads(content)
+
+            self.access_token = data.get("access_token", self.access_token)
+            self.refresh_token = data.get("refresh_token", self.refresh_token)
+            self.client_id = data.get("client_id", self.client_id)
+            self.client_secret = data.get("client_secret", self.client_secret)
+            self.mag_identifier = data.get("mag-identifier", self.mag_identifier)
+            _LOGGER.debug(f"Loaded credentials from {self.token_file_path}")
+            return True
+        except Exception as e:
+            _LOGGER.warning(f"Failed loading token file {self.token_file_path}: {e}")
+            return False
+
+    async def save_tokens(self):
+        """Persist refreshed tokens to data directory atomically."""
+        os.makedirs(self.data_dir, exist_ok=True)
+        payload = {
+            "access_token": self.access_token,
+            "refresh_token": self.refresh_token,
+            "client_id": self.client_id,
+        }
+        if self.client_secret:
+            payload["client_secret"] = self.client_secret
+        if self.mag_identifier:
+            payload["mag-identifier"] = self.mag_identifier
+
+        tmp_file = self.token_file_path + ".tmp"
+        try:
+            async with aiofiles.open(tmp_file, "w") as f:
+                await f.write(json.dumps(payload, indent=2))
+            os.replace(tmp_file, self.token_file_path)
+            _LOGGER.debug(f"Saved token payload to {self.token_file_path}")
+        except Exception as e:
+            _LOGGER.error(f"Failed saving tokens to file: {e}")
+
+    def _parse_jwt(self, token: str) -> dict:
+        """Decode JWT payload without verifying signature."""
+        try:
+            parts = token.split(".")
+            if len(parts) < 2:
+                raise ValueError("Invalid JWT token structure")
+
+            b64_str = parts[1]
+            padding = 4 - (len(b64_str) % 4)
+            if padding and padding < 4:
+                b64_str += "=" * padding
+
+            decoded_bytes = base64.b64decode(b64_str)
+            return json.loads(decoded_bytes.decode("utf-8"))
+        except Exception as e:
+            raise CarelinkAuthError(f"Failed decoding JWT access token: {e}") from e
+
+    def _extract_token_metadata(self):
+        """Extract expiration timestamp, username, and country from JWT payload."""
+        if not self.access_token:
+            raise CarelinkAuthError("No access token provided")
+
+        payload = self._parse_jwt(self.access_token)
+        exp_ts = payload.get("exp")
+        if not exp_ts:
+            raise CarelinkAuthError("JWT token missing 'exp' field")
+
+        self.token_expires_at = datetime.fromtimestamp(exp_ts, tz=timezone.utc)
+        token_details = payload.get("token_details", {})
+        self.username = token_details.get("preferred_username")
+        self.country = token_details.get("country", "EU")
+
+        _LOGGER.debug(
+            f"Token parsed: user={self.username}, country={self.country}, "
+            f"expires_at={self.token_expires_at.strftime('%Y-%m-%d %H:%M:%S UTC')}"
+        )
+
+    async def _discover_config(self):
+        """Discover Carelink endpoints based on country/region."""
+        client = await self._get_client()
+        try:
+            resp = await client.get(DISCOVERY_URL)
+        except httpx.RequestError as e:
+            raise CarelinkConnectionError(f"Discovery endpoint unreachable: {e}") from e
+
+        if resp.status_code != 200:
+            raise CarelinkError(f"Discovery API returned HTTP {resp.status_code}")
+
+        data = resp.json()
+        region = None
+        for country_map in data.get("supportedCountries", []):
+            if self.country.upper() in country_map:
+                region = country_map[self.country.upper()].get("region")
+                break
+
+        if not region:
+            raise CarelinkError(f"Unsupported country code: {self.country}")
+
+        config = None
+        for cp in data.get("CP", []):
+            if cp.get("region") == region:
+                config = cp
+                break
+
+        if not config:
+            raise CarelinkError(f"No region configuration found for region {region}")
+
+        # Fetch SSO configuration to get token_url
+        sso_key = config.get("UseSSOConfiguration", "Auth0SSOConfiguration")
+        sso_url = config.get(sso_key)
+        if not sso_url:
+            raise CarelinkError(f"SSO URL key '{sso_key}' not found in discovery configuration")
+
+        try:
+            sso_resp = await client.get(sso_url)
+        except httpx.RequestError as e:
+            raise CarelinkConnectionError(f"SSO config endpoint unreachable: {e}") from e
+
+        if sso_resp.status_code != 200:
+            raise CarelinkError(f"SSO config returned HTTP {sso_resp.status_code}")
+
+        sso_config = sso_resp.json()
+        is_auth0 = "Auth0" in sso_key
+
+        if is_auth0:
+            if "issuer" in sso_config and sso_config["issuer"]:
+                sso_base = sso_config["issuer"].rstrip("/")
+            elif "server" in sso_config:
+                srv = sso_config["server"]
+                sso_base = f"https://{srv['hostname']}:{srv['port']}/{srv['prefix']}".rstrip("/")
+            else:
+                auth_ep = sso_config.get("system_endpoints", {}).get("authorization_endpoint_path", "")
+                if auth_ep.startswith("http"):
+                    sso_base = auth_ep.rsplit("/", 1)[0]
+                else:
+                    raise CarelinkError("Cannot resolve Auth0 base URL")
+        else:
+            srv = sso_config["server"]
+            sso_base = f"https://{srv['hostname']}:{srv['port']}/{srv['prefix']}".rstrip("/")
+
+        token_path = sso_config.get("system_endpoints", {}).get("token_endpoint_path", "/oauth/token")
+        config["token_url"] = sso_base + token_path
+        config["is_auth0"] = is_auth0
+        self.config = config
+        _LOGGER.debug(f"Resolved Carelink token endpoint: {config['token_url']}")
+
+    async def _refresh_token(self):
+        """Execute OAuth 2.0 refresh_token grant."""
+        if not self.config or "token_url" not in self.config:
+            await self._discover_config()
+
+        client = await self._get_client()
+        token_url = self.config["token_url"]
+        _LOGGER.info("Refreshing Carelink access token...")
+
+        body = {
+            "grant_type": "refresh_token",
+            "refresh_token": self.refresh_token,
+            "client_id": self.client_id,
+        }
+        headers = {}
+
+        is_auth0 = self.config.get("is_auth0", False)
+        try:
+            if is_auth0:
+                # Auth0 is a public native OAuth client and does not accept client_secret
+                resp = await client.post(token_url, json=body, headers=headers)
+            else:
+                if self.client_secret:
+                    body["client_secret"] = self.client_secret
+                if self.mag_identifier:
+                    headers["mag-identifier"] = self.mag_identifier
+                resp = await client.post(token_url, data=body, headers=headers)
+        except httpx.RequestError as e:
+            raise CarelinkConnectionError(f"Token refresh network error: {e}") from e
+
+        if resp.status_code != 200:
+            raise CarelinkAuthError(f"Token refresh failed HTTP {resp.status_code}: {resp.text}")
+
+        res_json = resp.json()
+        self.access_token = res_json["access_token"]
+        self.refresh_token = res_json.get("refresh_token", self.refresh_token)
+
+        self._extract_token_metadata()
+        await self.save_tokens()
+        _LOGGER.info(f"Token successfully refreshed (expires at {self.token_expires_at.strftime('%H:%M:%S UTC')}).")
+
+    async def ensure_valid_token(self):
+        """Check token expiry and refresh if expiring within margin."""
+        if not self.access_token or not self.token_expires_at:
+            self._extract_token_metadata()
+
+        now = datetime.now(timezone.utc)
+        margin = timedelta(seconds=TOKEN_EXPIRY_MARGIN_SEC)
+
+        if now + margin >= self.token_expires_at:
+            _LOGGER.info("Access token near expiration. Triggering refresh...")
+            await self._refresh_token()
+
+    async def _setup_session(self):
+        """Extract token metadata, validate/refresh token, discover config, and resolve role."""
+        self._extract_token_metadata()
+        await self.ensure_valid_token()
+        await self._discover_config()
+
+        # Fetch user role via /users/me
+        client = await self._get_client()
+        user_url = self.config["baseUrlCareLink"] + "/users/me"
+        headers = {
+            "Authorization": f"Bearer {self.access_token}",
+            "Accept": "application/json, text/plain, */*",
+        }
+        if self.mag_identifier:
+            headers["mag-identifier"] = self.mag_identifier
+
+        try:
+            resp = await client.get(user_url, headers=headers)
+            if resp.status_code in (401, 403):
+                _LOGGER.info("Initial /users/me call returned 401/403. Attempting token refresh...")
+                await self._refresh_token()
+                headers["Authorization"] = f"Bearer {self.access_token}"
+                resp = await client.get(user_url, headers=headers)
+        except httpx.RequestError as e:
+            raise CarelinkConnectionError(f"User profile network error: {e}") from e
+
+        if resp.status_code in (401, 403):
+            raise CarelinkAuthError(f"User profile authentication failed HTTP {resp.status_code}")
+        elif resp.status_code != 200:
+            raise CarelinkError(f"Failed fetching user profile HTTP {resp.status_code}")
+
+        user_data = resp.json()
+        user_role = user_data.get("role", "PATIENT")
+        self.role = "carepartner" if user_role in ("CARE_PARTNER", "CARE_PARTNER_OUS") else "patient"
+
+        # If care partner role, resolve patient ID
+        if self.role == "carepartner":
+            if not self.patient_id:
+                patients_url = self.config["baseUrlCareLink"] + "/links/patients"
+                try:
+                    patients_resp = await client.get(patients_url, headers=headers)
+                except httpx.RequestError as e:
+                    raise CarelinkConnectionError(f"Patient list network error: {e}") from e
+
+                if patients_resp.status_code == 200:
+                    active_patients = [p for p in patients_resp.json() if p.get("status") == "ACTIVE"]
+                    if not active_patients:
+                        raise CarelinkError("Care Partner account has no active linked patients.")
+
+                    self.patient_id = active_patients[0].get("username")
+                    if len(active_patients) > 1:
+                        usernames = [p.get("username") for p in active_patients]
+                        _LOGGER.warning(
+                            f"Multiple active patients found: {usernames}. Defaulting to '{self.patient_id}'. "
+                            f"Specify CARELINK_PATIENT_ID in your environment to target a specific patient."
+                        )
+                    else:
+                        _LOGGER.info(f"Auto-resolved active Care Partner patient ID: {self.patient_id}")
+                else:
+                    raise CarelinkError(f"Failed fetching patient list HTTP {patients_resp.status_code}")
+            else:
+                _LOGGER.info(f"Using configured Care Partner patient ID: {self.patient_id}")
+
+        self._initialized = True
+        _LOGGER.info(f"Carelink session initialized (User: {self.username}, Role: {self.role}).")
+
+    async def authenticate(self):
+        """Initialize session and fetch user profile/role.
+
+        On startup, if tokens in volume fail authentication, falls back to environment
+        variables ONLY IF fresh/newer tokens are detected in the environment.
+        """
+        has_volume_tokens = await self.load_tokens()
+        volume_access_token = self.access_token if has_volume_tokens else None
+
+        if has_volume_tokens:
+            try:
+                await self._setup_session()
+                return
+            except CarelinkAuthError as auth_err:
+                _LOGGER.warning(
+                    f"Startup authentication with volume tokens failed: {auth_err}. "
+                    "Checking if fresh tokens are available in environment variables..."
+                )
+                if self._are_env_tokens_new(volume_access_token):
+                    _LOGGER.info(
+                        "Fresh environment tokens detected. Discarding stale volume tokens and re-authenticating with environment variables..."
+                    )
+                    self._apply_env_tokens()
+                    await self._setup_session()
+                    await self.save_tokens()
+                    return
+                else:
+                    _LOGGER.error(
+                        "Environment tokens are not newer than stored volume tokens; skipping fallback to prevent using stale credentials."
+                    )
+                    raise auth_err
+        else:
+            await self._setup_session()
+            await self.save_tokens()
+
+    async def fetch_recent_data(self) -> dict:
+        """Fetch recent pump/sensor data from Carelink /display/message."""
+        if not self._initialized:
+            await self.authenticate()
+        else:
+            await self.ensure_valid_token()
+
+        client = await self._get_client()
+        display_url = self.config["baseUrlCumulus"] + "/display/message"
+
+        payload_obj = {"username": self.username, "role": self.role}
+        if self.role == "carepartner" and self.patient_id:
+            payload_obj["patientId"] = self.patient_id
+
+        request_body = json.dumps(payload_obj)
+
+        headers = {
+            "Authorization": f"Bearer {self.access_token}",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Content-Type": "application/x-www-form-urlencoded",
+        }
+        if self.mag_identifier:
+            headers["mag-identifier"] = self.mag_identifier
+
+        try:
+            resp = await client.post(display_url, data=request_body, headers=headers)
+            if resp.status_code in (401, 403):
+                _LOGGER.warning("Data fetch returned 401/403. Refreshing token and retrying...")
+                await self._refresh_token()
+                headers["Authorization"] = f"Bearer {self.access_token}"
+                resp = await client.post(display_url, data=request_body, headers=headers)
+        except httpx.RequestError as e:
+            raise CarelinkConnectionError(f"Data fetch network error: {e}") from e
+
+        if resp.status_code != 200:
+            raise CarelinkError(f"Data fetch failed HTTP {resp.status_code}: {resp.text}")
+
+        data = resp.json()
+        return data.get("patientData", data)

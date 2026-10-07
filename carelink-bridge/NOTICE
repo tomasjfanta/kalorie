@@ -1,0 +1,11 @@
+This directory is a copy of cl2ns (https://github.com/bigcheesesteak/cl2ns, Apache License 2.0,
+commit c05ca24f7584a2585c170dfcdce3617a1671c8c5, 2026-09-16), files from its sync/ folder.
+
+Modified by the Kalorie project on 2026-10-07:
+- nightscout.py: duplicate detection uses a 2-minute time bucket (own and neighbouring buckets)
+  instead of the exact created_at, because CareLink marker times drift by ~1 s between fetches
+  and the same bolus/basal record was re-uploaded every few hours. "notes" no longer part of the
+  treatment fingerprint (the Sensor Change note changes as the sensor ages).
+- nightscout.py: readings without a timestamp are skipped instead of failing the whole sync cycle.
+- Dockerfile: VOLUME instruction removed (Railway mounts its own volume at /data).
+- nightscout.py: zero-rate AUTO_BASAL_DELIVERY markers are uploaded too (so a suspension differs from missing data).

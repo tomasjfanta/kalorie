@@ -137,7 +137,7 @@ function showView(name) {
   if (name === 'dnes') renderDnes();
   if (name === 'historie') renderHistory();
   if (name === 'vaha') renderWeight();
-  if (name === 'nastaveni') fillSettings();
+  if (name === 'nastaveni') { fillSettings(); window.JOBS?.renderDiag(); }
   window.scrollTo(0, 0);
 }
 $$('.tab').forEach(t => t.addEventListener('click', () => showView(t.dataset.view)));
@@ -151,6 +151,7 @@ $('#date-label').addEventListener('click', () => { viewDate = todayStr(); render
 /* ═══ DNES ═══ */
 const CIRC = 2 * Math.PI * 52;
 function renderDnes() {
+  window.JOBS?.renderStrip();
   $('#date-label').textContent = fmtHuman(viewDate);
   $('#date-next').style.visibility = viewDate < todayStr() ? 'visible' : 'hidden';
   const t = dayTotals(viewDate);
@@ -890,6 +891,7 @@ $('#save-ai').addEventListener('click', () => {
   store.set('kal.ai', aiCfg);
   $('#ai-key-note').textContent = aiCfg.key ? '✓ Klíč uložen — AI odhady jsou připravené.' : 'Bez klíče AI odhady nefungují.';
   toast('Uloženo');
+  window.JOBS?.retryAll();
 });
 
 /* Kalkulačka (Mifflin-St Jeor) */
@@ -960,7 +962,7 @@ $('#import-file').addEventListener('change', async e => {
 });
 $('#wipe-btn').addEventListener('click', () => {
   if (!confirm('Opravdu smazat úplně všechna data (deník, váhu, nastavení)? Tohle nejde vrátit.')) return;
-  ['kal.settings', 'kal.days', 'kal.custom', 'kal.products', 'kal.favs', 'kal.recent', 'kal.ai', 'kal.ns', 'kal.nsSync', 'kal.nsLast', 'kal.nsErr', 'kal.clImport', 'kal.dataAt'].forEach(k => localStorage.removeItem(k));
+  ['kal.settings', 'kal.days', 'kal.custom', 'kal.products', 'kal.favs', 'kal.recent', 'kal.ai', 'kal.ns', 'kal.nsSync', 'kal.nsLast', 'kal.nsErr', 'kal.clImport', 'kal.dataAt', 'kal.aiLog', 'kal.aiOut', 'kal.migr2'].forEach(k => localStorage.removeItem(k));
   Promise.resolve(window.CGM?.clearAll()).catch(() => {}).finally(() => location.reload());
 });
 
@@ -972,6 +974,7 @@ window.KAL = {
   days: () => days, day: s => day(s), saveAll, settings: () => settings, saveSettings: () => store.set('kal.settings', settings),
   store, renderDnes, showView, entryConf, groupConf, badge, fmtC, vjTxt, TOL, esc, dstr, todayStr, fmtHuman,
   viewDate: () => viewDate, mealByHour, r0, r1, dec, num,
+  VERSION: 'v13',
   aiConfig: () => aiCfg,
   setAiModel: m => { aiCfg.model = m; store.set('kal.ai', aiCfg); },  // zapamatuje funkční model ze zálohy
   openQuick,          // prefill rychlého zápisu z AI výsledku
