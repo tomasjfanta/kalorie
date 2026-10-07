@@ -412,3 +412,5 @@ code { font-size: 12.5px; background: var(--track); padding: 1px 5px; border-rad
 .job-btns .btn { margin-top: 0; padding: 6px 10px; font-size: 13px; }
 .bg-meal2 { stroke-dasharray: 3 2; opacity: .8; }
 #sheet-cnew .btn-row { margin-top: 10px; }
+
+.warn-note { background: var(--c-mid-bg); color: var(--text); margin-bottom: 8px; }

@@ -193,15 +193,23 @@
     if (e.ev?.implied && LEARN.REL_SD[e.ev.quality]) return '📈 podle glykémie ~' + r0(e.ev.implied) + ' g';
     return '— ' + (e.ev?.flags?.[0] || 'zatím bez dat z CGM');
   }
+  // Glykémie přestaly chodit (most k CareLinku se odhlásil, telefon s pumpou mimo dosah…) → upozornit.
+  function staleTxt() {
+    const ns = K.store.get('kal.ns', null), last = K.store.get('kal.nsLast', null);
+    if (!ns?.url || !last?.t || K.viewDate() !== K.todayStr()) return '';
+    const age = Date.now() - last.t;
+    if (age < 30 * MIN) return '';
+    return `<div class="result-note warn-note">⚠️ Poslední glykémie z pumpy je z ${hhmm(last.t)} (${age > DAY ? 'před více než dnem' : 'před ' + Math.round(age / MIN) + ' min'}). Když to trvá, odhlásil se nejspíš most k CareLinku — na počítači spusťte znovu přihlášení, případně zkontrolujte, že je telefon s MiniMed Mobile u pumpy.</div>`;
+  }
   function renderTimeline() {
     const box = $('#ctimeline');
     if (!box || !K.isCarb()) return;
     const es = [...(K.day().e || [])].sort((a, b) => (b.ts || 0) - (a.ts || 0));
     if (!es.length) {
-      box.innerHTML = '<div class="result-note">Zatím žádné jídlo. Vyfoťte talíř — AI odhadne sacharidy a glykémie z CGM pak odhad ověří a zpřesní další.</div>';
+      box.innerHTML = staleTxt() + '<div class="result-note">Zatím žádné jídlo. Vyfoťte talíř — AI odhadne sacharidy a glykémie z CGM pak odhad ověří a zpřesní další.</div>';
       return;
     }
-    box.innerHTML = es.map(e => {
+    box.innerHTML = staleTxt() + es.map(e => {
       const c = K.entryConf(e);
       const sub = (e.ts ? hhmm(e.ts) + ' · ' : '') + (e.auto && e.conf == null ? 'uloženo bez potvrzení · ' : '') + (e.cs === 'ai-photo' ? status(e) : 'ruční zápis');
       return `<button class="ctl-row" data-id="${e.id}"><img class="ctl-thumb" data-thumb="${e.id}" alt=""><span class="ctl-mid"><span class="ctl-name">${esc(e.n)}</span><span class="ctl-sub">${sub}</span></span><span class="e-carb"><span class="e-kcal">${K.fmtC(c.C)}</span>${K.badge(c.p)}</span></button>`;
