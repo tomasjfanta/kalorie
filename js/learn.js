@@ -124,7 +124,9 @@
     }
     if (bg0 == null && meal.manual?.bg0) bg0 = meal.manual.bg0;
     const res = { ts: T, readings: rd, coverage, bg0, flags, quality: 'none', implied: null,
-      dur: absDuration(meal), gi: giKey(meal.gi), cluster: cluster.filter(m => m !== meal).map(m => m.ts) };
+      dur: absDuration(meal), gi: giKey(meal.gi), cluster: cluster.filter(m => m !== meal).map(m => m.ts),
+      // sacharidy zadané do pumpy (bez fotky) v okně nebo ještě se vstřebávající
+      pumpMeals: others.filter(m => m.pump && m.ts <= TL + POST && m.ts >= T0 - PRIOR_WIN).map(m => ({ ts: m.ts, g: m.s })) };
     if (bg0 == null) { flags.push('chybí glykémie před jídlem'); return res; }
 
     // Ukazatele pro toto jídlo (graf, vrchol); bilance se počítá za celé okno shluku.
@@ -183,6 +185,7 @@
     res.priorCarbs = priorC;
     if (priorC > 5) { flags.push(`započteno dovstřebávání dřívějšího jídla (~${Math.round(priorC)} g)`); if (priorC > 15) down('fair'); }
     if (unknown.length > 1) { flags.push('vyhodnoceno společně s dalším jídlem v okně — rozděleno podle odhadů AI'); down('fair'); }
+    else if (cluster.some(m => m !== meal && m.pump)) { flags.push('v okně jsou sacharidy zadané do pumpy — počítám s nimi, jak jsou zadané'); down('fair'); }
     else if (cluster.length > 1) flags.push('v okně je i jiné, už ověřené jídlo — započteno');
     if (res.absorbed < 0.7) { flags.push(`pomalé jídlo — do konce okna se vstřebá jen ~${Math.round(res.absorbed * 100)} %`); down('fair'); }
 
@@ -196,14 +199,20 @@
       if (!set || !set.icr || !set.isf) { flags.push('chybí sacharidový poměr nebo citlivost v nastavení léčby'); return res; }
       const tp = therapy.insulin === 'ultra' ? 55 : 75;
       const acted = t => insulinActed((tEnd - t) / MIN, tp) - insulinActed(Math.max(0, T0 - t) / MIN, tp);
-      const ins = { meal: 0, corr: 0, pre: 0, basal: 0 }, del = { meal: 0, corr: 0, basal: 0 };
+      // Inzulin podle původu: k jídlu / automatické korekce pumpy / ruční korekce pumpou /
+      // dřív podaný. Pro bilanci je to jedno (všechen inzulin snižuje glykémii stejně) — rozdělení
+      // slouží k vysvětlení, kolik sacharidů musela dorovnat pumpa a kolik vy.
+      const ins = { meal: 0, auto: 0, man: 0, pre: 0, basal: 0 }, del = { meal: 0, auto: 0, man: 0, basal: 0 };
       let any = false;
       for (const b of dedupeBoluses(data.boluses)) {
         if (b.t < T0 - PRIOR_WIN || b.t > tEnd) continue;
-        // Dávka k jídlu = do 20 min od jídla a aspoň 1 U; automatické korekce 780G jsou skoro vždy
-        // pod 1 U (uploader je od ručních bolusů neodliší, export z CareLinku ano — podle „src").
-        const atMeal = cluster.some(m => Math.abs(b.t - m.ts) <= 20 * MIN) && b.u >= 1 && !/auto|closed_loop|micro/i.test(b.src || '');
-        const cls = atMeal ? 'meal' : b.t < T0 - 20 * MIN ? 'pre' : 'corr';
+        // Dávka k jídlu = do 20 min od jídla a aspoň 1 U. Automatické korekce 780G jsou skoro vždy
+        // pod 1 U (uploader je od ručních bolusů neodliší, export z CareLinku ano — podle „src");
+        // větší dávka později je ruční korekce.
+        const auto = /auto|closed_loop|micro/i.test(b.src || '');
+        const manual = !auto && b.u >= 1;
+        const cls = !auto && b.u >= 1 && cluster.some(m => Math.abs(b.t - m.ts) <= 20 * MIN) ? 'meal'
+          : b.t < T0 - 20 * MIN ? 'pre' : manual ? 'man' : 'auto';
         ins[cls] += b.u * acted(b.t);
         if (cls !== 'pre') del[cls] += b.u;
         any = true;
@@ -237,11 +246,12 @@
         }
       }
       if (therapy.type === 'aid' && !basalOk) { flags.push('chybí údaje o automatickém bazálu — v bilanci chybí'); down('fair'); }
-      const units = ins.meal + ins.corr + ins.pre + ins.basal;
+      const units = ins.meal + ins.auto + ins.man + ins.pre + ins.basal;
       Object.assign(res, { units, ins, del, icr: set.icr, isf: set.isf, basalOk });
-      // Kolik sacharidů dávka k jídlu „předpokládala" a kolik musela pumpa automaticky dorovnat.
+      // Kolik sacharidů dávka k jídlu „předpokládala", kolik dorovnala pumpa sama a kolik vy korekcí.
       res.coveredCarbs = set.icr * del.meal;
-      res.extraCarbs = set.icr * (del.corr + del.basal);
+      res.extraCarbs = set.icr * (del.auto + del.basal);
+      res.manCarbs = set.icr * del.man;
       const absorbedTotal = set.icr * (units + (end - bg0) / set.isf);
       if (!(unknownW > 0)) { flags.push('chybí odhad sacharidů jídla'); return res; }
       res.k = (absorbedTotal - known) / unknownW;

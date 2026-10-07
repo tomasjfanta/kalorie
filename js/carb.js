@@ -95,8 +95,22 @@
     return { readings, boluses, basal, basalBase, pumpset };
   }
 
+  // Sacharidy zadané do pumpy (bolusový kalkulátor) bez fotky do 30 min → známé jídlo v bilanci
+  // (jinak by se jejich vliv na glykémii připsal vyfocenému jídlu).
+  async function pumpMeals(entries, from, to) {
+    const pc = await CGM.range('pcarbs', from, to).catch(() => []);
+    const out = [];
+    for (const p of pc.sort((a, b) => a.t - b.t)) {
+      if (out.some(o => o.s === p.g && Math.abs(o.ts - p.t) <= 3 * MIN)) continue; // duplicity z uploaderu
+      if (entries.some(x => Math.abs(x.ts - p.t) <= 30 * MIN)) continue;           // stejné jídlo jako fotka
+      out.push({ id: 'pc' + p.t, ts: p.t, s: p.g, conf: p.g, kat: 'ostatni', pump: true });
+    }
+    return out;
+  }
+
   async function evaluate(e) {
-    const meals = mealsWithTime().filter(x => Math.abs(x.ts - e.ts) < DAY).map(asMeal);
+    const entries = mealsWithTime().filter(x => Math.abs(x.ts - e.ts) < DAY);
+    const meals = [...entries.map(asMeal), ...await pumpMeals(entries, e.ts - DAY, e.ts + DAY)];
     const w = await loadWindow(e, meals);
     const manual = {};
     if (e.man?.bg0) manual.bg0 = e.man.bg0;
@@ -114,7 +128,7 @@
       icr: ev.icr, isf: ev.isf, n: w.readings.length, at: Date.now(),
       ins: ev.ins, del: ev.del, coveredCarbs: ev.coveredCarbs, extraCarbs: ev.extraCarbs, basalOk: ev.basalOk,
       endSlope15: ev.endSlope15, stable: ev.stable, cluster: ev.cluster, share: ev.share, priorCarbs: ev.priorCarbs,
-      dur: ev.dur, gi: ev.gi,
+      dur: ev.dur, gi: ev.gi, manCarbs: ev.manCarbs, pumpMeals: ev.pumpMeals,
       final: Date.now() > lastTs + POST + 10 * MIN,
     };
     return { ev, ...w };
@@ -124,10 +138,10 @@
   let busy = false;
   async function nsAutoSync() {
     // Jednorázově (verze s automatickým bazálem): přeuložit bolusy bez duplicit a stáhnout 3 dny znovu.
-    const full = !K.store.get('kal.migr2', false);
+    const full = !K.store.get('kal.migr3', false);
     if (full) { await CGM.migrateBoluses().catch(() => {}); touchData(); }
     const ns = K.store.get('kal.ns', null);
-    if (!ns?.url) { if (full) K.store.set('kal.migr2', true); return; }
+    if (!ns?.url) { if (full) K.store.set('kal.migr3', true); return; }
     const last = +(K.store.get('kal.nsSync', 0) || 0);
     if (!full && Date.now() - last < 5 * MIN) return;
     const lastR = await CGM.lastKey('cgm').catch(() => null);
@@ -137,7 +151,7 @@
       K.store.set('kal.nsSync', Date.now());
       K.store.set('kal.nsLast', r.last ? { t: r.last.t, v: r.last.v } : K.store.get('kal.nsLast', null));
       if (r.readings || r.boluses || r.basal) touchData();
-      if (full) K.store.set('kal.migr2', true);
+      if (full) K.store.set('kal.migr3', true);
     } catch (e) { K.store.set('kal.nsErr', { at: Date.now(), msg: e.message }); }
   }
   async function refresh() {
@@ -470,16 +484,24 @@
       if (ev?.del) {
         const d = ev.del, r1 = K.r1;
         let t = `Inzulin: ${ev.cluster?.length ? 'k jídlům v okně' : 'k jídlu'} <b>${dec(r1(d.meal))} U</b>${ev.coveredCarbs ? ` (pokrývá ~${r0(ev.coveredCarbs)} g)` : ''}`;
-        if (d.corr > 0.05) t += ` · korekce pumpy <b>${dec(r1(d.corr))} U</b>`;
+        if (d.auto > 0.05) t += ` · automatické korekce pumpy <b>${dec(r1(d.auto))} U</b>`;
+        if (d.man > 0.05) t += ` · vaše korekce <b>${dec(r1(d.man))} U</b>`;
         if (ev.basalOk && Math.abs(d.basal) >= 0.1) t += ` · bazál ${d.basal > 0 ? '+' : '−'}${dec(r1(Math.abs(d.basal)))} U oproti obvyklému`;
         h += `<div class="ev-metrics">${t}.</div>`;
-        if (ev.extraCarbs > 3) h += `<div class="ev-metrics">➕ Pumpa automaticky dorovnávala ~<b>${r0(ev.extraCarbs)} g</b> — dávka k jídlu počítala s méně sacharidy, než jídlo mělo.</div>`;
+        if (ev.extraCarbs > 3) h += `<div class="ev-metrics">➕ Pumpa automaticky dorovnávala ~<b>${r0(ev.extraCarbs)} g</b>.</div>`;
         else if (ev.extraCarbs < -3) h += `<div class="ev-metrics">➖ Pumpa ubírala inzulin (~${r0(-ev.extraCarbs)} g) — dávka k jídlu byla spíš větší, než bylo potřeba.</div>`;
+        if (ev.manCarbs > 3) h += `<div class="ev-metrics">🔧 Vaše korekce pokryla dalších ~<b>${r0(ev.manCarbs)} g</b>.</div>`;
+        const miss = (ev.extraCarbs || 0) + (ev.manCarbs || 0);
+        if (miss > 5 && d.meal > 0) h += `<div class="ev-metrics">Dávce k jídlu tedy chybělo ~<b>${r0(miss)} g</b>. Bilance počítá s veškerým inzulinem, takže výsledek níže to už zahrnuje.</div>`;
+      }
+      if (ev?.pumpMeals?.length) {
+        h += `<div class="ev-metrics">🍞 Započteny sacharidy zadané do pumpy (bez fotky): ${ev.pumpMeals.map(p => `${r0(p.g)} g v ${hhmm(p.ts)}`).join(', ')}.</div>`;
       }
       if (ev?.end != null && ev.endSlope15 != null) {
         h += `<div class="ev-metrics">Na konci okna ${fmtBG(ev.end)} ${uLbl()} — ${ev.stable ? 'ustálená' : ev.endSlope15 > 0 ? 'ještě stoupá' : 'ještě klesá'} (${ev.endSlope15 >= 0 ? '+' : '−'}${fmtBG(Math.abs(ev.endSlope15))} za 15 min).</div>`;
       }
-      if (ev?.cluster?.length) h += `<div class="ev-metrics">🍽 Vyhodnoceno společně s jídlem v ${ev.cluster.map(hhmm).join(', ')}${ev.share != null && ev.share < 1 ? ` — podíl tohoto jídla ~${Math.round(ev.share * 100)} %` : ''}.</div>`;
+      const photoNeighbours = (ev?.cluster || []).filter(t => !(ev.pumpMeals || []).some(p => p.ts === t));
+      if (photoNeighbours.length) h += `<div class="ev-metrics">🍽 Vyhodnoceno společně s jídlem v ${photoNeighbours.map(hhmm).join(', ')}${ev.share != null && ev.share < 1 ? ` — podíl tohoto jídla ~${Math.round(ev.share * 100)} %` : ''}.</div>`;
       if (ev?.dur) h += `<div class="ev-metrics">Vstřebávání: ${LEARN.GI_LABEL[ev.gi] || 'podle druhu jídla'}${ev.absorbed != null ? ` — do konce okna ~${Math.round(ev.absorbed * 100)} %` : ''}.</div>`;
       const pendingWin = Date.now() < e.ts + POST;
       if (ev?.implied && LEARN.REL_SD[ev.quality]) {

@@ -2,9 +2,10 @@
 // Medtronic nemá veřejné API — automaticky jen přes Nightscout (plněný xDrip+ nebo nightscout-connect).
 'use strict';
 (function () {
-  const DB_NAME = 'kalorie', DB_VER = 2;
-  // basal = automatický bazál pumpy (U/h po 5 min), jobs = fotky a popisy čekající na odhad AI.
-  const STORES = { cgm: 't', bolus: 't', pumpset: 't', thumbs: 'id', basal: 't', jobs: 'id' };
+  const DB_NAME = 'kalorie', DB_VER = 3;
+  // basal = automatický bazál pumpy (U/h po 5 min), jobs = fotky a popisy čekající na odhad AI,
+  // pcarbs = sacharidy zadané do pumpy (bolusový kalkulátor).
+  const STORES = { cgm: 't', bolus: 't', pumpset: 't', thumbs: 'id', basal: 't', jobs: 'id', pcarbs: 't' };
   let dbp = null;
   function db() {
     if (dbp) return dbp;
@@ -106,6 +107,11 @@
       await put('bolus', boluses);
     } catch (e) { /* ošetření nejsou povinná — glykémie stačí pro náhled */ }
     try {
+      const tc = await nsFetch(cfg, '/api/v1/treatments.json', { ...win, 'find[carbs][$gt]': '0', count: '2000' });
+      await put('pcarbs', (tc || []).filter(x => x.carbs > 0 && isFinite(Date.parse(x.created_at)))
+        .map(x => ({ t: Math.round(Date.parse(x.created_at) / 60000) * 60000, g: +x.carbs })));
+    } catch (e) { /* sacharidy z pumpy jsou jen doplněk */ }
+    try {
       const tb = await nsFetch(cfg, '/api/v1/treatments.json', { ...win, 'find[eventType]': 'Temp Basal', count: '5000' });
       basal = (tb || []).filter(x => x.absolute != null && isFinite(Date.parse(x.created_at)))
         .map(x => ({ t: basalKey(Date.parse(x.created_at)), r: +x.absolute }));
@@ -129,6 +135,7 @@
     const p = LEARN.parseCareLink(text);
     await put('cgm', p.readings);
     await put('bolus', p.boluses.map(normBolus));
+    await put('pcarbs', (p.carbsEntered || []).map(c => ({ t: Math.round(c.t / 60000) * 60000, g: c.g })));
     await put('pumpset', p.settings);
     const first = p.readings[0]?.t, last = p.readings[p.readings.length - 1]?.t;
     return { readings: p.readings.length, boluses: p.boluses.length, settings: p.settings.length, first, last,
