@@ -398,6 +398,69 @@ class NightscoutUploader:
                 
         return list(merged.values())
 
+    # PATCH (Kalorie, 2026-10-08): MiniMed 780G temporary target (used for exercise) -> Nightscout
+    # "Temporary Target". CareLink only reports the current pump banner
+    # {"type": "TEMP_TARGET", "timeRemaining": minutes}, so each episode is tracked here: created
+    # when first seen, its duration updated when extended, cut short when cancelled.
+    async def sync_temp_target(self, data: dict):
+        banners = [b for b in (data.get("pumpBannerState") or []) if isinstance(b, dict)]
+        if banners:
+            _LOGGER.info("Pump banners: " + ", ".join(f"{b.get('type')}({b.get('timeRemaining')})" for b in banners))
+        tt = next((b for b in banners if b.get("type") == "TEMP_TARGET"), None)
+        path = os.path.join(self.data_dir, "temp_target.json")
+        try:
+            with open(path, encoding="utf-8") as f:
+                state = json.load(f)
+        except Exception:
+            state = {}
+        now = int(datetime.now(timezone.utc).timestamp() * 1000)
+        client = await self._get_client()
+
+        def doc(start, end):
+            return {
+                "eventType": "Temporary Target",
+                "created_at": datetime.fromtimestamp(start / 1000, timezone.utc).isoformat(),
+                "timestamp": start,
+                "duration": max(1, round((end - start) / 60000)),
+                "targetTop": 150, "targetBottom": 150, "units": "mg/dl",
+                "reason": "Activity", "enteredBy": USER_AGENT,
+            }
+
+        changed = False
+        if tt is not None:
+            end = now + int(tt.get("timeRemaining") or 0) * 60000
+            if not state.get("active"):
+                resp = await client.post(f"{self.url}/api/v1/treatments", json=doc(now, end))
+                if resp.status_code in (200, 201):
+                    _id = None
+                    try:
+                        body = resp.json()
+                        _id = (body[0] if isinstance(body, list) else body).get("_id")
+                    except Exception:
+                        pass
+                    state = {"active": True, "id": _id, "start": now, "end": end}
+                    changed = True
+                    _LOGGER.info(f"Temp target started ({tt.get('timeRemaining')} min remaining) -> Nightscout")
+                else:
+                    _LOGGER.error(f"Temp target upload HTTP {resp.status_code}: {resp.text}")
+            elif abs(end - state.get("end", end)) > 3 * 60000:
+                if state.get("id"):
+                    await client.put(f"{self.url}/api/v1/treatments/", json={"_id": state["id"], **doc(state["start"], end)})
+                state["end"] = end
+                changed = True
+                _LOGGER.info("Temp target duration changed -> Nightscout")
+        elif state.get("active"):
+            if state.get("id") and state.get("end", now) - now > 3 * 60000:  # cancelled early
+                await client.put(f"{self.url}/api/v1/treatments/", json={"_id": state["id"], **doc(state["start"], now)})
+            state = {"active": False, "id": state.get("id"), "start": state.get("start"), "end": min(now, state.get("end", now))}
+            changed = True
+            _LOGGER.info("Temp target ended")
+        if changed:
+            tmp = path + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(state, f)
+            os.replace(tmp, path)
+
     async def upload_carelink_payload(self, data: dict, tz: ZoneInfo) -> dict:
         """Process and upload all Carelink data components to Nightscout."""
         await self.load_cache()
@@ -423,6 +486,11 @@ class NightscoutUploader:
         if trt_items:
             trt_up, trt_skip = await self._post_batch("treatments", trt_items)
             results["treatments"] = (trt_up, trt_skip)
+
+        try:
+            await self.sync_temp_target(data)
+        except Exception as e:
+            _LOGGER.warning(f"Temp target sync failed: {e}")
 
         if self.seeding:
             _LOGGER.info("Dedup cache migrated to 2-minute buckets (existing records not re-uploaded).")

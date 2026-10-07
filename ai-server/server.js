@@ -34,9 +34,10 @@ const SCHEMA = {
     jistota: { type: 'string', enum: ['nízká', 'střední', 'vysoká'] },
     kategorie: { type: 'string', enum: ['pecivo', 'prilohy', 'hotove', 'fastfood', 'sladke', 'ovoce', 'mlecne', 'napoje', 'ostatni'] },
     gi: { type: 'string', enum: ['nízký', 'střední', 'vysoký'] },
+    alkohol: { type: 'boolean' },
     poznamka: { type: 'string' },
   },
-  required: ['nazev', 'mnozstvi', 'kcal', 'bilkoviny', 'sacharidy', 'tuky', 'sacharidy_min', 'sacharidy_max', 'jistota', 'kategorie', 'gi', 'poznamka'],
+  required: ['nazev', 'mnozstvi', 'kcal', 'bilkoviny', 'sacharidy', 'tuky', 'sacharidy_min', 'sacharidy_max', 'jistota', 'kategorie', 'gi', 'alkohol', 'poznamka'],
   additionalProperties: false,
 };
 

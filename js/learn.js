@@ -26,12 +26,25 @@
   const GI_DUR = { vysoky: 165, stredni: 210, nizky: 270 };
   const GI_LABEL = { vysoky: 'rychlé (vysoký GI)', stredni: 'střední GI', nizky: 'pomalé (nízký GI)' };
   const giKey = s => { const t = String(s || '').toLowerCase(); return /vys|high/.test(t) ? 'vysoky' : /níz|niz|low/.test(t) ? 'nizky' : /stř|str|med/.test(t) ? 'stredni' : null; };
+  // m.speed = osobní rychlost vstřebávání (naučená z průběhu glykémie; >1 = rychleji než obvykle).
   function absDuration(m) {
     let D = GI_DUR[giKey(m.gi)] ?? CATS[catKey(m.kat)].dur;
     const fat = m.fat || 0;
     if (fat >= 40) D += 75; else if (fat >= 25) D += 45; // tuk vyprazdňování žaludku zpomaluje
-    return D;
+    return D / (m.speed > 0 ? m.speed : 1);
   }
+
+  // Tuk a bílkoviny: zvyšují glykémii později a déle (Warsaw/FPU, Pańkowska; Smart 2013; Bell 2015).
+  // 1 FPU = 100 kcal z tuku a bílkovin; počítá se jako 5 g „sacharidů" (polovina původní Warsaw
+  // metody — plná hodnota u pump vede k hypoglykémiím), vstřebaných od 1 h po jídle po 3–8 h.
+  const FPU_G = 5;
+  const fpu = m => ((m.fat || 0) * 9 + (m.prot || 0) * 4) / 100;
+  const fpuDur = f => (f < 1.5 ? 180 : f < 2.5 ? 240 : f < 3.5 ? 300 : 480);
+  const fpuAbs = (m, t) => { const f = fpu(m); return f < 1 ? 0 : FPU_G * f * absorbedFrac(t - 60, fpuDur(f) - 60); };
+  // Těžké jídlo (hodně tuku/bílkovin) se vyhodnocuje 4 h místo 2,5 h — jinak by okno skončilo
+  // dřív, než se pozdní vzestup projeví.
+  const isHeavy = m => fpu(m) >= 4 || (m.fat || 0) >= 35 || (m.prot || 0) >= 50;
+  const postFor = m => (isHeavy(m) ? 240 : 150) * MIN;
   // Podíl sacharidů vstřebaný do t minut — parabolická křivka délky D (Scheiner; používá i Loop).
   function absorbedFrac(t, D) {
     if (t <= 0) return 0;
@@ -68,6 +81,8 @@
 
   const PRIOR_WIN = 300 * MIN;  // jak daleko před jídlem hledat předchozí jídla a inzulin
   const CLUSTER_MAX = 240 * MIN; // delší „uzobávání" už se rozumně rozdělit nedá
+  const CGM_LAG = 10 * MIN;      // senzor v podkoží měří s ~10min zpožděním za krví
+  const SPEED_GRID = [0.5, 0.56, 0.63, 0.71, 0.8, 0.9, 1, 1.12, 1.25, 1.4, 1.6, 1.8, 2];
 
   // Duplicity z uploaderu (stejná dávka s časem posunutým o sekundy) → jedna dávka.
   function dedupeBoluses(boluses) {
@@ -81,39 +96,46 @@
   // Obvyklý automatický bazál (U/h): medián za uplynulých 24 h — 780G se kolem něj pohybuje.
   const basalBaseline = recs => median((recs || []).map(r => r.r).filter(r => r >= 0));
 
-  // Jídla, která se v okně 2,5 h překrývají, se vyhodnocují společně (jinak by si „kradla" glykémii).
-  // meals: [{ id, ts, ... }] — ostatní jídla; vrací seřazené členy shluku včetně `meal`.
+  // Jídla, jejichž okna se překrývají, se vyhodnocují společně (jinak by si „kradla" glykémii).
+  // Okno jídla je 2,5 h, u těžkého jídla 4 h. Vrací seřazené členy shluku včetně `meal`.
   function clusterOf(meal, meals) {
     const all = [meal, ...(meals || []).filter(m => m.id !== meal.id)];
     const set = [meal];
+    const overlaps = (a, b) => (a.ts <= b.ts ? b.ts - a.ts <= postFor(a) : a.ts - b.ts <= postFor(b));
     for (let grew = true; grew;) {
       grew = false;
       for (const m of all) {
         if (set.includes(m)) continue;
-        if (set.some(c => Math.abs(m.ts - c.ts) <= POST)) { set.push(m); grew = true; }
+        if (set.some(c => overlaps(c, m))) { set.push(m); grew = true; }
       }
     }
     return set.sort((a, b) => a.ts - b.ts);
   }
+  const windowEnd = cluster => Math.max(...cluster.map(m => m.ts + postFor(m)));
 
-  // meal: { id, ts, aiRaw, s, kat, gi, fat, manual: {bg0, bg2, units} }
+  // meal: { id, ts, aiRaw, s, kat, gi, fat, prot, alc, speed, manual: {bg0, bg2, units} }
   // data: { readings: [{t, v mmol/L}], boluses: [{t, u, src}], basal: [{t, r U/h}] | null, basalBase,
-  //         meals: ostatní jídla [{ id, ts, aiRaw, s, conf, kat, gi, fat }], settingsAt: ts → {icr, isf} }
+  //         targets: [{t, dur min}] (dočasný cíl pumpy = pohyb), cgmLag (ms, výchozí 10 min),
+  //         meals: ostatní jídla [{ id, ts, aiRaw, s, conf, kat, gi, fat, prot, alc, speed, pump }],
+  //         settingsAt: ts → {icr, isf} }
   // therapy: { type: 'aid'|'insulin'|'none', insulin: 'rapid'|'ultra' }
-  // Bilance okna od prvního jídla shluku do 2,5 h po posledním:
-  //   poměr × (účinný inzulin + Δglykémie / citlivost) = vstřebané sacharidy všech jídel.
-  // Jídla s ověřenou hodnotou (a dovstřebávání předchozích) jsou známá; neznámá mají sacharidy
-  // k × odhad AI (společné k — AI se u jednoho člověka v jednom okně plete podobně).
+  // Model glykémie od prvního jídla shluku:
+  //   G(t) = G0 + citlivost × (vstřebané sacharidy(t) / poměr − účinný inzulin(t))
+  // Jídla s ověřenou hodnotou, sacharidy zadané do pumpy, dovstřebávání předchozích jídel a pozdní
+  // „sacharidy" z tuku a bílkovin jsou známé; neznámá jídla mají sacharidy k × odhad AI (společné k).
+  // k se určí (1) z bilance na konci okna a (2) proložením celé křivky glykémie, které zároveň
+  // najde, jak rychle se jídlo u vás skutečně vstřebávalo.
   function evaluateMeal(meal, data, therapy, kNone) {
     const T = meal.ts;
     const flags = [];
     const others = (data.meals || []).filter(m => m.id !== meal.id);
     const cluster = clusterOf(meal, others);
-    const T0 = cluster[0].ts, TL = cluster[cluster.length - 1].ts;
-    const rd = (data.readings || []).filter(r => r.t >= T0 - PRE && r.t <= TL + POST).sort((a, b) => a.t - b.t);
+    const T0 = cluster[0].ts, winEnd = windowEnd(cluster);
+    const lag = data.cgmLag ?? CGM_LAG;
+    const rd = (data.readings || []).filter(r => r.t >= T0 - PRE && r.t <= winEnd).sort((a, b) => a.t - b.t);
     const pre = rd.filter(r => r.t <= T0 + 5 * MIN);
     const post = rd.filter(r => r.t > T0);
-    const coverage = Math.min(1, post.length / ((TL - T0 + POST) / (5 * MIN)));
+    const coverage = Math.min(1, post.length / ((winEnd - T0) / (5 * MIN)));
     // Glykémie přesně v čase jídla: přímka přes hodnoty z půlhodiny před ním (medián by ji při
     // klesající nebo stoupající glykémii posunul o ~12 min dřív, než od kdy se počítá inzulin).
     let bg0 = median(pre.map(r => r.v));
@@ -123,28 +145,29 @@
       if (sxx > 0) bg0 = mv + pre.reduce((a, r) => a + (r.t - mt) * (r.v - mv), 0) / sxx * (T0 - mt);
     }
     if (bg0 == null && meal.manual?.bg0) bg0 = meal.manual.bg0;
-    const res = { ts: T, readings: rd, coverage, bg0, flags, quality: 'none', implied: null,
-      dur: absDuration(meal), gi: giKey(meal.gi), cluster: cluster.filter(m => m !== meal).map(m => m.ts),
+    const res = { ts: T, readings: rd, coverage, bg0, flags, quality: 'none', implied: null, winEnd,
+      dur: absDuration(meal), gi: giKey(meal.gi), heavy: isHeavy(meal), fpu: fpu(meal),
+      cluster: cluster.filter(m => m !== meal).map(m => m.ts),
       // sacharidy zadané do pumpy (bez fotky) v okně nebo ještě se vstřebávající
-      pumpMeals: others.filter(m => m.pump && m.ts <= TL + POST && m.ts >= T0 - PRIOR_WIN).map(m => ({ ts: m.ts, g: m.s })) };
+      pumpMeals: others.filter(m => m.pump && m.ts <= winEnd && m.ts >= T0 - PRIOR_WIN).map(m => ({ ts: m.ts, g: m.s })) };
     if (bg0 == null) { flags.push('chybí glykémie před jídlem'); return res; }
 
-    // Ukazatele pro toto jídlo (graf, vrchol); bilance se počítá za celé okno shluku.
-    let peak = null, tPeak = null, iauc = 0;
-    const own = rd.filter(r => r.t > T && r.t <= T + POST);
-    for (const r of own) if (peak == null || r.v > peak) { peak = r.v; tPeak = r.t; }
+    // Ukazatele pro toto jídlo (graf, vrchol, čas nad 10 mmol/l); bilance se počítá za celé okno.
+    let peak = null, tPeak = null, iauc = 0, above = 0;
+    const own = rd.filter(r => r.t > T && r.t <= T + postFor(meal));
+    for (const r of own) { if (peak == null || r.v > peak) { peak = r.v; tPeak = r.t; } if (r.v > 10) above += 5; }
     let prev = { t: T, v: bg0 };
     for (const r of own) { iauc += ((Math.max(0, prev.v - bg0) + Math.max(0, r.v - bg0)) / 2) * (r.t - prev.t) / MIN; prev = r; }
-    let end = null, tEnd = TL + POST;
-    const tail = post.filter(r => r.t >= TL + 135 * MIN);
+    let end = null, tEnd = winEnd;
+    const tail = post.filter(r => r.t >= winEnd - 15 * MIN);
     if (tail.length) {
       end = tail.reduce((a, r) => a + r.v, 0) / tail.length;
       tEnd = tail.reduce((a, r) => a + r.t, 0) / tail.length; // inzulin hodnotit ve stejném čase jako glykémii
     }
     if (end == null && meal.manual?.bg2 && cluster.length === 1) { end = meal.manual.bg2; flags.push('ruční glykémie po jídle'); }
-    Object.assign(res, { peak, tPeak, end, iauc, rise: peak != null ? peak - bg0 : null, delta: end != null ? end - bg0 : null });
+    Object.assign(res, { peak, tPeak, end, iauc, tAbove10: own.length ? above : null, rise: peak != null ? peak - bg0 : null, delta: end != null ? end - bg0 : null });
 
-    if (end == null) { flags.push(post.length ? 'chybí hodnoty ke konci okna (2–2,5 h)' : 'chybí glykémie po jídle'); return res; }
+    if (end == null) { flags.push(post.length ? 'chybí hodnoty ke konci okna' : 'chybí glykémie po jídle'); return res; }
     if (!meal.manual?.bg2 && coverage < 0.6) { flags.push('málo hodnot z CGM'); return res; }
     if (bg0 < 3.9) { flags.push('hypoglykémie před jídlem'); return res; }
 
@@ -155,6 +178,19 @@
       res.preSlope = slope;
       if (Math.abs(slope) > 0.04) { flags.push('glykémie se před jídlem rychle měnila'); down('poor'); }
     }
+    // Hypoglykémie v okně: skoro jistě nezapsané sacharidy na její řešení + protiregulace těla.
+    if (post.some(r => r.t <= tEnd && r.v < 3.9)) { res.hypo = true; flags.push('hypoglykémie v okně — nejspíš nezapsané sacharidy na její řešení, nepoužito k učení'); down('poor'); }
+    // Pohyb (dočasný cíl pumpy): zvyšuje citlivost na inzulin ještě hodiny po skončení.
+    for (const g of data.targets || []) {
+      const gEnd = g.t + (g.dur || 0) * MIN;
+      if (g.t <= tEnd && gEnd >= T0 - 60 * MIN) { res.exercise = 'during'; break; }
+      if (gEnd < T0 - 60 * MIN && gEnd >= T0 - 12 * 60 * MIN) res.exercise = res.exercise || 'after';
+    }
+    if (res.exercise === 'during') { flags.push('dočasný cíl pumpy (pohyb) v okně — nepoužito k učení'); down('poor'); }
+    else if (res.exercise === 'after') { flags.push('pohyb během posledních 12 h — citlivost na inzulin může být vyšší'); down('fair'); }
+    // Alkohol: tlumí tvorbu glukózy v játrech ještě hodiny.
+    if (meal.alc) { res.alcohol = true; flags.push('alkohol — ovlivňuje glykémii ještě hodiny, nepoužito k učení'); down('poor'); }
+    else if ([...cluster, ...others].some(m => m !== meal && m.alc && m.ts <= tEnd && m.ts >= T0 - 6 * 60 * MIN)) { flags.push('alkohol v posledních hodinách'); down('fair'); }
     // Ustálení na konci okna: sklon za posledních 30 min (mmol/l za 15 min).
     const last = post.filter(r => r.t >= tEnd - 30 * MIN);
     if (last.length >= 3) {
@@ -164,30 +200,32 @@
       res.stable = Math.abs(res.endSlope15) <= 0.5;
       if (Math.abs(res.endSlope15) > 1.0) { flags.push(res.endSlope15 > 0 ? 'na konci okna glykémie ještě stoupá' : 'na konci okna glykémie ještě klesá'); down('fair'); }
     }
-    if (TL - T0 > CLUSTER_MAX) { flags.push('jídla na sebe navazují déle než 4 h — nedají se spolehlivě rozdělit'); down('poor'); }
+    if (cluster[cluster.length - 1].ts - T0 > CLUSTER_MAX) { flags.push('jídla na sebe navazují déle než 4 h — nedají se spolehlivě rozdělit'); down('poor'); }
 
-    // Vstřebané sacharidy v okně: známé části a neznámé (k × odhad AI).
+    // ── Sacharidy: známé části a neznámé (k × odhad AI), jako funkce času ──
     const est = m => m.aiRaw > 0 ? m.aiRaw : (m.s > 0 ? m.s : 0);
-    const inWin = m => absorbedFrac((tEnd - m.ts) / MIN, absDuration(m)) - absorbedFrac(Math.max(0, T0 - m.ts) / MIN, absDuration(m));
-    let known = 0, unknownW = 0;
-    const unknown = [];
+    const absIn = (m, t, sp = 1) => { const D = absDuration(m) / sp; return absorbedFrac((t - m.ts) / MIN, D) - absorbedFrac(Math.max(0, T0 - m.ts) / MIN, D); };
+    const known = [], unknown = [];
     for (const m of cluster) {
-      if (m !== meal && (m.conf != null || !(m.aiRaw > 0))) known += (m.conf != null ? m.conf : est(m)) * inWin(m);
-      else if (est(m) > 0) { unknown.push(m); unknownW += est(m) * inWin(m); }
+      if (m !== meal && (m.conf != null || !(m.aiRaw > 0))) known.push({ m, c: m.conf != null ? m.conf : est(m) });
+      else if (est(m) > 0) unknown.push(m);
     }
-    let priorC = 0;
-    for (const m of others) {
-      if (cluster.includes(m) || m.ts >= T0 || m.ts < T0 - PRIOR_WIN) continue;
-      priorC += (m.conf != null ? m.conf : est(m)) * inWin(m);
-    }
-    known += priorC;
-    res.absorbed = inWin(meal);
+    const prior = others.filter(m => !cluster.includes(m) && m.ts < T0 && m.ts >= T0 - PRIOR_WIN);
+    for (const m of prior) known.push({ m, c: m.conf != null ? m.conf : est(m) });
+    const fpuMeals = [...cluster, ...prior];
+    const knownAt = t => known.reduce((a, x) => a + x.c * absIn(x.m, t), 0)
+      + fpuMeals.reduce((a, m) => a + fpuAbs(m, (t - m.ts) / MIN) - fpuAbs(m, Math.max(0, T0 - m.ts) / MIN), 0);
+    const unknownAt = (t, sp) => unknown.reduce((a, m) => a + est(m) * absIn(m, t, sp), 0);
+    const priorC = prior.reduce((a, m) => a + (m.conf != null ? m.conf : est(m)) * absIn(m, tEnd), 0);
+    res.absorbed = absIn(meal, tEnd);
     res.priorCarbs = priorC;
+    res.fpuCarbs = fpuMeals.reduce((a, m) => a + fpuAbs(m, (tEnd - m.ts) / MIN) - fpuAbs(m, Math.max(0, T0 - m.ts) / MIN), 0);
     if (priorC > 5) { flags.push(`započteno dovstřebávání dřívějšího jídla (~${Math.round(priorC)} g)`); if (priorC > 15) down('fair'); }
     if (unknown.length > 1) { flags.push('vyhodnoceno společně s dalším jídlem v okně — rozděleno podle odhadů AI'); down('fair'); }
     else if (cluster.some(m => m !== meal && m.pump)) { flags.push('v okně jsou sacharidy zadané do pumpy — počítám s nimi, jak jsou zadané'); down('fair'); }
     else if (cluster.length > 1) flags.push('v okně je i jiné, už ověřené jídlo — započteno');
     if (res.absorbed < 0.7) { flags.push(`pomalé jídlo — do konce okna se vstřebá jen ~${Math.round(res.absorbed * 100)} %`); down('fair'); }
+    if (res.heavy) flags.push(`hodně tuku a bílkovin — okno prodlouženo na 4 h, pozdní vzestup započten (~${Math.round(res.fpuCarbs)} g)`);
 
     if (therapy.type === 'none') {
       // Bez inzulinu: sacharidy z plochy pod křivkou přes osobní citlivost k (mmol/L·min na 1 g).
@@ -198,11 +236,13 @@
       const set = data.settingsAt ? data.settingsAt(T0) : null;
       if (!set || !set.icr || !set.isf) { flags.push('chybí sacharidový poměr nebo citlivost v nastavení léčby'); return res; }
       const tp = therapy.insulin === 'ultra' ? 55 : 75;
-      const acted = t => insulinActed((tEnd - t) / MIN, tp) - insulinActed(Math.max(0, T0 - t) / MIN, tp);
+      // Všechny dávky jako {t, u}: bolusy + odchylky automatického bazálu od obvyklé úrovně.
       // Inzulin podle původu: k jídlu / automatické korekce pumpy / ruční korekce pumpou /
       // dřív podaný. Pro bilanci je to jedno (všechen inzulin snižuje glykémii stejně) — rozdělení
       // slouží k vysvětlení, kolik sacharidů musela dorovnat pumpa a kolik vy.
+      const doses = [];
       const ins = { meal: 0, auto: 0, man: 0, pre: 0, basal: 0 }, del = { meal: 0, auto: 0, man: 0, basal: 0 };
+      const actedIn = (d, t) => d.u * (insulinActed((t - d.t) / MIN, tp) - insulinActed(Math.max(0, T0 - d.t) / MIN, tp));
       let any = false;
       for (const b of dedupeBoluses(data.boluses)) {
         if (b.t < T0 - PRIOR_WIN || b.t > tEnd) continue;
@@ -211,13 +251,15 @@
         // větší dávka později je ruční korekce.
         const auto = /auto|closed_loop|micro/i.test(b.src || '');
         const manual = !auto && b.u >= 1;
-        const cls = !auto && b.u >= 1 && cluster.some(m => Math.abs(b.t - m.ts) <= 20 * MIN) ? 'meal'
-          : b.t < T0 - 20 * MIN ? 'pre' : manual ? 'man' : 'auto';
-        ins[cls] += b.u * acted(b.t);
+        const near = cluster.filter(m => Math.abs(b.t - m.ts) <= 20 * MIN);
+        const cls = !auto && b.u >= 1 && near.length ? 'meal' : b.t < T0 - 20 * MIN ? 'pre' : manual ? 'man' : 'auto';
+        const d = { t: b.t, u: b.u, cls };
+        doses.push(d);
         if (cls !== 'pre') del[cls] += b.u;
+        if (cls === 'meal' && near.includes(meal) && res.bolusLead == null) res.bolusLead = (b.t - T) / MIN;
         any = true;
       }
-      if (!any && meal.manual?.units) { ins.meal = meal.manual.units * acted(T); del.meal = meal.manual.units; any = true; flags.push('inzulin zadaný ručně'); }
+      if (!any && meal.manual?.units) { doses.push({ t: T, u: meal.manual.units, cls: 'meal' }); del.meal = meal.manual.units; any = true; flags.push('inzulin zadaný ručně'); }
       if (!any) { flags.push('chybí údaj o inzulinu k jídlu'); return res; }
       // Automatický bazál nad obvyklou úroveň (nebo pod ni) působí jako korekce.
       let basalOk = false;
@@ -240,27 +282,90 @@
             const r = rateAt(t);
             if (r == null) continue; // bez dat — počítat jako obvyklý bazál
             const dose = (r - data.basalBase) * slot / (60 * MIN);
-            ins.basal += dose * acted(t + slot / 2);
+            doses.push({ t: t + slot / 2, u: dose, cls: 'basal' });
             if (t >= T0 - 20 * MIN) del.basal += dose;
           }
         }
       }
       if (therapy.type === 'aid' && !basalOk) { flags.push('chybí údaje o automatickém bazálu — v bilanci chybí'); down('fair'); }
+      for (const d of doses) ins[d.cls] += actedIn(d, tEnd);
+      const insulinAt = t => doses.reduce((a, d) => a + actedIn(d, t), 0);
       const units = ins.meal + ins.auto + ins.man + ins.pre + ins.basal;
       Object.assign(res, { units, ins, del, icr: set.icr, isf: set.isf, basalOk });
       // Kolik sacharidů dávka k jídlu „předpokládala", kolik dorovnala pumpa sama a kolik vy korekcí.
       res.coveredCarbs = set.icr * del.meal;
       res.extraCarbs = set.icr * (del.auto + del.basal);
       res.manCarbs = set.icr * del.man;
-      const absorbedTotal = set.icr * (units + (end - bg0) / set.isf);
-      if (!(unknownW > 0)) { flags.push('chybí odhad sacharidů jídla'); return res; }
-      res.k = (absorbedTotal - known) / unknownW;
+      if (!(unknownAt(tEnd, 1) > 0)) { flags.push('chybí odhad sacharidů jídla'); return res; }
+
+      // (1) Bilance na konci okna.
+      const kEnd = (set.icr * (units + (end - bg0) / set.isf) - knownAt(tEnd)) / unknownAt(tEnd, 1);
+      res.impliedEnd = kEnd * est(meal);
+      // (2) Proložení celé křivky: pro každou rychlost vstřebávání nejlepší k (nejmenší čtverce).
+      //     Množství a rychlost se u pomalého jídla v krátkém okně navzájem zastoupí (víc sacharidů
+      //     pomaleji ≈ míň rychleji), proto se rychlosti nevybírají, ale váží: podle shody s křivkou
+      //     a podle předpokladu, že rychlost je obvyklá (σ = 0,3 v log). Když křivka rychlost
+      //     neurčí, výsledek zůstane u obvyklé rychlosti. Model se porovnává s CGM o zpoždění senzoru dřív.
+      const pts = post.filter(r => r.t <= tEnd + 5 * MIN && r.t - lag > T0).map(r => ({ v: r.v, t: r.t - lag }));
+      if (pts.length >= 18 && !meal.manual?.bg2) {
+        const base = pts.map(p => bg0 + set.isf * (knownAt(p.t) / set.icr - insulinAt(p.t)));
+        const grid = [];
+        for (const sp of SPEED_GRID) {
+          const xs = pts.map(p => set.isf * unknownAt(p.t, sp) / set.icr);
+          const sxx = xs.reduce((a, x) => a + x * x, 0);
+          if (!(sxx > 0)) continue;
+          const k = Math.max(0, xs.reduce((a, x, i) => a + x * (pts[i].v - base[i]), 0) / sxx);
+          grid.push({ sp, k, sse: pts.reduce((a, p, i) => a + (p.v - base[i] - k * xs[i]) ** 2, 0) });
+        }
+        if (grid.length) {
+          const minSse = Math.min(...grid.map(g => g.sse));
+          // Šum CGM ~0,35 mmol/l; sousední hodnoty senzoru nejsou nezávislé (×1,7).
+          const sig = Math.max(0.35, Math.sqrt(minSse / pts.length)) * 1.7;
+          for (const g of grid) g.J = g.sse / sig ** 2 + (Math.log(g.sp) / 0.3) ** 2;
+          const Jmin = Math.min(...grid.map(g => g.J));
+          for (const g of grid) g.w = Math.exp(-(g.J - Jmin) / 2);
+          const W = grid.reduce((a, g) => a + g.w, 0);
+          // Výsledek = nejpravděpodobnější rychlost (shoda + předpoklad) a její k. Průměrovat k přes
+          // rychlosti nejde — pomalejší rychlosti dávají nepřiměřeně velké k (k ~ 1/rychlost²).
+          const map = grid.reduce((a, g) => (g.J < a.J ? g : a));
+          const kPost = map.k, lnS = Math.log(map.sp);
+          // Rozptyl vah říká, jak dobře křivka rychlost určila.
+          const lnMean = grid.reduce((a, g) => a + g.w * Math.log(g.sp), 0) / W;
+          const lnSd = Math.sqrt(grid.reduce((a, g) => a + g.w * (Math.log(g.sp) - lnMean) ** 2, 0) / W);
+          const mv = pts.reduce((a, p) => a + p.v, 0) / pts.length;
+          const sst = pts.reduce((a, p) => a + (p.v - mv) ** 2, 0);
+          const rmse = Math.sqrt(minSse / pts.length), r2 = sst > 0 ? 1 - minSse / sst : 0;
+          res.fit = { k: kPost, rel: Math.exp(lnS), speed: (meal.speed > 0 ? meal.speed : 1) * Math.exp(lnS), lnSd, rmse, r2, n: pts.length };
+          // Křivka sedí → její odhad je spolehlivější než jediný bod na konci okna.
+          res.fit.used = kPost > 0 && rmse <= 0.9 && r2 >= 0.5;
+          // Rychlost se učí jen z jídel, kde ji křivka opravdu určila (úzké rozdělení vah).
+          res.fit.informative = res.fit.used && lnSd < 0.18 && unknown.length === 1;
+        }
+      }
+      res.k = res.fit?.used ? res.fit.k : kEnd;
       res.implied = res.k * est(meal);
-      res.share = unknown.length > 1 ? est(meal) * inWin(meal) / unknownW : 1;
+      res.share = unknown.length > 1 ? est(meal) * absIn(meal, tEnd) / unknownAt(tEnd, 1) : 1;
     }
     if (!(res.implied > 0)) { flags.push('bilance nedává smysl (záporné sacharidy)'); res.implied = null; return res; }
     res.quality = quality;
     return res;
+  }
+
+  // Osobní rychlost vstřebávání podle druhu jídla z dobře proložených křivek (log-průměr,
+  // smrštěný k celkové hodnotě a ta k 1 — s málo daty se nic nemění).
+  // samples: [{ ts, kat, speed }] → { global, cats: { kat: { factor, n } } }
+  function learnSpeed(samples, now) {
+    const prep = samples.filter(s => s.speed > 0).map(s => ({ kat: catKey(s.kat), y: Math.log(s.speed),
+      w: Math.pow(0.5, Math.max(0, (now - s.ts) / 86400000) / HALF_LIFE_D) / 0.3 ** 2 }));
+    const sw = prep.reduce((a, s) => a + s.w, 0);
+    const mu = prep.reduce((a, s) => a + s.w * s.y, 0) / (1 / 0.12 ** 2 + sw); // obecná rychlost se mění opatrně
+    const cats = {};
+    for (const k of Object.keys(CATS)) {
+      const cs = prep.filter(s => s.kat === k);
+      const m = (mu / 0.2 ** 2 + cs.reduce((a, s) => a + s.w * s.y, 0)) / (1 / 0.2 ** 2 + cs.reduce((a, s) => a + s.w, 0));
+      cats[k] = { factor: Math.min(1.8, Math.max(0.55, Math.exp(m))), n: cs.length };
+    }
+    return { n: prep.length, global: Math.exp(mu), cats };
   }
 
   const REL_SD = { confirmed: 0.10, good: 0.25, fair: 0.40 };
@@ -284,25 +389,39 @@
       const m = (mu / PRIOR_C ** 2 + cs.reduce((a, s) => a + s.w * s.y, 0)) / (1 / PRIOR_C ** 2 + cw);
       cats[k] = { factor: clamp(Math.exp(m)), n: cs.length, mu: m };
     }
+    // Denní doba: co zbude po korekci podle druhu jídla (např. ráno vyšší inzulinová rezistence,
+    // kterou nastavení pumpy úplně nepokrývá) — smrštěno k nule, s málo daty bez vlivu.
+    const blocks = {};
+    for (const b of Object.keys(BLOCKS)) {
+      const bs = prep.filter(s => blockOf(s.ts) === b);
+      const m = bs.reduce((a, s) => a + s.w * (s.y - cats[s.kat].mu), 0) / (1 / PRIOR_B ** 2 + bs.reduce((a, s) => a + s.w, 0));
+      blocks[b] = { factor: Math.exp(m), n: bs.length, mu: m };
+    }
+    const resid = s => s.y - cats[s.kat].mu - blocks[blockOf(s.ts)].mu;
     // Osobní přesnost po kalibraci: rozptyl reziduí minus šum samotných „pravd".
     let sd = null;
     if (prep.length >= 5) {
       const dw = prep.reduce((a, s) => a + s.decay, 0);
-      const r2 = prep.reduce((a, s) => a + s.decay * (s.y - cats[s.kat].mu) ** 2, 0) / dw;
+      const r2 = prep.reduce((a, s) => a + s.decay * resid(s) ** 2, 0) / dw;
       const lab = prep.reduce((a, s) => a + s.decay * s.lab, 0) / dw;
       sd = Math.min(0.6, Math.max(0.10, Math.sqrt(Math.max(0, r2 - lab))));
     }
     // Typická chyba AI před kalibrací (pro srovnání na obrazovce Učení).
     const mapeBefore = prep.length ? median(prep.map(s => Math.abs(Math.exp(s.y) - 1))) : null;
-    const mapeAfter = prep.length ? median(prep.map(s => Math.abs(Math.exp(s.y - cats[s.kat].mu) - 1))) : null;
-    return { n: prep.length, nConfirmed: prep.filter(s => s.src === 'confirmed').length, global: clamp(Math.exp(mu)), cats, sd, mapeBefore, mapeAfter };
+    const mapeAfter = prep.length ? median(prep.map(s => Math.abs(Math.exp(resid(s)) - 1))) : null;
+    return { n: prep.length, nConfirmed: prep.filter(s => s.src === 'confirmed').length, global: clamp(Math.exp(mu)), cats, blocks, sd, mapeBefore, mapeAfter };
   }
   const clamp = f => Math.min(1.6, Math.max(0.6, f));
+  // Části dne pro kalibraci (místní čas jídla).
+  const BLOCKS = { rano: { label: 'Ráno (4–10 h)' }, den: { label: 'Přes den (10–17 h)' }, vecer: { label: 'Večer a v noci (17–4 h)' } };
+  const PRIOR_B = 0.15;
+  const blockOf = ts => { const h = new Date(ts).getHours(); return h >= 4 && h < 10 ? 'rano' : h >= 10 && h < 17 ? 'den' : 'vecer'; };
 
-  function applyCal(aiRaw, kat, cal) {
+  function applyCal(aiRaw, kat, cal, ts) {
     const c = cal && cal.n ? cal.cats[catKey(kat)] : null;
-    const factor = c ? c.factor : 1;
-    return { C: aiRaw * factor, factor, learnedSd: cal && cal.sd != null ? cal.sd : null };
+    const b = cal && cal.n && ts != null && cal.blocks ? cal.blocks[blockOf(ts)] : null;
+    const factor = clamp((c ? c.factor : 1) * (b ? b.factor : 1));
+    return { C: aiRaw * factor, factor, catFactor: c ? c.factor : 1, blockFactor: b ? b.factor : 1, learnedSd: cal && cal.sd != null ? cal.sd : null };
   }
 
   // Bez inzulinu: osobní citlivost k = medián (plocha pod křivkou / sacharidy) z kvalitních jídel.
@@ -457,6 +576,6 @@
     };
   }
 
-  root.LEARN = { CATS, catKey, GI_DUR, GI_LABEL, giKey, absDuration, absorbedFrac, clusterOf, dedupeBoluses, basalBaseline, ensemble, vendorWeights, vendorShares, vendorOf, VENDOR_LABEL, insulinActed, segmentAt, evaluateMeal, calibrate, applyCal, estimateKNone, combine, parseCareLink, REL_SD, MIN };
+  root.LEARN = { CATS, catKey, GI_DUR, GI_LABEL, giKey, absDuration, absorbedFrac, clusterOf, windowEnd, postFor, isHeavy, fpu, fpuAbs, learnSpeed, BLOCKS, blockOf, dedupeBoluses, basalBaseline, ensemble, vendorWeights, vendorShares, vendorOf, VENDOR_LABEL, insulinActed, segmentAt, evaluateMeal, calibrate, applyCal, estimateKNone, combine, parseCareLink, REL_SD, MIN };
   if (typeof module !== 'undefined') module.exports = root.LEARN;
 })(typeof window !== 'undefined' ? window : globalThis);

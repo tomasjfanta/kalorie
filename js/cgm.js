@@ -2,10 +2,10 @@
 // Medtronic nemá veřejné API — automaticky jen přes Nightscout (plněný xDrip+ nebo nightscout-connect).
 'use strict';
 (function () {
-  const DB_NAME = 'kalorie', DB_VER = 3;
+  const DB_NAME = 'kalorie', DB_VER = 4;
   // basal = automatický bazál pumpy (U/h po 5 min), jobs = fotky a popisy čekající na odhad AI,
-  // pcarbs = sacharidy zadané do pumpy (bolusový kalkulátor).
-  const STORES = { cgm: 't', bolus: 't', pumpset: 't', thumbs: 'id', basal: 't', jobs: 'id', pcarbs: 't' };
+  // pcarbs = sacharidy zadané do pumpy (bolusový kalkulátor), targets = dočasný cíl pumpy (pohyb).
+  const STORES = { cgm: 't', bolus: 't', pumpset: 't', thumbs: 'id', basal: 't', jobs: 'id', pcarbs: 't', targets: 't' };
   let dbp = null;
   function db() {
     if (dbp) return dbp;
@@ -111,6 +111,13 @@
       await put('pcarbs', (tc || []).filter(x => x.carbs > 0 && isFinite(Date.parse(x.created_at)))
         .map(x => ({ t: Math.round(Date.parse(x.created_at) / 60000) * 60000, g: +x.carbs })));
     } catch (e) { /* sacharidy z pumpy jsou jen doplněk */ }
+    try {
+      // Dočasný cíl 780G (pohyb) — od začátku 12 h zpět, ať se zachytí i delší aktivita před jídlem.
+      const tt = await nsFetch(cfg, '/api/v1/treatments.json', { 'find[created_at][$gte]': new Date(from - 12 * 3600e3).toISOString(),
+        'find[created_at][$lte]': new Date(to).toISOString(), 'find[eventType]': 'Temporary Target', count: '500' });
+      await put('targets', (tt || []).filter(x => isFinite(Date.parse(x.created_at)))
+        .map(x => ({ t: Date.parse(x.created_at), dur: +x.duration || 0 })));
+    } catch (e) { /* bez údajů o pohybu se počítá jako dřív */ }
     try {
       const tb = await nsFetch(cfg, '/api/v1/treatments.json', { ...win, 'find[eventType]': 'Temp Basal', count: '5000' });
       basal = (tb || []).filter(x => x.absolute != null && isFinite(Date.parse(x.created_at)))

@@ -9,3 +9,5 @@ Modified by the Kalorie project on 2026-10-07:
 - nightscout.py: readings without a timestamp are skipped instead of failing the whole sync cycle.
 - Dockerfile: VOLUME instruction removed (Railway mounts its own volume at /data).
 - nightscout.py: zero-rate AUTO_BASAL_DELIVERY markers are uploaded too (so a suspension differs from missing data).
+- nightscout.py (2026-10-08): 780G temporary target (pump banner TEMP_TARGET) is uploaded as a Nightscout
+  "Temporary Target" treatment and its duration kept up to date; banner types are logged.
