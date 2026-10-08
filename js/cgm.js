@@ -2,10 +2,11 @@
 // Medtronic nemá veřejné API — automaticky jen přes Nightscout (plněný xDrip+ nebo nightscout-connect).
 'use strict';
 (function () {
-  const DB_NAME = 'kalorie', DB_VER = 4;
+  const DB_NAME = 'kalorie', DB_VER = 5;
   // basal = automatický bazál pumpy (U/h po 5 min), jobs = fotky a popisy čekající na odhad AI,
   // pcarbs = sacharidy zadané do pumpy (bolusový kalkulátor), targets = dočasný cíl pumpy (pohyb).
-  const STORES = { cgm: 't', bolus: 't', pumpset: 't', thumbs: 'id', basal: 't', jobs: 'id', pcarbs: 't', targets: 't' };
+  // photos = celá fotka jídla (14 dní) pro nový odhad po opravě názvu.
+  const STORES = { cgm: 't', bolus: 't', pumpset: 't', thumbs: 'id', basal: 't', jobs: 'id', pcarbs: 't', targets: 't', photos: 'id' };
   let dbp = null;
   function db() {
     if (dbp) return dbp;

@@ -974,7 +974,7 @@ window.KAL = {
   days: () => days, day: s => day(s), saveAll, settings: () => settings, saveSettings: () => store.set('kal.settings', settings),
   store, renderDnes, showView, entryConf, groupConf, badge, fmtC, vjTxt, TOL, esc, dstr, todayStr, fmtHuman,
   viewDate: () => viewDate, mealByHour, r0, r1, dec, num,
-  VERSION: 'v16',
+  VERSION: 'v17',
   aiConfig: () => aiCfg,
   setAiModel: m => { aiCfg.model = m; store.set('kal.ai', aiCfg); },  // zapamatuje funkční model ze zálohy
   openQuick,          // prefill rychlého zápisu z AI výsledku

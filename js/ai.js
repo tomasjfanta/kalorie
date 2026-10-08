@@ -126,7 +126,7 @@
       r = await fetch(url + '/estimate', {
         method: 'POST',
         headers: { 'content-type': 'application/json', authorization: 'Bearer ' + token },
-        body: JSON.stringify({ system: SYS + SYS_CARB + (extra || ''), prompt: 'Odhadni sacharidy tohoto jídla z fotky.',
+        body: JSON.stringify({ system: SYS + SYS_CARB + (extra || ''), prompt: args.text || 'Odhadni sacharidy tohoto jídla z fotky.',
           image: imageBase64, media: imageMedia }),
         signal: AbortSignal.timeout(170000),
       });

@@ -166,10 +166,16 @@
       if (full) K.store.set('kal.migr4', true);
     } catch (e) { K.store.set('kal.nsErr', { at: Date.now(), msg: e.message }); }
   }
+  async function prunePhotos() {
+    if (Date.now() - (+(K.store.get('kal.photoPrune', 0) || 0)) < DAY) return;
+    K.store.set('kal.photoPrune', Date.now());
+    for (const p of await CGM.all('photos').catch(() => [])) if (p.t < Date.now() - 14 * DAY) await CGM.del('photos', p.id).catch(() => {});
+  }
   async function refresh() {
     if (busy || !K.isCarb()) return;
     busy = true;
     try {
+      prunePhotos();
       await nsAutoSync();
       const all = photoEntries(), now = Date.now(), changed = [];
       for (const e of all) {
@@ -350,26 +356,34 @@
     cs: 'ai-photo', jist: a.jist, sMin: a.sMin, sMax: a.sMax, sSd: a.sSd, meal: 'sv', ts, kat: a.kat, gi: a.gi, fat: a.fat,
     aiRaw: a.aiRaw, calF: a.factor, aiRuns: a.runs, ...(a.alc ? { alc: true } : {}), ...over,
   });
-  async function storeEntry(e, thumb) {
+  async function storeEntry(e, thumb, img) {
     K.day(K.dstr(new Date(e.ts))).e.push(e);
     K.saveAll();
     if (thumb) await CGM.put('thumbs', [{ id: e.id, data: thumb }]).catch(() => {});
+    // Celá fotka zůstane 14 dní — pro nový odhad, když se název jídla později opraví.
+    if (img) await CGM.put('photos', [{ id: e.id, t: e.ts, data: img }]).catch(() => {});
     invalidate(); touchData(); // nové jídlo může patřit do okna jiného → přepočítat
     K.renderDnes();
   }
   async function autoSave(job) {
     const a = buildAi(job.result, job.ts);
-    await storeEntry(entryFrom(a, job.ts, { auto: true }), job.thumb);
+    await storeEntry(entryFrom(a, job.ts, { auto: true, ...(job.hint ? { n: job.hint, hint: job.hint } : {}) }), job.thumb, job.img);
     K.toast(`Fotka z ${hhmm(job.ts)}: ${r0(a.C)} g — uloženo s odhadem AI (klepnutím upravíte)`);
   }
 
+  // Uživatel opravil, co na fotce je (název, množství) → jeho popis platí, fotka doplní zbytek.
+  const hintPrompt = h => h ? `Uživatel upřesnil, co na fotce je: „${h}". Jeho popis (druh jídla a množství) ber jako správný — `
+    + 'pokud uvádí počet kusů, váhu nebo velikost porce, vycházej z ní. Fotku použij jen na to, co popis neříká. '
+    + 'Odhadni sacharidy tohoto jídla.' : undefined;
+  const runArgs = (job, img) => ({ imageBase64: img, imageMedia: 'image/jpeg', extra: examplesText(), text: hintPrompt(job.hint),
+    diag: { flow: job.hint ? 'photo-hint' : 'photo', job: job.id, attempt: job.attempts } });
+
   JOBS.register('carb-photo', {
-    label: () => 'Fotka jídla',
+    label: j => j.hint ? 'Oprava: ' + j.hint : 'Fotka jídla',
     run: job => {
       const plan = planFor();
       if (!(plan.gemini + plan.claude)) return { error: 'nokey' };
-      return AI.callRuns({ imageBase64: job.img, imageMedia: 'image/jpeg', extra: examplesText(), diag: { flow: 'photo', job: job.id, attempt: job.attempts } },
-        plan, (k, n) => { if (pending?.jobId === job.id) progress(k, n); });
+      return AI.callRuns(runArgs(job, job.img), plan, (k, n) => { if (pending?.jobId === job.id) progress(k, n); });
     },
     present: job => {
       if (!pending || pending.jobId !== job.id || !sheetOpen()) return false;
@@ -385,10 +399,42 @@
     open: showJob,
   });
 
+  // Uložené jídlo s opraveným názvem: nový odhad z uložené fotky (u starších jídel z náhledu).
+  async function applyReest(job) {
+    const f = findEntry(job.entryId);
+    if (!f) return;
+    const e = f.e, a = buildAi(job.result, e.ts);
+    Object.assign(e, { aiRaw: a.aiRaw, aiRuns: a.runs, kat: a.kat, fat: a.fat, kcal: a.kcal, b: a.b, t: a.t, jist: a.jist,
+      sMin: a.sMin, sMax: a.sMax, sSd: a.sSd, calF: a.factor, hint: job.hint });
+    if (!e.giUser && a.gi) e.gi = a.gi;
+    if (a.alc) e.alc = true; else delete e.alc;
+    if (e.conf == null && !job.keepCarbs) e.s = a.C;
+    delete e.ev; delete e.auto;
+    K.saveAll(); invalidate(); touchData();
+    K.renderDnes();
+    K.toast(`Přepočítáno podle „${job.hint}": ${r0(a.C)} g${e.conf != null ? ' (potvrzená hodnota zůstává)' : ''}`);
+    if (openId === e.id) openMeal(e.id);
+  }
+  JOBS.register('carb-reest', {
+    label: j => 'Oprava: ' + j.hint,
+    run: async job => {
+      const photo = await CGM.get('photos', job.entryId).catch(() => null);
+      const thumb = photo ? null : await CGM.get('thumbs', job.entryId).catch(() => null);
+      const img = photo?.data || (thumb?.data ? thumb.data.split(',')[1] : null);
+      const plan = planFor();
+      if (!img) plan.claude = 0; // Claude na serveru potřebuje fotku
+      if (!(plan.gemini + plan.claude)) return { error: 'nokey' };
+      return AI.callRuns(img ? runArgs(job, img) : { text: hintPrompt(job.hint), extra: examplesText(), diag: { flow: 'text-hint', job: job.id, attempt: job.attempts } }, plan);
+    },
+    present: () => false, // výsledek se rovnou zapíše do jídla
+    save: applyReest,
+  });
+
   function fillForm(job) {
     const a = buildAi(job.result, job.ts);
-    pending.ai = a; pending.filled = true;
-    $('#cnew-name').value = a.name;
+    pending.ai = a; pending.filled = true; pending.hint = job.hint || null;
+    pending.shownName = job.hint || a.name;
+    $('#cnew-name').value = pending.shownName;
     $('#cnew-carbs').value = r0(a.C);
     $('#cnew-time').value = hhmm(job.ts);
     $('#cnew-units').value = '';
@@ -409,6 +455,22 @@
     $('#cnew-retry').classList.add('hidden');
     $('#cnew-form').classList.remove('hidden');
   }
+  // Oprava názvu/množství v okně → nový odhad z téže fotky s popisem uživatele.
+  async function reestimate() {
+    const v = $('#cnew-name').value.trim();
+    if (!pending?.filled || !v || v === pending.shownName) return;
+    const job = await JOBS.get(pending.jobId);
+    if (!job) return;
+    Object.assign(job, { hint: v, status: 'pending', result: null, nextAt: Date.now(), attempts: 0 });
+    await JOBS.save(job);
+    pending.filled = false; pending.ai = null;
+    $('#cnew-form').classList.add('hidden');
+    $('#cnew-status').textContent = `Přepočítávám podle „${v}"…`;
+    JOBS.attempt(job.id);
+  }
+  $('#cnew-name').addEventListener('change', reestimate);
+  $('#cnew-name').addEventListener('keydown', ev => { if (ev.key === 'Enter') { ev.preventDefault(); $('#cnew-name').blur(); } });
+
   function newConf() {
     if (!pending?.ai) return;
     const C = K.num($('#cnew-carbs').value);
@@ -433,16 +495,17 @@
   $('#cnew-save').addEventListener('click', async () => {
     if (!pending?.ai) return;
     if ($('#cnew-carbs').value.trim() === '') { K.toast('Zadejte sacharidy'); return; }
-    const a = pending.ai, id = pending.jobId, thumb = pending.thumb;
+    const a = pending.ai, id = pending.jobId, thumb = pending.thumb, hint = pending.hint;
+    const img = (await JOBS.get(id))?.img;
     const ts = tsFromTime(pending.ts, $('#cnew-time').value);
     const units = K.num($('#cnew-units').value);
     const C = K.num($('#cnew-carbs').value);
-    const e = entryFrom(a, ts, { n: $('#cnew-name').value.trim() || 'Jídlo', s: C, gi: $('#cnew-gi').value || a.gi });
+    const e = entryFrom(a, ts, { n: $('#cnew-name').value.trim() || 'Jídlo', s: C, gi: $('#cnew-gi').value || a.gi, ...(hint ? { hint } : {}) });
     if (units > 0) e.units = units;
     pending = null;
     K.closeSheet('sheet-cnew');
     await JOBS.remove(id);
-    await storeEntry(e, thumb);
+    await storeEntry(e, thumb, img);
     K.toast('Uloženo: ' + r0(C) + ' g sacharidů');
   });
 
@@ -590,11 +653,18 @@
       after();
     });
     $('#cm-units-save')?.addEventListener('click', () => { const u = K.num($('#cm-units').value); if (u > 0) e.units = u; else delete e.units; after(); });
-    $('#cm-save')?.addEventListener('click', () => {
+    $('#cm-save')?.addEventListener('click', async () => {
       const f = findEntry(e.id);
-      e.n = $('#cm-name').value.trim() || e.n;
+      const newName = $('#cm-name').value.trim(), renamed = !!newName && newName !== e.n;
+      const carbsEdited = K.num($('#cm-carbs').value) !== K.r1(e.s);
+      e.n = newName || e.n;
       e.s = K.num($('#cm-carbs').value);
-      if ($('#cm-gi')) { if ($('#cm-gi').value) e.gi = $('#cm-gi').value; else delete e.gi; }
+      if ($('#cm-gi')) { if ($('#cm-gi').value) { if ($('#cm-gi').value !== LEARN.giKey(e.gi)) e.giUser = true; e.gi = $('#cm-gi').value; } else { delete e.gi; delete e.giUser; } }
+      if (renamed && e.cs === 'ai-photo') {
+        await JOBS.add({ kind: 'carb-reest', ts: e.ts, entryId: e.id, hint: newName, keepCarbs: carbsEdited, thumb: (await CGM.get('thumbs', e.id).catch(() => null))?.data });
+        JOBS.tick();
+        K.toast('Přepočítávám sacharidy podle nového názvu…');
+      }
       delete e.auto;
       if (e.ts && $('#cm-time').value) {
         const nts = tsFromTime(e.ts, $('#cm-time').value);
@@ -612,6 +682,7 @@
       K.days()[f.key].e = K.days()[f.key].e.filter(x => x.id !== e.id);
       K.saveAll(); invalidate(); touchData();
       await CGM.del('thumbs', e.id).catch(() => {});
+      await CGM.del('photos', e.id).catch(() => {});
       K.closeSheet('sheet-cmeal'); openId = null; K.renderDnes(); K.toast('Smazáno');
     });
   }
