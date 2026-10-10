@@ -1009,7 +1009,7 @@
     // Nejistota štítku: vlastní (ze společného vyhodnocení), jinak podle kvality.
     const labSd = s => (s.src !== 'confirmed' && s.labSd > 0 ? Math.min(1, s.labSd) : REL_SD[s.src]);
     const prep = use.map(s => {
-      const decay = Math.pow(0.5, Math.max(0, (now - s.ts) / 86400000) / HALF_LIFE_D);
+      const decay = Math.pow(0.5, Math.max(0, (now - s.ts) / 86400000) / HALF_LIFE_D) * (s.w ?? 1);
       const v = labSd(s) ** 2 + AI_NOISE ** 2;
       return { ...s, kat: catKey(s.kat), y: Math.log(s.label / s.aiRaw), w: decay / v, decay, lab: labSd(s) ** 2 };
     });
@@ -1148,22 +1148,146 @@
   // ověřené glykémií: 1 / střední kvadratická log-chyba, smrštěná k předpokladu (VW_K jídel),
   // takže s málo daty jsou váhy vyrovnané a teprve s ověřenými jídly se rozcházejí.
   // samples: [{ ts, label, runs: [{ m, c }] }]
+  /* ─── Dotaz v2: složky jídla → sacharidy počítá aplikace ───
+     Model u každé složky odhadne gramy (jak se jí) a vybere klíč. U běžných českých příloh a pečiva
+     se sacharidy na 100 g berou z pevné tabulky (model je jinak pokaždé „vymyslí" trochu jinak);
+     u ostatního (maso, omáčka, zelenina…) z odhadu modelu. Hodnoty jsou orientační (využitelné
+     sacharidy bez vlákniny, hotový stav) podle běžných českých tabulek pro počítání sacharidů;
+     celkovou odchylku stejně dorovnává kalibrace z glykémie. kus = obvyklá hmotnost kusu v g. */
+  const PROMPT_V = 2;
+  const CARB_TABLE = {
+    knedlik_houskovy: { n: 'houskový knedlík', c: 45, kus: 45 },
+    knedlik_bramborovy: { n: 'bramborový knedlík', c: 33, kus: 50 },
+    ryze: { n: 'rýže bílá vařená', c: 28 },
+    ryze_natural: { n: 'rýže natural / celozrnná vařená', c: 24 },
+    testoviny: { n: 'těstoviny vařené', c: 30 },
+    noky: { n: 'noky / gnocchi', c: 32 },
+    brambory: { n: 'brambory vařené', c: 16 },
+    kase_bramborova: { n: 'bramborová kaše', c: 13 },
+    brambory_pecene: { n: 'brambory pečené / americké', c: 21 },
+    hranolky: { n: 'hranolky', c: 32 },
+    bramborak: { n: 'bramborák', c: 24 },
+    kuskus: { n: 'kuskus vařený', c: 22 },
+    bulgur: { n: 'bulgur vařený', c: 18 },
+    quinoa: { n: 'quinoa vařená', c: 19 },
+    lusteniny: { n: 'luštěniny vařené (čočka, fazole, cizrna)', c: 16 },
+    kukurice: { n: 'kukuřice', c: 16 },
+    chleb: { n: 'chléb pšenično-žitný', c: 48, kus: 45 },
+    chleb_celozrnny: { n: 'chléb celozrnný', c: 40, kus: 45 },
+    rohlik: { n: 'rohlík, bílé pečivo', c: 56, kus: 43 },
+    toust: { n: 'toustový chléb', c: 47, kus: 25 },
+    bageta: { n: 'bageta', c: 52 },
+    croissant: { n: 'croissant', c: 42, kus: 55 },
+    buchta: { n: 'buchta, koláč, kynuté sladké pečivo', c: 50, kus: 70 },
+    pizza: { n: 'pizza (celá, vč. obložení)', c: 29 },
+    palacinka: { n: 'palačinka bez náplně', c: 25, kus: 60 },
+    rizek: { n: 'řízek v trojobalu (celý)', c: 11 },
+    ovesna_kase: { n: 'ovesná kaše na mléce', c: 14 },
+    vlocky: { n: 'ovesné vločky / müsli (suché)', c: 60 },
+    omacka_smetanova: { n: 'svíčková / smetanová omáčka', c: 9 },
+    omacka_gulas: { n: 'guláš / hnědá omáčka', c: 6 },
+    jablko: { n: 'jablko', c: 12 },
+    banan: { n: 'banán (bez slupky)', c: 20, kus: 120 },
+    pomeranc: { n: 'pomeranč, mandarinka', c: 9 },
+    hrozny: { n: 'hroznové víno', c: 16 },
+    jahody: { n: 'jahody', c: 6 },
+    cokolada: { n: 'čokoláda mléčná', c: 56 },
+    cukr: { n: 'cukr', c: 100 },
+    med_dzem: { n: 'med, džem', c: 70 },
+    mleko: { n: 'mléko', c: 4.8 },
+    jogurt_bily: { n: 'jogurt bílý', c: 4.5 },
+    jogurt_ovocny: { n: 'jogurt ovocný / slazený', c: 13 },
+    pivo: { n: 'pivo (ležák)', c: 3.5 },
+    sladky_napoj: { n: 'limonáda, cola (slazená)', c: 10.5 },
+    dzus: { n: 'džus, ovocná šťáva', c: 9 },
+  };
+  // Obecné skupiny (sacharidy na 100 g odhadne model).
+  const ITEM_GROUPS = { maso: 'maso, uzeniny, vejce', ryba: 'ryba', zelenina: 'zelenina', salat: 'salát s dresinkem', omacka: 'jiná omáčka',
+    polevka: 'polévka', sladke: 'jiné sladkosti, dezert', ovoce: 'jiné ovoce', napoj: 'jiný nápoj', mlecne: 'jiné mléčné',
+    pecivo: 'jiné pečivo', priloha: 'jiná příloha', jine: 'jiné' };
+  const tableText = () => 'TABULKA (klíč: potravina — g sacharidů na 100 g hotové potraviny; kus = obvyklá hmotnost kusu): '
+    + Object.entries(CARB_TABLE).map(([k, v]) => `${k}: ${v.n} — ${v.c}${v.kus ? ` (kus ~${v.kus} g)` : ''}`).join('; ')
+    + '. OBECNÉ SKUPINY (sacharidy na 100 g odhadni sám): ' + Object.entries(ITEM_GROUPS).map(([k, v]) => `${k} (${v})`).join(', ') + '.';
+  // Odpověď v2 → složky se sacharidy (z tabulky, jinak od modelu) a součet; rozsah modelu se přepočítá
+  // na tento součet. Odpověď bez složek (starý tvar) → null.
+  function v2Totals(j) {
+    if (!j || !Array.isArray(j.polozky)) return null;
+    const items = [];
+    let modelSum = 0;
+    for (const p of j.polozky) {
+      const g = Math.max(0, +p.gramy || 0);
+      if (!(g > 0)) continue;
+      const k0 = String(p.klic || '').trim().toLowerCase();
+      const k = CARB_TABLE[k0] || ITEM_GROUPS[k0] ? k0 : 'jine';
+      const own = Math.min(100, Math.max(0, +p.sacharidy_100g || 0));
+      const d = CARB_TABLE[k] ? CARB_TABLE[k].c : own;
+      items.push({ k, n: String(p.nazev || CARB_TABLE[k]?.n || ITEM_GROUPS[k] || 'složka').trim().slice(0, 60), g, c: g * d / 100, vis: p.viditelne !== false, kus: +p.kusy > 0 ? +p.kusy : undefined });
+      modelSum += g * own / 100;
+    }
+    const c = items.reduce((a, x) => a + x.c, 0);
+    let min = +j.sacharidy_min, max = +j.sacharidy_max;
+    if (isFinite(min) && isFinite(max) && max >= min && modelSum > 1) { min *= c / modelSum; max *= c / modelSum; }
+    else { min = undefined; max = undefined; }
+    return { c, min, max, items };
+  }
+  // Shoda složek mezi odhady téže fotky: složka (podle klíče) platí, když ji uvede aspoň polovina
+  // odhadů — odfiltruje vymyšlené položky; když v některém odhadu chybí, doplní se mediánem ostatních
+  // (vynechaná příloha by jinak stáhla celý odhad). Od 3 odhadů se složkami.
+  // runs: [{ items }] → { items: [{ k, n, g, c, vis, share }], perRun: [c] (pořadí runs se složkami), dropped }
+  function itemConsensus(runs) {
+    const withI = runs.filter(r => r.items);
+    if (withI.length < 3) return null;
+    const per = withI.map(r => {
+      const m = {};
+      for (const it of r.items) {
+        const x = (m[it.k] ??= { g: 0, c: 0, names: [], vis: false });
+        x.g += it.g; x.c += it.c; x.names.push(it.n); x.vis = x.vis || it.vis;
+      }
+      return m;
+    });
+    const keys = [...new Set(per.flatMap(m => Object.keys(m)))];
+    const items = [], dropped = [];
+    for (const k of keys) {
+      const have = per.filter(m => m[k]);
+      const names = have.flatMap(m => m[k].names), cnt = {};
+      for (const nm of names) cnt[nm.toLowerCase()] = (cnt[nm.toLowerCase()] || 0) + 1;
+      const name = names.find(nm => cnt[nm.toLowerCase()] === Math.max(...Object.values(cnt)));
+      if (have.length * 2 < per.length) { dropped.push({ k, n: name, share: have.length / per.length }); continue; }
+      items.push({ k, n: name, g: median(have.map(m => m[k].g)), c: median(have.map(m => m[k].c)), vis: have.filter(m => m[k].vis).length * 2 >= have.length, share: have.length / per.length });
+    }
+    items.sort((a, b) => b.c - a.c || b.g - a.g);
+    const perRun = per.map(m => items.reduce((a, it) => a + (m[it.k] ? m[it.k].c : it.c), 0));
+    return { items, perRun, dropped };
+  }
+
+  // Oprava jedné AI: úroveň a závislost chyby na velikosti porce (velké porce se podceňují).
+  // log(skutečnost / odhad) = a + b · log(odhad / 40 g); bez dat a = b = 0.
+  const VC_REF = 40;
+  const vendorFix = (x, raw) => (!x || !(raw >= 3) ? 1 : Math.min(1.6, Math.max(0.6, Math.exp((x.a || 0) + (x.b || 0) * Math.log(raw / VC_REF)))));
+
   function vendorWeights(samples, now) {
     const acc = {};
     for (const s of samples) {
       if (!(s.label > 0) || !s.runs?.length) continue;
-      const decay = Math.pow(0.5, Math.max(0, (now - s.ts) / 86400000) / HALF_LIFE_D);
+      const decay = Math.pow(0.5, Math.max(0, (now - s.ts) / 86400000) / HALF_LIFE_D) * (s.w ?? 1);
       const by = {};
       for (const r of s.runs) if (r.c > 0) (by[vendorOf(r.m)] ??= []).push(r.c);
       for (const [v, xs] of Object.entries(by)) {
-        const e = Math.log(s.label / median(xs));
-        const a = acc[v] ??= { w: 0, se: 0, n: 0 };
-        a.w += decay; a.se += decay * e * e; a.n++;
+        const med = median(xs);
+        if (!(med >= 3)) continue;
+        (acc[v] ??= []).push({ x: Math.log(med / VC_REF), e: Math.log(s.label / med), d: decay, v: (s.labSd > 0 ? Math.min(1, s.labSd) : 0.15) ** 2 + 0.15 ** 2 });
       }
     }
     const out = {};
-    for (const [v, a] of Object.entries(acc))
-      out[v] = { n: a.n, rmse: Math.sqrt(a.se / a.w), weight: (a.w + VW_K) / (a.se + VW_K * VW_PRIOR) };
+    for (const [v, rows] of Object.entries(acc)) {
+      // bayesovská přímka s předpokladem a, b ~ N(0; 0,25²) — s málo jídly se oprava skoro nehne
+      const P = [[1 / 0.25 ** 2, 0], [0, 1 / 0.25 ** 2]], q = [0, 0];
+      for (const r of rows) { const w = r.d / r.v, x = [1, r.x]; for (let i = 0; i < 2; i++) { q[i] += w * x[i] * r.e; for (let j = 0; j < 2; j++) P[i][j] += w * x[i] * x[j]; } }
+      const C = invert(P) || [[0, 0], [0, 0]];
+      const fa = C[0][0] * q[0] + C[0][1] * q[1], fb = C[1][0] * q[0] + C[1][1] * q[1];
+      const W = rows.reduce((t, r) => t + r.d, 0), se = rows.reduce((t, r) => t + r.d * (r.e - fa - fb * r.x) ** 2, 0);
+      out[v] = { n: rows.length, rmse: Math.sqrt(se / W), weight: (W + VW_K) / (se + VW_K * VW_PRIOR), a: fa, b: fb };
+    }
     return out;
   }
 
@@ -1182,10 +1306,10 @@
     const xs = runs.map(r => r.c).sort((a, b) => a - b), n = xs.length;
     const by = {};
     for (const r of runs) (by[vendorOf(r.model)] ??= []).push(r.c);
-    const vendors = Object.entries(by).map(([v, a]) => ({
-      v, label: VENDOR_LABEL[v], c: median(a), n: a.length, values: [...a].sort((p, q) => p - q),
-      w: vw[v]?.weight ?? 1 / VW_PRIOR,
-    }));
+    const vendors = Object.entries(by).map(([v, a]) => {
+      const raw = median(a), fix = vendorFix(vw[v], raw);
+      return { v, label: VENDOR_LABEL[v], raw, fix, c: raw * fix, n: a.length, values: [...a].sort((p, q) => p - q), w: vw[v]?.weight ?? 1 / VW_PRIOR };
+    });
     const W = vendors.reduce((s, x) => s + x.w, 0);
     for (const x of vendors) x.share = x.w / W;
     const c = vendors.reduce((s, x) => s + x.share * x.c, 0);
@@ -1209,6 +1333,6 @@
     };
   }
 
-  root.LEARN = { CATS, catKey, GI_DUR, GI_LABEL, giKey, absDuration, absorbedFrac, clusterOf, windowEnd, postFor, isHeavy, fpu, fpuAbs, learnSpeed, BLOCKS, blockOf, segmentOf, evaluateSegment, dedupeBoluses, basalBaseline, ensemble, vendorWeights, vendorShares, vendorOf, VENDOR_LABEL, insulinActed, segmentAt, evaluateMeal, dayCurves, dayStatsOf, weeklyTrend, timeOfDay, correctionEpisodes, estimateISF, ratioCheck, calibrate, applyCal, estimateKNone, combine, parseCareLink, REL_SD, MIN };
+  root.LEARN = { PROMPT_V, CARB_TABLE, ITEM_GROUPS, tableText, v2Totals, itemConsensus, vendorFix, CATS, catKey, GI_DUR, GI_LABEL, giKey, absDuration, absorbedFrac, clusterOf, windowEnd, postFor, isHeavy, fpu, fpuAbs, learnSpeed, BLOCKS, blockOf, segmentOf, evaluateSegment, dedupeBoluses, basalBaseline, ensemble, vendorWeights, vendorShares, vendorOf, VENDOR_LABEL, insulinActed, segmentAt, evaluateMeal, dayCurves, dayStatsOf, weeklyTrend, timeOfDay, correctionEpisodes, estimateISF, ratioCheck, calibrate, applyCal, estimateKNone, combine, parseCareLink, REL_SD, MIN };
   if (typeof module !== 'undefined') module.exports = root.LEARN;
 })(typeof window !== 'undefined' ? window : globalThis);

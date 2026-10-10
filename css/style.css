@@ -455,3 +455,8 @@ code { font-size: 12.5px; background: var(--track); padding: 1px 5px; border-rad
 .tod-line { margin: 2px 0; }
 .tod-verdict { margin-top: 6px; font-size: 13.5px; color: var(--muted); }
 .tod-verdict.warn-note { color: var(--text); padding: 6px 8px; border-radius: 8px; margin-bottom: 0; }
+
+/* Rychlá upřesnění fotky */
+.cnew-facts { margin: 6px 0 2px; }
+.cnew-facts .chip { padding: 6px 10px; font-size: 13px; }
+#cnew-facts-list { margin-bottom: 8px; }

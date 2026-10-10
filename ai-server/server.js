@@ -41,6 +41,21 @@ const SCHEMA = {
   additionalProperties: false,
 };
 
+// Dotaz v2 (aplikace od v24): jídlo po složkách s gramy, sacharidy počítá aplikace z tabulky.
+// Starší verze aplikace posílají dotaz v1 bez "schema" a dostanou původní tvar.
+const SCHEMA2 = {
+  type: 'object',
+  properties: {
+    polozky: { type: 'array', items: { type: 'object', properties: {
+      nazev: { type: 'string' }, klic: { type: 'string' }, viditelne: { type: 'boolean' }, kusy: { type: 'number' },
+      gramy: { type: 'number' }, sacharidy_100g: { type: 'number' }, zaklad: { type: 'string' },
+    }, required: ['nazev', 'klic', 'viditelne', 'kusy', 'gramy', 'sacharidy_100g', 'zaklad'], additionalProperties: false } },
+    ...Object.fromEntries(Object.entries(SCHEMA.properties).filter(([k]) => k !== 'sacharidy')),
+  },
+  required: ['polozky', ...SCHEMA.required.filter(k => k !== 'sacharidy')],
+  additionalProperties: false,
+};
+
 const log = (...a) => console.log(new Date().toISOString(), ...a);
 
 /* ─── Deník AI z aplikace (oba režimy): každý pokus o odhad, bez fotek a klíčů ───
@@ -52,7 +67,8 @@ const DIAG_DIR = process.env.DIAG_DIR || '/data';
 const DIAG_FILE = path.join(DIAG_DIR, 'diag.jsonl');
 const ADMIN = process.env.NS_API_SECRET ? crypto.createHash('sha1').update(process.env.NS_API_SECRET).digest('hex') : null;
 const diagRate = new Map(); // ip → { min, n }
-const DIAG_KEYS = ['at', 'dev', 'v', 'mode', 'flow', 'job', 'attempt', 'kb', 'vendor', 'model', 'ok', 'err', 'status', 'msg', 'ms', 'finish', 'tok', 'snippet'];
+const DIAG_KEYS = ['at', 'dev', 'v', 'mode', 'flow', 'job', 'attempt', 'kb', 'vendor', 'model', 'ok', 'err', 'status', 'msg', 'ms', 'finish', 'tok', 'snippet',
+  'pv', 'carbs', 'items', 'label', 'src', 'per', 'q', 'kat'];
 function cleanDiag(x) {
   if (!x || typeof x !== 'object') return null;
   const o = {};
@@ -61,7 +77,7 @@ function cleanDiag(x) {
     if (v == null) continue;
     if (typeof v === 'string') o[k] = v.replace(/AIza[0-9A-Za-z_\-]{20,}|sk-ant-[0-9A-Za-z_\-]+/g, '<key>').slice(0, 400);
     else if (typeof v === 'number' || typeof v === 'boolean') o[k] = v;
-    else if (k === 'tok') o[k] = Object.fromEntries(Object.entries(v).filter(([, n]) => typeof n === 'number').slice(0, 6));
+    else if (k === 'tok' || k === 'per') o[k] = Object.fromEntries(Object.entries(v).filter(([, n]) => typeof n === 'number').slice(0, 6));
   }
   return o.at ? o : null;
 }
@@ -91,13 +107,13 @@ const acquire = () => running < MAX_PARALLEL ? (running++, Promise.resolve()) : 
 const release = () => { const next = waiting.shift(); if (next) next(); else running--; };
 
 /* ─── Jeden odhad = jeden běh CLI ─── */
-function runClaude({ system, prompt, image, media }) {
+function runClaude({ system, prompt, image, media, schema = SCHEMA }) {
   const args = [
     '-p', '--input-format', 'stream-json', '--output-format', 'stream-json', '--verbose',
     '--model', MODEL, '--effort', EFFORT,
     '--system-prompt', system,
     '--tools', '',                       // žádné nástroje — jen se podívat na fotku a odpovědět
-    '--json-schema', JSON.stringify(SCHEMA),
+    '--json-schema', JSON.stringify(schema),
     '--no-session-persistence', '--strict-mcp-config', '--setting-sources', 'project',
   ];
   const env = { ...process.env, CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: '1' };
@@ -217,7 +233,7 @@ http.createServer(async (req, res) => {
 
     await acquire();
     try {
-      const r = await runClaude({ system, prompt: prompt || 'Odhadni sacharidy tohoto jídla z fotky.', image, media });
+      const r = await runClaude({ system, prompt: prompt || 'Odhadni sacharidy tohoto jídla z fotky.', image, media, schema: body.schema === 'v2' ? SCHEMA2 : SCHEMA });
       log('estimate ok', r.model, `${Date.now() - t0}ms`, `in=${r.usage.in} out=${r.usage.out}`, `today=${used}/${DAILY_CAP}`);
       send(res, 200, r);
     } finally { release(); }

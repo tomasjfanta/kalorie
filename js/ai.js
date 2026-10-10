@@ -30,6 +30,41 @@
   const SYS_CARB = ' Uživatel má diabetes: sacharidy jsou nejdůležitější údaj — započítej i skryté sacharidy '
     + '(zahušťovadla v omáčkách, strouhanku a těstíčko, slazené nápoje, dresinky, cukr v pečivu).';
 
+  // Dotaz v2 (režim sacharidů): model rozepíše jídlo na složky s gramy a klíčem z tabulky, sacharidy
+  // spočítá aplikace (LEARN.v2Totals). Pevné hodnoty pro běžné přílohy a pečivo, jen viditelné složky,
+  // žádné „obvyklé porce" — u modelů to snižuje vymýšlení i rozptyl mezi odhady.
+  const SYS2 = () => 'Jsi nutriční terapeut, který lidem s diabetem 1. typu počítá sacharidy z fotky jídla. Podle výsledku si '
+    + 'dávkují inzulin, proto je poctivost důležitější než sebejistota. POSTUP: '
+    + '1) Najdi na fotce každou samostatnou složku jídla (příloha, maso, omáčka, zelenina, pečivo, nápoj, dezert…). Počítej JEN to, '
+    + 'co je na fotce vidět; nevymýšlej složky, které nevidíš. Výjimka: věc, která tam téměř jistě je, ale vidět není (cukr v kávě, '
+    + 'omáčka pod masem, sladký nápoj ve sklenici, strouhanka v obalu) — zapiš ji s "viditelne": false a v "zaklad" uveď proč. '
+    + '2) U každé složky odhadni hmotnost v gramech tak, jak se jí (uvařená, upečená). Vycházej z toho, co je vidět: talíř (mělký '
+    + '~26 cm, hluboký ~22 cm, dezertní ~19 cm), příbor, sklenice, ruka, výška vrstvy. Neodhaduj „obvyklou porci" — odhaduj, co je '
+    + 'na fotce. Velké a vrchovaté porce se z fotek obvykle podceňují, u plného talíře zohledni i výšku. Co jde spočítat (plátky '
+    + 'knedlíku, krajíce, rohlíky, brambory, dílky pizzy), spočítej do "kusy" a hmotnost odvoď z počtu a velikosti kusů. '
+    + '3) Ke každé složce vyber "klic" z tabulky, když odpovídá, jinak obecnou skupinu. U tabulkových položek použij hodnotu '
+    + 'z tabulky, u ostatních uveď "sacharidy_100g" (využitelné sacharidy bez vlákniny, hotový stav) podle běžných nutričních tabulek. '
+    + '4) Když fotka není čitelná nebo na ní není jídlo, vrať prázdné "polozky" a důvod napiš do "poznamka". '
+    + window.LEARN.tableText() + ' '
+    + 'Odpověz VÝHRADNĚ jedním validním JSON objektem bez markdownu, přesně ve tvaru: {"polozky": [{"nazev": "česky", "klic": '
+    + '"klíč z tabulky nebo skupiny", "viditelne": true, "kusy": počet kusů nebo 0, "gramy": číslo, "sacharidy_100g": číslo, '
+    + '"zaklad": "krátce, podle čeho je odhad hmotnosti"}], "nazev": "krátký český název celého jídla", "mnozstvi": "např. 1 talíř '
+    + '~450 g", "kcal": číslo, "bilkoviny": číslo v g, "tuky": číslo v g, "sacharidy_min": číslo v g, "sacharidy_max": číslo v g, '
+    + '"jistota": "nízká"|"střední"|"vysoká", "kategorie": "pecivo"|"prilohy"|"hotove"|"fastfood"|"sladke"|"ovoce"|"mlecne"|"napoje"|"ostatni", '
+    + '"gi": "nízký"|"střední"|"vysoký", "alkohol": true|false, "poznamka": "krátká poznámka nebo prázdný řetězec"}. kcal, '
+    + 'bílkoviny a tuky platí pro celé jídlo; "sacharidy_min" a "sacharidy_max" je rozsah, ve kterém součet sacharidů celého jídla '
+    + 'leží s 90% pravděpodobností — u nejasné porce nebo receptu ho rozšiř. "kategorie" = převažující zdroj sacharidů (prilohy = rýže, '
+    + 'těstoviny, brambory, knedlíky; hotove = jídlo s omáčkou nebo masem; fastfood = pizza, burger, smažené). "gi" = jak rychle se '
+    + 'sacharidy jídla jako celku vstřebají: vysoký (bílé pečivo, sladké nápoje, kaše, sladkosti), střední (rýže, těstoviny na skus, '
+    + 'běžné obědy), nízký (luštěniny, celozrnné, hodně tuku, bílkovin nebo vlákniny). Vychladlá a znovu ohřátá rýže, těstoviny a '
+    + 'brambory a těstoviny na skus se vstřebávají pomaleji, kaše a rozvařené rychleji. "alkohol" = true, je-li na fotce alkoholický '
+    + 'nápoj. Započítej i skryté sacharidy (zahušťovadla v omáčkách, strouhanku a těstíčko, slazené nápoje, dresinky). Sladidla: '
+    + 'erythritol nepočítej, ostatní polyoly (maltitol, sorbitol, xylitol, isomalt) jen z poloviny.';
+  const sysFor = (args, carb) => (args.pv === 2 ? SYS2() : SYS + (carb ? SYS_CARB : '')) + (args.extra || '');
+  const sleep = ms => new Promise(r => setTimeout(r, ms));
+  // Pro deník: sacharidy jednoho běhu (u dotazu v2 součet složek) a počet složek.
+  const runInfo = j => { const t = window.LEARN.v2Totals(j); return t ? { carbs: Math.round(t.c), items: t.items.length } : { carbs: isFinite(+j?.sacharidy) ? Math.round(+j.sacharidy) : undefined }; };
+
   // Modely k vyzkoušení v pořadí — Google občas starší modely pro bezplatné klíče vypne,
   // proto se při chybě „model není dostupný" zkusí automaticky další a ten, co funguje,
   // se zapamatuje.
@@ -72,14 +107,14 @@
     job: args.diag?.job, attempt: args.diag?.attempt, kb: args.imageBase64 ? Math.round(args.imageBase64.length * 0.75 / 1024) : undefined, ...ev });
 
   async function callGemini(args) {
-    const { text, imageBase64, imageMedia, extra, temperature = 0.2 } = args;
+    const { text, imageBase64, imageMedia, temperature = 0.2 } = args;
     const c = cfg();
     if (!c.key) { diag(args, { vendor: 'gemini', ok: false, err: 'nokey' }); return { error: 'nokey' }; }
     const parts = [];
     if (imageBase64) parts.push({ inline_data: { mime_type: imageMedia, data: imageBase64 } });
     parts.push({ text: text || 'Odhadni kalorie a makra tohoto jídla z fotky.' });
     const body = {
-      systemInstruction: { parts: [{ text: SYS + (window.KAL.isCarb() ? SYS_CARB : '') + (extra || '') }] },
+      systemInstruction: { parts: [{ text: sysFor(args, window.KAL.isCarb()) }] },
       contents: [{ role: 'user', parts }],
       // Gemini 3.x jsou „přemýšlecí" modely — interní uvažování se počítá do maxOutputTokens.
       // S malým limitem model celý budget spotřebuje na přemýšlení a nevrátí žádný text.
@@ -88,26 +123,30 @@
         ...(temperature != null ? { temperature } : {}) },
     };
 
-    // Zvolený model první, pak zbytek řetězce jako záloha.
+    // Zvolený model první, pak zbytek řetězce jako záloha (jen když model Google vypnul).
+    // Přetížení (503) a vyčerpaný minutový limit (429) bezplatného klíče: chvíli počkat a zkusit znovu —
+    // okamžité přeskakování na další modely jen přidávalo požadavky do už vyčerpaného limitu.
     const chain = [c.model, ...MODEL_CHAIN.filter(m => m !== c.model)].filter(Boolean);
-    let out = null, used = null, retired = false, hops = 0;
-    for (const model of chain) {
-      const t0 = Date.now();
+    const deadline = Date.now() + (args.budgetMs || 50000);
+    let out = null, retired = false, tries = 0;
+    for (let i = 0; i < chain.length;) {
+      const model = chain[i], t0 = Date.now();
       out = await callModel(model, c.key, body);
       if (out.response) {
-        used = model;
         if (model !== c.model && retired) window.KAL.setAiModel(model); // zapamatuj funkční model
         const parsed = parseAnswer(out.response);
         diag(args, { vendor: 'gemini', model, ok: !!parsed.result, err: parsed.error, ms: Date.now() - t0,
-          finish: parsed.finish, tok: parsed.tok, snippet: parsed.snippet, msg: parsed.block });
-        return parsed.result ? { ...parsed, model: used } : parsed;
+          finish: parsed.finish, tok: parsed.tok, snippet: parsed.snippet, msg: parsed.block, pv: args.pv, ...(parsed.result ? runInfo(parsed.result) : {}) });
+        return parsed.result ? { ...parsed, model } : parsed;
       }
-      diag(args, { vendor: 'gemini', model, ok: false, err: out.error, status: out.status, msg: out.msg, ms: Date.now() - t0 });
-      if (out.error === 'model') { retired = true; continue; }
-      // Přetížený model (503/500/504) nebo vyčerpaný limit jednoho modelu → zkusit další model
-      // v řetězci (každý má vlastní limit); zvolený model se kvůli tomu nemění.
-      if ((out.error === 'api' && [500, 503, 504].includes(out.status)) || out.error === 'quota') { if (++hops <= 2) continue; }
-      break; // klíč, síť apod. — další model by nepomohl
+      diag(args, { vendor: 'gemini', model, ok: false, err: out.error, status: out.status, msg: out.msg, ms: Date.now() - t0, pv: args.pv });
+      if (out.error === 'model') { retired = true; i++; continue; }
+      const busy = out.error === 'api' && [500, 503, 504].includes(out.status), quota = out.error === 'quota';
+      if (!(busy || quota || out.error === 'network') || ++tries > 3) break; // klíč apod. — opakování nepomůže
+      const wait = (quota ? 4000 : 2500) * tries;
+      if (Date.now() + wait + 8000 > deadline) break;
+      if (quota && tries === 2) i = (i + 1) % chain.length; // limit drží → jeden pokus s jiným modelem (vlastní limit)
+      await sleep(wait);
     }
     return out;
   }
@@ -116,7 +155,7 @@
   // Claude uživatele. Přístup ověří tokenem Nightscoutu, který aplikace už má.
   const claudeReady = () => !!(cfg().claudeUrl && window.KAL.store.get('kal.ns', null)?.token);
   async function callClaude(args) {
-    const { imageBase64, imageMedia, extra } = args;
+    const { imageBase64, imageMedia } = args;
     const url = String(cfg().claudeUrl || '').trim().replace(/\/+$/, '');
     const token = window.KAL.store.get('kal.ns', null)?.token;
     if (!url || !token) return { error: 'noclaude' };
@@ -126,8 +165,8 @@
       r = await fetch(url + '/estimate', {
         method: 'POST',
         headers: { 'content-type': 'application/json', authorization: 'Bearer ' + token },
-        body: JSON.stringify({ system: SYS + SYS_CARB + (extra || ''), prompt: args.text || 'Odhadni sacharidy tohoto jídla z fotky.',
-          image: imageBase64, media: imageMedia }),
+        body: JSON.stringify({ system: sysFor(args, true), prompt: args.text || 'Odhadni sacharidy tohoto jídla z fotky.',
+          image: imageBase64, media: imageMedia, ...(args.pv === 2 ? { schema: 'v2' } : {}) }),
         signal: AbortSignal.timeout(170000),
       });
     } catch (e) {
@@ -136,12 +175,12 @@
     }
     const j = await r.json().catch(() => ({}));
     if (r.ok && j.result) {
-      diag(args, { vendor: 'claude', model: j.model, ok: true, ms: Date.now() - t0, tok: j.usage });
+      diag(args, { vendor: 'claude', model: j.model, ok: true, ms: Date.now() - t0, tok: j.usage, pv: args.pv, ...runInfo(j.result) });
       return { result: j.result, model: j.model };
     }
     const out = { error: r.status === 401 ? 'claude-auth' : j.error === 'not-logged-in' ? 'claude-login'
       : r.status === 429 ? 'quota' : 'api', status: r.status, msg: j.detail || j.error };
-    diag(args, { vendor: 'claude', ok: false, err: out.error, status: r.status, msg: out.msg, ms: Date.now() - t0 });
+    diag(args, { vendor: 'claude', ok: false, err: out.error, status: r.status, msg: out.msg, ms: Date.now() - t0, pv: args.pv });
     return out;
   }
 
@@ -151,7 +190,13 @@
   // Vrací { runs: [{ result, model }], errors: { gemini?, claude? } }, nebo chybu, když neuspělo nic.
   async function callRuns(args, plan, onProgress) {
     const jobs = [];
-    for (let i = 0; i < (plan.gemini || 0); i++) jobs.push(['gemini', () => callGemini({ ...args, temperature: null })]);
+    let active = 0;
+    const queue = [], gate = () => new Promise(res => { if (active < 2) { active++; res(); } else queue.push(res); });
+    const release = () => { const next = queue.shift(); if (next) next(); else active--; };
+    for (let i = 0; i < (plan.gemini || 0); i++) jobs.push(['gemini', async () => {
+      await sleep(i * 700); await gate();
+      try { return await callGemini({ ...args, temperature: null }); } finally { release(); }
+    }]);
     for (let i = 0; i < (plan.claude || 0); i++) jobs.push(['claude', () => callClaude(args)]);
     let done = 0;
     const all = await Promise.all(jobs.map(([v, run]) => run().then(r => { onProgress?.(++done, jobs.length); return { ...r, v }; })));
