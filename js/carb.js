@@ -48,7 +48,36 @@
     }).filter(Boolean);
   }
   function cal() { if (!calCache) calCache = LEARN.calibrate(samples(), Date.now()); return calCache; }
-  const invalidate = () => { calCache = null; vwCache = null; spCache = null; };
+  const invalidate = () => { calCache = null; vwCache = null; spCache = null; tailCache = null; };
+  // Pozdní vlna podle druhu jídla (LEARN.learnTail) z jídel, kde ji sonda změřila: dobře vysvětlená
+  // jídla a ta s odpovědí „nic zvláštního". Do výpočtu jde až změna o ≥ 0,07 proti použité hodnotě
+  // (kal.tails), aby se vyhodnocení při drobných posunech pořád nepřepočítávala.
+  let tailCache = null;
+  function tails() {
+    if (!tailCache) tailCache = LEARN.learnTail(photoEntries().filter(e => e.ev?.tailProbe && !e.excl && !e.ev.unlogged && !e.ev.hypo
+      && e.ev.exercise !== 'during' && !e.ev.alcohol && (e.why === 'nic' || LEARN.REL_SD[e.ev.quality]))
+      .map(e => ({ ts: e.ts, kat: e.kat, f: e.ev.tailProbe.f, sd: e.ev.tailProbe.sd })), Date.now());
+    return tailCache;
+  }
+  const catTail = kat => +(K.store.get('kal.tails', {})[LEARN.catKey(kat)] || 0);
+  function updateTails() {
+    const used = K.store.get('kal.tails', {});
+    let changed = false;
+    for (const [k, x] of Object.entries(tails().cats)) {
+      const v = x.f >= 0.05 ? Math.round(x.f * 20) / 20 : 0;
+      if (Math.abs(v - (used[k] || 0)) >= 0.07) { if (v) used[k] = v; else delete used[k]; changed = true; }
+    }
+    if (changed) { K.store.set('kal.tails', used); touchData(); }
+    return changed;
+  }
+  // „Co se stalo?" u jídla, které model nevysvětlil.
+  const WHY = {
+    snack: { lbl: '🍪 něco jsem snědl' },
+    pohyb: { lbl: '🏃 pohyb', excl: 'pohyb nebo sport' },
+    stres: { lbl: '🤒 stres / nemoc', excl: 'nemoc nebo stres' },
+    senzor: { lbl: '📉 chyba senzoru', excl: 'chyba senzoru' },
+    nic: { lbl: '🤷 nic zvláštního' },
+  };
 
   // Bez inzulinu: osobní reakce glykémie na 1 g sacharidů (z potvrzených, jinak z AI odhadů → jen relativní).
   function kNone() {
@@ -86,7 +115,7 @@
   }
   const catSpeed = kat => (spd().n >= 3 ? spd().cats[LEARN.catKey(kat)].factor : 1);
   const asMeal = e => ({ id: e.id, ts: e.ts, aiRaw: e.excl ? 0 : e.aiRaw, s: e.s, conf: e.conf, kat: e.kat, gi: e.gi,
-    fat: e.fat ?? e.t, prot: e.b, alc: e.alc, speed: e.ev?.fit?.informative ? e.ev.fit.speed : catSpeed(e.kat) });
+    fat: e.fat ?? e.t, prot: e.b, alc: e.alc, speed: e.ev?.fit?.informative ? e.ev.fit.speed : catSpeed(e.kat), tail: catTail(e.kat) });
   function mealsWithTime() {
     const out = [], D = K.days();
     for (const d of Object.keys(D)) for (const e of D[d].e || []) if (e.ts) out.push(e);
@@ -130,7 +159,7 @@
     for (const p of pc.sort((a, b) => a.t - b.t)) {
       if (out.some(o => o.s === p.g && Math.abs(o.ts - p.t) <= 3 * MIN)) continue; // duplicity z uploaderu
       if (entries.some(x => Math.abs(x.ts - p.t) <= 30 * MIN)) continue;           // stejné jídlo jako fotka
-      out.push({ id: 'pc' + p.t, ts: p.t, s: p.g, conf: p.g, kat: 'ostatni', pump: true });
+      out.push({ id: 'pc' + p.t, ts: p.t, s: p.g, conf: p.g, kat: 'ostatni', pump: true, tail: catTail('ostatni') });
     }
     return out;
   }
@@ -189,7 +218,7 @@
         endSlope15: ev.endSlope15, stable: ev.stable, cluster: ev.cluster, share: ev.share, sitting: ev.sitting,
         unlogged: ev.unlogged, noMeal: ev.noMeal, tail: ev.tail, seg: ev.seg, dur: ev.dur, gi: ev.gi, pumpMeals: ev.pumpMeals,
         fit: ev.fit, hypo: ev.hypo, exercise: ev.exercise, alcohol: ev.alcohol, heavy: ev.heavy, fpu: ev.fpu, fpuCarbs: ev.fpuCarbs,
-        winEnd: END, rise: ev.rise, tAbove10: ev.tAbove10, bolusLead: ev.bolusLead, final,
+        winEnd: END, rise: ev.rise, tAbove10: ev.tAbove10, bolusLead: ev.bolusLead, final, tailProbe: ev.tailProbe, misfit: ev.misfit,
       };
       const ck = checks[m.id];
       if (ck?.implied > 0 && ent.conf > 0) ent.ev.check = { implied: ck.implied, relSd: ck.relSd, quality: ck.quality, ratio: ck.implied / ent.conf, icr: ck.icr };
@@ -237,6 +266,7 @@
         await evaluate(e); changed.push(e);
       }
       if (changed.length) { K.saveAll(); invalidate(); }
+      updateTails(); // změna naučené pozdní vlny → příští průchod jídla přepočítá
       let sent = false;
       for (const e of all) {
         const lab = e.conf != null ? { label: e.conf, src: 'confirmed' }
@@ -667,6 +697,18 @@
   }
 
   const QLBL = { good: 'dobrá', fair: 'střední', poor: 'slabá', none: '—' };
+  // Kde průběh glykémie nesedí s modelem (LEARN: misfit = { kind, t, d } v mmol/l, d > 0 = výš než model).
+  function misfitTxt(m) {
+    const v = x => `${fmtBG(Math.abs(x))} ${uLbl()}`;
+    switch (m.kind) {
+      case 'late-rise': return `glykémie znovu stoupla kolem ${hhmm(m.t)} — o ~${v(m.d)} víc, než model čekal (pozdní vlna: tuk, bílkoviny, pomalé sacharidy — nebo jídlo, které tu není)`;
+      case 'early-high': return `vrchol kolem ${hhmm(m.t)} byl o ~${v(m.d)} vyšší, než model čekal (rychlejší vstřebání, nebo víc sacharidů)`;
+      case 'early-low': return `vzestup kolem ${hhmm(m.t)} byl o ~${v(m.d)} menší, než model čekal (pomalejší vstřebání, nebo méně sacharidů)`;
+      case 'late-low': return `kolem ${hhmm(m.t)} glykémie klesla o ~${v(m.d)} víc, než model čekal (víc účinného inzulinu, nebo pohyb)`;
+      case 'jump': return `kolem ${hhmm(m.t)} hodnota senzoru skočila o ${v(m.d)} během pár minut (spíš chyba senzoru — stlačení, kalibrace)`;
+      default: return `největší odchylka ~${v(m.d)} kolem ${hhmm(m.t)}`;
+    }
+  }
   function renderMeal(e, w, thumb) {
     const c = K.entryConf(e);
     const ev = e.ev;
@@ -717,7 +759,7 @@
       }
       const photoNeighbours = (ev?.cluster || []).filter(t => !(ev.pumpMeals || []).some(p => p.ts === t));
       if (photoNeighbours.length) h += `<div class="ev-metrics">🍽 Vyhodnoceno společně s jídlem v ${photoNeighbours.map(hhmm).join(', ')}${ev.share != null && ev.share < 1 ? ` — podíl tohoto jídla ~${Math.round(ev.share * 100)} %` : ''}.</div>`;
-      if (ev?.dur) h += `<div class="ev-metrics">Vstřebávání: ${LEARN.GI_LABEL[ev.gi] || 'podle druhu jídla'}${ev.absorbed != null ? ` — do konce okna ~${Math.round(ev.absorbed * 100)} %` : ''}.</div>`;
+      if (ev?.dur) h += `<div class="ev-metrics">Vstřebávání: ${LEARN.GI_LABEL[ev.gi] || 'podle druhu jídla'}${catTail(e.kat) ? ` + pozdní vlna ~${Math.round(catTail(e.kat) * 100)} % (naučeno pro ${LEARN.CATS[LEARN.catKey(e.kat)].short})` : ''}${ev.absorbed != null ? ` — do konce okna ~${Math.round(ev.absorbed * 100)} %` : ''}.</div>`;
       if (ev?.fit?.used) {
         const sp = ev.fit.speed, pct = Math.round(Math.abs(sp - 1) * 100);
         h += `<div class="ev-metrics">📈 Celý průběh glykémie odpovídá modelu (odchylka ±${fmtBG(ev.fit.rmse)} ${uLbl()}); jídlo se u vás vstřebávalo ${sp > 1.08 ? `o ~${pct} % rychleji` : sp < 0.93 ? `o ~${pct} % pomaleji` : 'obvyklou rychlostí'}${ev.fit.informative ? ' — aplikace si to pamatuje pro podobná jídla' : ''}.</div>`;
@@ -736,11 +778,22 @@
         h += `<div class="ev-box">Ověření glykémií bude možné po ${hhmm(wEnd)} (${wEnd - e.ts > POST ? '4 h po jídle — hodně tuku a bílkovin' : '2,5 h po jídle'}). Aplikace si data stáhne sama.</div>`;
       } else if (ev?.implied && ev.quality === 'poor') {
         // Výpočet proběhl, ale okno je zatížené (hypoglykémie, pohyb, alkohol…) — jen pro informaci.
-        h += `<div class="ev-box">Výpočet z glykémie dává ~${r0(ev.implied)} g, ale k učení se toto jídlo nepoužije: ${esc(ev.flags.filter(f => /nepoužito|rychle měnila|nedají se/.test(f)).join(', ') || ev.flags.join(', '))}.</div>`;
+        h += `<div class="ev-box">Výpočet z glykémie dává ~${r0(ev.implied)} g, ale k učení sacharidů se toto jídlo nepoužije: ${esc(ev.flags.filter(f => /nepoužito|rychle měnila|nedají se/.test(f)).join(', ') || ev.flags.join(', '))}.${ev.misfit ? `<br>Kde to nesedí: ${misfitTxt(ev.misfit)}.` : ''}</div>`;
       } else {
         h += `<div class="ev-box">Zatím nelze ověřit: ${esc((ev?.flags || ['chybí data z CGM']).join(', '))}.</div>`;
       }
       if (ev?.flags?.length && ev.implied && ev.quality !== 'poor') h += `<div class="muted small-text">Pozn.: ${esc(ev.flags.join(' · '))}</div>`;
+      // Model průběh nevysvětlil → zeptat se proč: odpověď rozhodne, čemu se model naučí
+      if (ev?.misfit && ev.final && e.conf == null && !pendingWin) {
+        if (e.why) {
+          h += `<div class="ev-metrics">Co se stalo: ${WHY[e.why]?.lbl || e.why}${e.why === 'nic' ? ' — model se z jídla učí tvar vstřebávání tohoto druhu jídla' : e.why === 'snack' ? ' — doplněné jídlo se započítá' : ' — jídlo je vyřazené z učení'} · <button type="button" id="cm-why-undo" class="linklike">změnit</button></div>`;
+        } else if (!e.excl) {
+          const st = ev.unlogged ? ev.unlogged.t : ev.misfit.t - (ev.misfit.kind === 'late-rise' ? 60 : 30) * MIN;
+          h += `<div class="ev-box">Co se stalo? Odpověď pomůže modelu učit se správnou věc.
+            <div class="chips">${Object.entries(WHY).map(([k, w]) => `<button type="button" class="chip" data-why="${k}">${w.lbl}</button>`).join('')}</div>
+            <div id="cm-why-snack" class="ev-actions hidden"><input id="cm-ws-g" type="text" inputmode="decimal" placeholder="g"><span class="unit">g v</span><input id="cm-ws-t" type="time" value="${hhmm(Math.max(e.ts, st))}"><button id="cm-ws-add" class="btn slim">Zapsat</button></div></div>`;
+        }
+      }
 
       // Ruční doplnění, když CGM data chybí
       if (!pendingWin && !(ev?.n > 0) && e.conf == null) {
@@ -789,7 +842,24 @@
     });
     $('#cm-unconf')?.addEventListener('click', () => { delete e.conf; after(); });
     $('#cm-excl')?.addEventListener('click', () => { e.excl = $('#cm-excl-why').value; after(); });
-    $('#cm-unexcl')?.addEventListener('click', () => { delete e.excl; after(); });
+    $('#cm-unexcl')?.addEventListener('click', () => { delete e.excl; if (WHY[e.why]?.excl) delete e.why; after(); });
+    // „Co se stalo?"
+    $$('#cmeal-body [data-why]').forEach(b => b.addEventListener('click', () => {
+      const k = b.dataset.why;
+      if (k === 'snack') { $('#cm-why-snack').classList.remove('hidden'); $('#cm-ws-g').focus(); return; }
+      e.why = k;
+      if (WHY[k].excl) e.excl = WHY[k].excl;
+      after();
+    }));
+    $('#cm-ws-add')?.addEventListener('click', () => {
+      const g = K.num($('#cm-ws-g').value);
+      if (!(g > 0)) { K.toast('Zadejte sacharidy'); return; }
+      const ts = tsFromTime(e.ts, $('#cm-ws-t').value);
+      K.day(K.dstr(new Date(ts))).e.push({ id: 'm' + Date.now(), n: 'Doplněné jídlo', q: 1, s: g, cs: 'manual', ts, meal: 'sv' });
+      e.why = 'snack';
+      after(); K.toast(`Zapsáno: ${r0(g)} g v ${hhmm(ts)} — jídla kolem se přepočítají`);
+    });
+    $('#cm-why-undo')?.addEventListener('click', () => { if (WHY[e.why]?.excl && e.excl === WHY[e.why].excl) delete e.excl; delete e.why; after(); });
     $('#cm-man')?.addEventListener('click', () => {
       e.man = { bg0: toMmol($('#cm-bg0').value), bg2: toMmol($('#cm-bg2').value) };
       if (!e.man.bg0 || !e.man.bg2) { K.toast('Zadejte obě hodnoty'); return; }
@@ -1018,6 +1088,16 @@
       h += '<div class="card"><div class="card-title">Jak rychle se u vás jídlo vstřebává</div>' + spc.map(([k, v]) =>
         `<div class="learn-row"><span>${LEARN.CATS[k].label}<br><span class="muted small-text">${v.n} jídel s jasným průběhem</span></span><b>${v.factor > 1.05 ? 'rychleji o ' + Math.round((v.factor - 1) * 100) + ' %' : v.factor < 0.95 ? 'pomaleji o ' + Math.round((1 - v.factor) * 100) + ' %' : 'obvykle'}</b></div>`).join('')
         + '<p class="muted small-text">Oproti obecnému glykemickému indexu. Používá se při vyhodnocení dalších jídel.</p></div>';
+    }
+    // Pozdní vlna po jídle (naučená) a odpovědi na „Co se stalo?"
+    const tl = Object.entries(tails().cats).filter(([, x]) => x.n > 0), usedT = K.store.get('kal.tails', {});
+    const misfits = all.filter(e => e.ev?.misfit && e.ev.final), whys = {};
+    for (const e of misfits) if (e.why) whys[e.why] = (whys[e.why] || 0) + 1;
+    if (tl.length || misfits.length) {
+      h += '<div class="card"><div class="card-title">Pozdní vlna po jídle</div>' + tl.map(([k, x]) =>
+        `<div class="learn-row"><span>${LEARN.CATS[k].label}<br><span class="muted small-text">${x.n} ${x.n === 1 ? 'jídlo' : x.n < 5 ? 'jídla' : 'jídel'}${usedT[k] ? ' · používá se ve výpočtu' : ''}</span></span><b>${x.f >= 0.05 ? `~${Math.round(x.f * 100)} % pozdě` : 'bez pozdní vlny'}</b></div>`).join('')
+        + '<p class="muted small-text">Podíl sacharidů, který u vás přichází pomalu 1–5 h po jídle („pizza efekt" — tuk a bílkoviny zdrží část sacharidů). Navíc k tomu, co se počítá z tuku a bílkovin v odhadu AI. Učí se z dobře vysvětlených jídel a z jídel s odpovědí „nic zvláštního"; mění se, až se shodne víc jídel.</p>'
+        + (misfits.length ? `<p class="muted small-text">Jídla, která model nevysvětlil: ${misfits.length}${Object.keys(whys).length ? ' — vaše odpovědi: ' + Object.entries(whys).map(([k, n]) => `${WHY[k]?.lbl || k} ${n}×`).join(' · ') : ' — odpovězte v detailu jídla „Co se stalo?"'}.</p>` : '') + '</div>';
     }
     // Vzestup glykémie podle druhu jídla (bez jídel s pohybem, alkoholem, hypoglykémií)
     const clean = all.filter(e => e.ev?.rise != null && e.ev.final && !e.excl && !e.ev.hypo && e.ev.exercise !== 'during' && !e.ev.alcohol);

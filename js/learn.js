@@ -44,13 +44,22 @@
   // Těžké jídlo (hodně tuku/bílkovin) se vyhodnocuje 4 h místo 2,5 h — jinak by okno skončilo
   // dřív, než se pozdní vzestup projeví.
   const isHeavy = m => fpu(m) >= 4 || (m.fat || 0) >= 35 || (m.prot || 0) >= 50;
-  const postFor = m => (isHeavy(m) ? 240 : 150) * MIN;
+  const postFor = m => (isHeavy(m) || m.tail >= 0.2 ? 240 : 150) * MIN; // výrazná pozdní vlna → okno 4 h
   // Podíl sacharidů vstřebaný do t minut — parabolická křivka délky D (Scheiner; používá i Loop).
   function absorbedFrac(t, D) {
     if (t <= 0) return 0;
     if (t >= D) return 1;
     const x = t / D;
     return x < 0.5 ? 2 * x * x : 1 - 2 * (1 - x) * (1 - x);
+  }
+
+  // Vstřebaný podíl sacharidů jídla po t minutách: hlavní vlna (parabola délky podle GI a druhu jídla)
+  // a naučená pozdní vlna — podíl m.tail sacharidů přichází pomalu od 60 min po jídle po 4 h
+  // („pizza efekt": tuk a bílkoviny zdrží část sacharidů). sp = rychlost proložení.
+  const TAIL_DELAY = 60, TAIL_DUR = 240;
+  function mealAbs(m, t, sp = 1) {
+    const f = m.tail > 0 ? Math.min(0.5, m.tail) : 0, main = absorbedFrac(t, absDuration(m) / sp);
+    return f ? (1 - f) * main + f * absorbedFrac(t - TAIL_DELAY, TAIL_DUR) : main;
   }
 
   // Podíl účinku bolusu po t minutách — exponenciální model inzulinu (jako Loop/OpenAPS).
@@ -204,7 +213,7 @@
 
     // ── Sacharidy: známé části a neznámé (k × odhad AI), jako funkce času ──
     const est = m => m.aiRaw > 0 ? m.aiRaw : (m.s > 0 ? m.s : 0);
-    const absIn = (m, t, sp = 1) => { const D = absDuration(m) / sp; return absorbedFrac((t - m.ts) / MIN, D) - absorbedFrac(Math.max(0, T0 - m.ts) / MIN, D); };
+    const absIn = (m, t, sp = 1) => mealAbs(m, (t - m.ts) / MIN, sp) - mealAbs(m, Math.max(0, T0 - m.ts) / MIN, sp);
     const known = [], unknown = [];
     for (const m of cluster) {
       if (m !== meal && (m.conf != null || !(m.aiRaw > 0))) known.push({ m, c: m.conf != null ? m.conf : est(m) });
@@ -457,7 +466,7 @@
 
     // Sacharidy: známé (ověřené, zadané do pumpy, dřívější jídla, tuk a bílkoviny) a neznámá sezení.
     const est = m => m.aiRaw > 0 ? m.aiRaw : (m.s > 0 ? m.s : 0);
-    const absIn = (m, t, sp = 1) => { const D = absDuration(m) / sp; return absorbedFrac((t - m.ts) / MIN, D) - absorbedFrac(Math.max(0, T0 - m.ts) / MIN, D); };
+    const absIn = (m, t, sp = 1) => mealAbs(m, (t - m.ts) / MIN, sp) - mealAbs(m, Math.max(0, T0 - m.ts) / MIN, sp);
     const isUnknown = m => m.conf == null && !m.pump && m.aiRaw > 0;
     const known = [...meals.filter(m => !isUnknown(m)), ...(data.prior || []).filter(m => m.ts < T0 && m.ts >= T0 - PRIOR_WIN)];
     const fpuMeals = [...meals, ...(data.prior || []).filter(m => m.ts < T0 && m.ts >= T0 - PRIOR_WIN)];
@@ -625,6 +634,35 @@
       }
     }
     const r2f = sst > 0 ? 1 - best.res.reduce((a, r) => a + r * r, 0) / sst : 0;
+    // Sonda pozdní vlny: kolik sacharidů každého sezení přišlo pomalou vlnou 1–5 h po jídle. Uloží se
+    // celkový podíl (už použitá naučená vlna + co přidala sonda), z jídel se pak učí tvar podle druhu.
+    // (s vlastní rychlostí hlavní vlny — pomalejší rychlost by jinak pozdní vlnu „schovala")
+    const probe = bestOf([...alts, ...unlogged.map(ghostTerm), ...sittings.map(S => ({
+      f: t => S.members.reduce((a, m) => a + scale(m.ts) * est(m) / S.E * (absorbedFrac((t - m.ts) / MIN - TAIL_DELAY, TAIL_DUR) - absorbedFrac(Math.max(0, T0 - m.ts) / MIN - TAIL_DELAY, TAIL_DUR)), 0),
+      mu: 0, sd: 0.5 * S.E }))], best.sig);
+    const probes = sittings.map((S, i) => {
+      if (!probe) return null;
+      const k = sittings.length + 1 + alts.length + unlogged.length + i, C = probe.beta[i], T = probe.beta[k];
+      if (!(C + T > 5)) return null;
+      const fm = S.members.reduce((a, m) => a + est(m) * (m.tail > 0 ? Math.min(0.5, m.tail) : 0), 0) / S.E;
+      return { f: Math.min(0.8, Math.max(-0.3, (fm * C + T) / (C + T))), sd: Math.sqrt(Math.max(0, probe.cov[k][k])) / (C + T) };
+    });
+    // Kde průběh nesedí (pro vysvětlení u jídla): rezidua = CGM − model v okně jídla.
+    function misfitOf(m) {
+      const own = pts.map((p, k) => ({ t: p.t + lag, d: best.res[k], dm: (p.t - m.ts) / MIN })).filter(x => x.dm >= 0 && x.dm <= postFor(m) / MIN + 60);
+      if (own.length < 6) return null;
+      for (let i = 1; i < own.length; i++) {
+        if (own[i].t - own[i - 1].t <= 10 * MIN && Math.abs(own[i].d - own[i - 1].d) > 2.5) return { kind: 'jump', t: own[i].t, d: own[i].d - own[i - 1].d };
+      }
+      const big = xs => xs.reduce((a, x) => (Math.abs(x.d) > Math.abs(a.d) ? x : a), { d: 0, t: null });
+      const e = big(own.filter(x => x.dm <= 100)), l = big(own.filter(x => x.dm > 120));
+      if (l.d >= 1.5 && l.d >= Math.abs(e.d)) return { kind: 'late-rise', t: l.t, d: l.d };
+      if (e.d >= 1.5) return { kind: 'early-high', t: e.t, d: e.d };
+      if (e.d <= -1.5) return { kind: 'early-low', t: e.t, d: e.d };
+      if (l.d <= -1.5) return { kind: 'late-low', t: l.t, d: l.d };
+      const x = Math.abs(l.d) > Math.abs(e.d) ? l : e;
+      return x.t ? { kind: 'other', t: x.t, d: x.d } : null;
+    }
     const seg = { T0, Tend, n: pts.length, nMeals: meals.length, sittings: sittings.length, rmse: best.rms, r2: r2f, speed: best.sp,
       drift: best.beta[sittings.length], outliers, excluded: excl.map(x => x[2]), basalOk, del, unlogged, noMeal,
       coveredCarbs: s0.icr * del.meal, extraCarbs: s0.icr * (del.auto + del.basal), manCarbs: s0.icr * del.man };
@@ -669,6 +707,8 @@
       r.fit = { used: fitOk, speed: (m.speed > 0 ? m.speed : 1) * best.sp, rel: best.sp, rmse: best.rms, r2: r2f, n: pts.length,
         informative: fitOk && sittings.length === 1 && meals.length === 1 && r.relSd < 0.2 };
       r.sitting = S.members.length > 1 ? S.members.filter(x => x !== m).map(x => x.ts) : null;
+      if (probes[si]) r.tailProbe = probes[si];
+      if (!fitOk) r.misfit = misfitOf(m);
       // kvalita z vlastní nejistoty + důvody k vyřazení
       let q = r.relSd <= 0.2 ? 'good' : r.relSd <= 0.4 ? 'fair' : 'poor';
       const down = x => { const o = ['good', 'fair', 'poor']; if (o.indexOf(x) > o.indexOf(q)) q = x; };
@@ -757,8 +797,7 @@
     // Jídla: kolik g (zapsané / přepočtené) a jak rychle
     const gLogged = m => (m.ghost ? 0 : m.conf != null ? m.conf : m.s > 0 ? m.s : m.aiRaw || 0);
     const gFit = m => (m.ghost ? m.g || 0 : m.conf != null ? m.conf : m.implied > 0 ? m.implied : gLogged(m));
-    const durOf = (m, fit) => absDuration({ ...m, speed: fit && m.fitSpeed > 0 ? m.fitSpeed : m.speed });
-    const carbCum = (m, t, fit) => { const g = fit ? gFit(m) : gLogged(m), x = (t - m.ts) / MIN; return g * absorbedFrac(x, durOf(m, fit)) + (m.ghost ? 0 : fpuAbs(m, x)); };
+    const carbCum = (m, t, fit) => { const g = fit ? gFit(m) : gLogged(m), x = (t - m.ts) / MIN; return g * mealAbs({ ...m, speed: fit && m.fitSpeed > 0 ? m.fitSpeed : m.speed }, x) + (m.ghost ? 0 : fpuAbs(m, x)); };
     const ms = (meals || []).filter(m => m.ts >= from - PRIOR_WIN && m.ts <= to).sort((a, b) => a.ts - b.ts);
 
     // Kumulativní vliv (mmol/l) v čase krve t − lag; projekce úseku = kotva + rozdíl proti začátku úseku.
@@ -985,6 +1024,24 @@
   // Osobní rychlost vstřebávání podle druhu jídla z dobře proložených křivek (log-průměr,
   // smrštěný k celkové hodnotě a ta k 1 — s málo daty se nic nemění).
   // samples: [{ ts, kat, speed }] → { global, cats: { kat: { factor, n } } }
+  // Pozdní vlna podle druhu jídla: podíl sacharidů, který přichází pomalu 1–5 h po jídle. Z jídel, kde ji
+  // sonda změřila (dobře vysvětlená jídla a ta s odpovědí „nic zvláštního"); vážený průměr smrštěný
+  // k nule (předpoklad 0 ± 0,12, šum jídla 0,1) — tvar se změní, až se shodne víc jídel.
+  // samples: [{ ts, kat, f, sd }] → { cats: { kat: { f, n, sd } } }
+  function learnTail(samples, now) {
+    const cats = {};
+    for (const k of Object.keys(CATS)) {
+      let P = 1 / 0.12 ** 2, q = 0, n = 0;
+      for (const s2 of samples || []) {
+        if (catKey(s2.kat) !== k || !(s2.sd >= 0) || !isFinite(s2.f)) continue;
+        const w = Math.pow(0.5, Math.max(0, (now - s2.ts) / 86400000) / HALF_LIFE_D) / (s2.sd ** 2 + 0.1 ** 2);
+        P += w; q += w * s2.f; n++;
+      }
+      cats[k] = { f: Math.min(0.5, Math.max(0, q / P)), n, sd: Math.sqrt(1 / P) };
+    }
+    return { cats };
+  }
+
   function learnSpeed(samples, now) {
     const prep = samples.filter(s => s.speed > 0).map(s => ({ kat: catKey(s.kat), y: Math.log(s.speed),
       w: Math.pow(0.5, Math.max(0, (now - s.ts) / 86400000) / HALF_LIFE_D) / 0.3 ** 2 }));
@@ -1333,6 +1390,6 @@
     };
   }
 
-  root.LEARN = { PROMPT_V, CARB_TABLE, ITEM_GROUPS, tableText, v2Totals, itemConsensus, vendorFix, CATS, catKey, GI_DUR, GI_LABEL, giKey, absDuration, absorbedFrac, clusterOf, windowEnd, postFor, isHeavy, fpu, fpuAbs, learnSpeed, BLOCKS, blockOf, segmentOf, evaluateSegment, dedupeBoluses, basalBaseline, ensemble, vendorWeights, vendorShares, vendorOf, VENDOR_LABEL, insulinActed, segmentAt, evaluateMeal, dayCurves, dayStatsOf, weeklyTrend, timeOfDay, correctionEpisodes, estimateISF, ratioCheck, calibrate, applyCal, estimateKNone, combine, parseCareLink, REL_SD, MIN };
+  root.LEARN = { mealAbs, learnTail, TAIL_DELAY, TAIL_DUR, PROMPT_V, CARB_TABLE, ITEM_GROUPS, tableText, v2Totals, itemConsensus, vendorFix, CATS, catKey, GI_DUR, GI_LABEL, giKey, absDuration, absorbedFrac, clusterOf, windowEnd, postFor, isHeavy, fpu, fpuAbs, learnSpeed, BLOCKS, blockOf, segmentOf, evaluateSegment, dedupeBoluses, basalBaseline, ensemble, vendorWeights, vendorShares, vendorOf, VENDOR_LABEL, insulinActed, segmentAt, evaluateMeal, dayCurves, dayStatsOf, weeklyTrend, timeOfDay, correctionEpisodes, estimateISF, ratioCheck, calibrate, applyCal, estimateKNone, combine, parseCareLink, REL_SD, MIN };
   if (typeof module !== 'undefined') module.exports = root.LEARN;
 })(typeof window !== 'undefined' ? window : globalThis);
