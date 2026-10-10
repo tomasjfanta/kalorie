@@ -634,7 +634,9 @@
         const prior = CONF.entrySigma({ C: e.s, kind: 'ai-photo', jist: e.jist, sMin: e.sMin, sMax: e.sMax, sSd: e.sSd, learnedSd: cal().sd }).sigma;
         const post = LEARN.combine(e.s, prior, ev.implied, ev.quality, ev.relSd);
         h += `<div class="ev-box">Podle glykémie a inzulinu mělo jídlo nejspíš <b>~${r0(ev.implied)} g</b> sacharidů (spolehlivost výpočtu: ${QLBL[ev.quality]}).<br>Spojeno s odhadem z fotky: <b>${r0(post.C)} g</b> (±${r0(CONF.Z90 * post.sigma)} g).</div>`;
-        if (e.conf == null && !e.excl) h += `<div class="ev-actions"><input id="cm-conf" type="text" inputmode="decimal" value="${r0(post.C)}"><span class="unit">g</span><button id="cm-confirm" class="btn slim">✓ Potvrdit jako skutečnost</button></div>`;
+        // Potvrzení jen pro známé množství — předvyplněný odhad by učení vracel AI jejím vlastním číslem.
+        if (e.conf == null && !e.excl) h += `<div class="muted small-text" style="margin-top:10px">Znám přesné množství (obal, vážení)? Jinak nechte prázdné — odhad z glykémie se do učení započítá sám, s vahou podle své přesnosti.</div>
+          <div class="ev-actions" style="margin-top:6px"><input id="cm-conf" type="text" inputmode="decimal" placeholder="g"><span class="unit">g</span><button id="cm-confirm" class="btn slim">✓ Potvrdit skutečnost</button></div>`;
       } else if (pendingWin) {
         h += `<div class="ev-box">Ověření glykémií bude možné po ${hhmm(wEnd)} (${wEnd - e.ts > POST ? '4 h po jídle — hodně tuku a bílkovin' : '2,5 h po jídle'}). Aplikace si data stáhne sama.</div>`;
       } else if (ev?.implied && ev.quality === 'poor') {
@@ -676,7 +678,11 @@
 
   function bindMeal(e) {
     const after = () => { K.saveAll(); invalidate(); touchData(); openMeal(e.id); };
-    $('#cm-confirm')?.addEventListener('click', () => { const v = K.num($('#cm-conf').value); if (!(v >= 0)) return; e.conf = v; e.s = v; delete e.auto; after(); K.toast('Potvrzeno — aplikace se z toho učí'); });
+    $('#cm-confirm')?.addEventListener('click', () => {
+      const raw = $('#cm-conf').value.trim(), v = K.num(raw);
+      if (!raw || !(v >= 0)) { K.toast('Zadejte skutečné množství z obalu nebo vážení'); return; }
+      e.conf = v; e.s = v; delete e.auto; after(); K.toast('Potvrzeno — aplikace se z toho učí');
+    });
     $('#cm-unconf')?.addEventListener('click', () => { delete e.conf; after(); });
     $('#cm-excl')?.addEventListener('click', () => { e.excl = $('#cm-excl-why').value; after(); });
     $('#cm-unexcl')?.addEventListener('click', () => { delete e.excl; after(); });
