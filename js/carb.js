@@ -95,6 +95,28 @@
     return out.sort((a, b) => a.t - b.t);
   }
 
+  // „Křivky": jídla dne (zapsaná, z pumpy, odhalená nezapsaná), CGM, inzulin a nastavení pumpy.
+  async function dayData(from, to) {
+    const W = 6 * 60 * MIN;
+    const entries = mealsWithTime().filter(e => e.ts >= from - W && e.ts <= to && (e.s > 0 || e.conf != null));
+    const meals = entries.map(e => ({ ...asMeal(e), n: e.n, implied: e.ev?.implied && LEARN.REL_SD[e.ev.quality] ? e.ev.implied : null,
+      fitSpeed: e.ev?.fit?.used ? e.ev.fit.speed : null }));
+    meals.push(...await pumpMeals(entries, from - W, to));
+    for (const e of entries) for (const u of e.ev?.seg?.unlogged || []) {
+      if (u.t >= from - W && u.t <= to && !meals.some(m => m.ghost && Math.abs(m.ts - u.t) < 10 * MIN)) meals.push({ id: 'g' + u.t, ts: u.t, g: u.g, gi: 'střední', kat: 'ostatni', ghost: true });
+    }
+    const [readings, boluses, basal, pumpset, targets] = await Promise.all([
+      CGM.range('cgm', from - 60 * MIN, to + 15 * MIN),
+      CGM.range('bolus', from - 300 * MIN, to),
+      CGM.range('basal', from - DAY, to).catch(() => []),
+      CGM.range('pumpset', from - 30 * DAY, to + 30 * DAY),
+      CGM.range('targets', from - 14 * 60 * MIN, to).catch(() => []),
+    ]);
+    const before = basal.filter(r => r.t < from);
+    return { readings, boluses, basal, basalBase: before.length >= 96 ? LEARN.basalBaseline(before) : null, targets, meals,
+      settingsAt: makeSettingsAt(pumpset), therapy: therapy(), noMeal: noMeals(from - W, to) };
+  }
+
   // Sacharidy zadané do pumpy (bolusový kalkulátor) bez fotky do 30 min → známé jídlo v bilanci
   // (jinak by se jejich vliv na glykémii připsal vyfocenému jídlu).
   async function pumpMeals(entries, from, to) {
@@ -207,6 +229,7 @@
     finally { busy = false; }
     K.renderDnes();
     if ($('#view-uceni').classList.contains('active')) renderLearn();
+    window.CURVES?.refresh();
   }
 
   /* ─── Časová osa dne ─── */
@@ -925,7 +948,7 @@
     } catch (e) { $('#cl-status').textContent = 'Soubor se nepodařilo načíst.'; }
   });
 
-  window.CARB = { cal, renderTimeline, renderLearn, fillSettings, refresh, openMeal };
+  window.CARB = { cal, renderTimeline, renderLearn, fillSettings, refresh, openMeal, dayData };
 
   renderTimeline();
   refresh();

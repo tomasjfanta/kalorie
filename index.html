@@ -108,6 +108,11 @@
     </div>
   </section>
 
+  <!-- ═══ KŘIVKY (režim sacharidů) ═══ -->
+  <section id="view-krivky" class="view">
+    <div id="curves-body"></div>
+  </section>
+
   <!-- ═══ VÁHA ═══ -->
   <section id="view-vaha" class="view">
     <div class="card">
@@ -287,7 +292,8 @@
 <!-- ═══ TABBAR ═══ -->
 <nav class="tabbar">
   <button data-view="dnes" class="tab on"><span class="t-ico">◎</span>Dnes</button>
-  <button data-view="historie" class="tab"><span class="t-ico">▤</span>Historie</button>
+  <button data-view="historie" class="tab kcal-only"><span class="t-ico">▤</span>Historie</button>
+  <button data-view="krivky" class="tab carb-only"><span class="t-ico">〰</span>Křivky</button>
   <button data-view="vaha" class="tab kcal-only"><span class="t-ico">⚖︎</span>Váha</button>
   <button data-view="uceni" class="tab carb-only"><span class="t-ico">📈</span>Učení</button>
   <button data-view="nastaveni" class="tab"><span class="t-ico">⚙︎</span>Nastavení</button>
@@ -619,6 +625,7 @@
 <script src="js/jobs.js"></script>
 <script src="js/ai.js"></script>
 <script src="js/carb.js"></script>
+<script src="js/curves.js"></script>
 <script>
   if ('serviceWorker' in navigator) {
     window.addEventListener('load', () => navigator.serviceWorker.register('sw.js'));

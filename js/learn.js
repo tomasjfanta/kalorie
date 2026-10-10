@@ -487,7 +487,7 @@
     const tailTerm = (m, start, sd) => ({ f: t => scale(m.ts) * (absorbedFrac((t - start) / MIN, TAIL_D) - absorbedFrac(Math.max(0, T0 - start) / MIN, TAIL_D)), mu: 0, sd });
     const rampTerm = start => ({ f: t => Math.max(0, t - start) / (60 * MIN), mu: 0, sd: RAMP_SD });
     function solve(sp, sigFix, extra = []) {
-      const X = pts.map((p, k) => [...sittings.map(S => S.members.reduce((a, m) => a + scale(m.ts) * est(m) / S.E * absIn(m, p.t, (m.speed > 0 ? m.speed : 1) * sp), 0)), tau[k],
+      const X = pts.map((p, k) => [...sittings.map(S => S.members.reduce((a, m) => a + scale(m.ts) * est(m) / S.E * absIn(m, p.t, sp), 0)), tau[k],
         ...extra.map(e => e.f(p.t))]);
       const mu0 = [...sittings.map(S => S.E), 0, ...extra.map(e => e.mu)];
       const prec0 = [...sittings.map(S => 1 / (LOOSE * S.E) ** 2), 1 / DRIFT_SD ** 2, ...extra.map(e => 1 / e.sd ** 2)];
@@ -569,7 +569,7 @@
       if (cand.length) {
         const ghost = t => ({ ts: t, gi: 'střední', kat: 'ostatni' });
         const mkX = withC => pts.map((p, k) => [
-          ...sittings.map(S => S.members.reduce((a, m) => a + scale(m.ts) * est(m) / S.E * absIn(m, p.t, (m.speed > 0 ? m.speed : 1) * best.sp), 0)),
+          ...sittings.map(S => S.members.reduce((a, m) => a + scale(m.ts) * est(m) / S.E * absIn(m, p.t, best.sp), 0)),
           tau[k], ...alts.map(e => e.f(p.t)), ...(withC ? cand.map(c => scale(c) * absIn(ghost(c), p.t)) : [])]);
         const fit = withC => {
           const X = mkX(withC), n = X[0].length;
@@ -708,6 +708,117 @@
       out.results[m.id] = r;
     }
     return out;
+  }
+
+  /* ─── Křivky dne: co jsme čekali vs. co se stalo ───
+     Den se rozdělí na úseky: navazující jídla (jako segment) a mezery mezi nimi (po nejvýš 4 h). Každý
+     úsek začíná skutečnou glykémií z CGM a dál se počítá jen z toho, co je známé: sacharidy (vstřebávání
+     podle GI a druhu jídla, tuk a bílkoviny), bolusy a odchylky automatického bazálu od obvyklého.
+     „logged" = sacharidy, jak byly zapsané; „fit" = sacharidy přepočtené z glykémie (implied), naučená
+     rychlost a odhalená nezapsaná jídla. Rozdíl proti CGM ukazuje, kde a o kolik se předpoklad mýlil.
+     meals: [{ ts, s, conf, aiRaw, implied, fitSpeed, ghost, g, gi, kat, fat, prot, speed }]
+     Vrací { grid, actual, carbs: [{ m, rate }], ins, insBasal, intervals: [{ a, b, kind, logged, fit, … }], stats }. */
+  function dayCurves({ from, to, readings, boluses, basal, basalBase, meals, settingsAt, therapy, cgmLag, step = 5 * MIN }) {
+    const lag = cgmLag ?? CGM_LAG, tp = therapy?.insulin === 'ultra' ? 55 : 75;
+    const set = t => (settingsAt ? settingsAt(t) : null);
+    if (!set(from) && !set(to)) return { error: 'chybí sacharidový poměr nebo citlivost v nastavení léčby' };
+    const isfAt = t => (set(t) || set(from) || set(to)).isf;
+    const scaleAt = t => { const x = set(t) || set(from) || set(to); return x.isf / x.icr; };
+    const grid = [];
+    for (let t = from; t <= to; t += step) grid.push(t);
+    const rd = (readings || []).filter(r => r.t >= from - 60 * MIN && r.t <= to + 15 * MIN).sort((a, b) => a.t - b.t);
+    // CGM v čase t (lineárně mezi hodnotami, mezera nejvýš 15 min)
+    let j = 0;
+    const cgmAt = t => {
+      if (!rd.length) return null;
+      while (j > 0 && rd[j].t > t) j--;
+      while (j < rd.length - 1 && rd[j + 1].t <= t) j++;
+      const a = rd[j], b = rd[j + 1];
+      if (!a) return null;
+      if (a.t === t) return a.v;
+      if (a.t < t && b && b.t - a.t <= 15 * MIN) return a.v + (b.v - a.v) * (t - a.t) / (b.t - a.t);
+      if (Math.abs(a.t - t) <= 5 * MIN) return a.v;
+      if (b && Math.abs(b.t - t) <= 5 * MIN) return b.v;
+      return null;
+    };
+
+    // Inzulin: bolusy + odchylky bazálu od obvyklého (po 5 min, chybějící záznamy z nejbližšího do 15 min).
+    const doses = dedupeBoluses(boluses).filter(b => b.t >= from - PRIOR_WIN && b.t <= to).map(b => ({ t: b.t, u: b.u, basal: false }));
+    if (basal?.length && basalBase != null) {
+      const recs = basal.filter(r => r.t >= from - PRIOR_WIN - 20 * MIN && r.t <= to + 20 * MIN).sort((a, b) => a.t - b.t);
+      let k = 0;
+      for (let t = from - PRIOR_WIN; t < to; t += 5 * MIN) {
+        while (k < recs.length - 1 && recs[k + 1].t <= t) k++;
+        let best = null;
+        for (const r of [recs[k], recs[k + 1]]) if (r && Math.abs(r.t - t) <= 15 * MIN && (!best || Math.abs(r.t - t) < Math.abs(best.t - t))) best = r;
+        if (best) doses.push({ t: t + 2.5 * MIN, u: (best.r - basalBase) * 5 / 60, basal: true });
+      }
+    }
+    // Jídla: kolik g (zapsané / přepočtené) a jak rychle
+    const gLogged = m => (m.ghost ? 0 : m.conf != null ? m.conf : m.s > 0 ? m.s : m.aiRaw || 0);
+    const gFit = m => (m.ghost ? m.g || 0 : m.conf != null ? m.conf : m.implied > 0 ? m.implied : gLogged(m));
+    const durOf = (m, fit) => absDuration({ ...m, speed: fit && m.fitSpeed > 0 ? m.fitSpeed : m.speed });
+    const carbCum = (m, t, fit) => { const g = fit ? gFit(m) : gLogged(m), x = (t - m.ts) / MIN; return g * absorbedFrac(x, durOf(m, fit)) + (m.ghost ? 0 : fpuAbs(m, x)); };
+    const ms = (meals || []).filter(m => m.ts >= from - PRIOR_WIN && m.ts <= to).sort((a, b) => a.ts - b.ts);
+
+    // Kumulativní vliv (mmol/l) v čase krve t − lag; projekce úseku = kotva + rozdíl proti začátku úseku.
+    const tb = grid.map(t => t - lag);
+    const cumL = tb.map(t => ms.reduce((a, m) => a + scaleAt(m.ts) * carbCum(m, t, false), 0));
+    const cumF = tb.map(t => ms.reduce((a, m) => a + scaleAt(m.ts) * carbCum(m, t, true), 0));
+    const cumI = tb.map(t => doses.reduce((a, d) => a + isfAt(d.t) * d.u * insulinActed((t - d.t) / MIN, tp), 0));
+    const h = step / (60 * MIN);
+    // Rychlosti (mmol/l za hodinu): sacharidy každého jídla (zapsané), inzulin celkem a z toho bazál.
+    const carbs = ms.filter(m => !m.ghost && m.ts >= from - 6 * 60 * MIN).map(m => ({ m, rate: tb.map(t => Math.max(0, scaleAt(m.ts) * (carbCum(m, t, false) - carbCum(m, t - step, false)) / h)) }));
+    const ghosts = ms.filter(m => m.ghost).map(m => ({ m, rate: tb.map(t => Math.max(0, scaleAt(m.ts) * (carbCum(m, t, true) - carbCum(m, t - step, true)) / h)) }));
+    const insRate = sel => tb.map(t => doses.filter(sel).reduce((a, d) => a + isfAt(d.t) * d.u * (insulinActed((t - d.t) / MIN, tp) - insulinActed((t - step - d.t) / MIN, tp)), 0) / h);
+    const ins = insRate(() => true), insBasal = insRate(d => d.basal);
+
+    // Úseky: od každého jídla (chody do 30 min = jedno) do dalšího jídla, nejvýš do konce jeho okna a 4 h;
+    // zbytek dne v mezerách po nejvýš 4 h. Každý úsek začíná skutečnou glykémií, takže chyba se nesčítá
+    // přes celý den a je vidět, kde vznikla (vliv dřívějších jídel a inzulinu se do úseku započítá).
+    const real = ms.filter(m => !m.ghost && m.ts >= from && m.ts < to);
+    const snap = t => from + Math.round((t - from) / step) * step;
+    const groups = [];
+    for (const m of real) { const g = groups[groups.length - 1]; if (g && m.ts - g[0].ts < 30 * MIN) g.push(m); else groups.push([m]); }
+    const ivs = [];
+    let cur = from;
+    const gaps = until => { for (let g0 = cur; until - g0 >= 20 * MIN; g0 += 4 * 60 * MIN) ivs.push({ a: g0, b: Math.min(until, g0 + 4 * 60 * MIN), kind: 'gap' }); cur = Math.max(cur, until); };
+    groups.forEach((g, i) => {
+      const a = snap(g[0].ts);
+      gaps(a);
+      const next = groups[i + 1] ? snap(groups[i + 1][0].ts) : to;
+      const b = Math.min(next, snap(Math.min(windowEnd(g), g[0].ts + 4 * 60 * MIN)), to);
+      if (b > a) { ivs.push({ a, b, kind: 'meal', meals: g }); cur = b; }
+    });
+    gaps(to);
+    const idx = t => Math.round((t - from) / step);
+    const actual = grid.map(cgmAt);
+    for (const iv of ivs) {
+      const ia = idx(iv.a), ib = Math.min(grid.length - 1, idx(iv.b));
+      const anchor = actual[ia];
+      if (anchor == null || ib <= ia) { iv.logged = iv.fit = null; continue; }
+      iv.logged = []; iv.fit = [];
+      for (let k = ia; k <= ib; k++) {
+        const ins0 = cumI[k] - cumI[ia];
+        iv.logged.push({ t: grid[k], v: anchor + cumL[k] - cumL[ia] - ins0 });
+        iv.fit.push({ t: grid[k], v: anchor + cumF[k] - cumF[ia] - ins0 });
+      }
+      // jak moc jsme se mýlili: průměr a maximum rozdílu CGM − předpověď, a stav na konci úseku
+      const d = iv.logged.map(p => { const v = actual[idx(p.t)]; return v == null ? null : { t: p.t, d: v - p.v }; }).filter(Boolean);
+      if (d.length) {
+        iv.mae = d.reduce((a, x) => a + Math.abs(x.d), 0) / d.length;
+        iv.max = d.reduce((a, x) => (Math.abs(x.d) > Math.abs(a.d) ? x : a));
+        const last = d[d.length - 1];
+        iv.endDiff = last.d; iv.endT = last.t;
+        iv.endG = last.d / scaleAt(iv.a); // ≈ g sacharidů (kladné = glykémie výš, než odpovídá zápisu a inzulinu)
+        const df = iv.fit.map(p => { const v = actual[idx(p.t)]; return v == null ? null : v - p.v; }).filter(x => x != null);
+        iv.maeFit = df.reduce((a, x) => a + Math.abs(x), 0) / df.length;
+      }
+    }
+    const withD = ivs.filter(iv => iv.mae != null && iv.kind === 'meal');
+    const stats = withD.length ? { mae: withD.reduce((a, iv) => a + iv.mae, 0) / withD.length, maeFit: withD.reduce((a, iv) => a + iv.maeFit, 0) / withD.length,
+      worst: withD.reduce((a, iv) => (Math.abs(iv.max.d) > Math.abs(a.max.d) ? iv : a)) } : null;
+    return { grid, actual, carbs, ghosts, ins, insBasal, intervals: ivs, stats, scale: scaleAt(from), lag };
   }
 
   // Osobní rychlost vstřebávání podle druhu jídla z dobře proložených křivek (log-průměr,
@@ -937,6 +1048,6 @@
     };
   }
 
-  root.LEARN = { CATS, catKey, GI_DUR, GI_LABEL, giKey, absDuration, absorbedFrac, clusterOf, windowEnd, postFor, isHeavy, fpu, fpuAbs, learnSpeed, BLOCKS, blockOf, segmentOf, evaluateSegment, dedupeBoluses, basalBaseline, ensemble, vendorWeights, vendorShares, vendorOf, VENDOR_LABEL, insulinActed, segmentAt, evaluateMeal, calibrate, applyCal, estimateKNone, combine, parseCareLink, REL_SD, MIN };
+  root.LEARN = { CATS, catKey, GI_DUR, GI_LABEL, giKey, absDuration, absorbedFrac, clusterOf, windowEnd, postFor, isHeavy, fpu, fpuAbs, learnSpeed, BLOCKS, blockOf, segmentOf, evaluateSegment, dedupeBoluses, basalBaseline, ensemble, vendorWeights, vendorShares, vendorOf, VENDOR_LABEL, insulinActed, segmentAt, evaluateMeal, dayCurves, calibrate, applyCal, estimateKNone, combine, parseCareLink, REL_SD, MIN };
   if (typeof module !== 'undefined') module.exports = root.LEARN;
 })(typeof window !== 'undefined' ? window : globalThis);

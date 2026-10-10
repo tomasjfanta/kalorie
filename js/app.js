@@ -132,10 +132,11 @@ function showView(name) {
   const isDnes = name === 'dnes';
   $('#bar-dnes').classList.toggle('hidden', !isDnes);
   $('#bar-title').classList.toggle('hidden', isDnes);
-  $('#bar-title').textContent = { historie: 'Historie', vaha: 'Váha', nastaveni: 'Nastavení', uceni: 'Učení' }[name] || '';
+  $('#bar-title').textContent = { historie: 'Historie', krivky: 'Křivky', vaha: 'Váha', nastaveni: 'Nastavení', uceni: 'Učení' }[name] || '';
   if (name === 'uceni') window.CARB?.renderLearn();
   if (name === 'dnes') renderDnes();
   if (name === 'historie') renderHistory();
+  if (name === 'krivky') window.CURVES?.render();
   if (name === 'vaha') renderWeight();
   if (name === 'nastaveni') { fillSettings(); window.JOBS?.renderDiag(); }
   window.scrollTo(0, 0);
@@ -974,7 +975,7 @@ window.KAL = {
   days: () => days, day: s => day(s), saveAll, settings: () => settings, saveSettings: () => store.set('kal.settings', settings),
   store, renderDnes, showView, entryConf, groupConf, badge, fmtC, vjTxt, TOL, esc, dstr, todayStr, fmtHuman,
   viewDate: () => viewDate, mealByHour, r0, r1, dec, num,
-  VERSION: 'v20',
+  VERSION: 'v21',
   aiConfig: () => aiCfg,
   setAiModel: m => { aiCfg.model = m; store.set('kal.ai', aiCfg); },  // zapamatuje funkční model ze zálohy
   openQuick,          // prefill rychlého zápisu z AI výsledku

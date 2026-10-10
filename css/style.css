@@ -414,3 +414,35 @@ code { font-size: 12.5px; background: var(--track); padding: 1px 5px; border-rad
 #sheet-cnew .btn-row { margin-top: 10px; }
 
 .warn-note { background: var(--c-mid-bg); color: var(--text); margin-bottom: 8px; }
+
+/* Křivky */
+.cv-nav { display: flex; align-items: center; justify-content: space-between; margin: 2px 0 6px; font-size: 16px; }
+.cv-nav button { font-size: 26px; line-height: 1; padding: 4px 16px; color: var(--accent); background: none; border: 0; }
+.cv-nav button:disabled { opacity: .25; }
+.cv-chips { margin: 4px 0 10px; }
+.cv-chips .chip { padding: 6px 10px; font-size: 13px; }
+.cv-card { padding: 10px 8px; }
+.cv-chart { width: 100%; height: auto; display: block; touch-action: pan-y; user-select: none; -webkit-user-select: none; }
+.cv-proj { fill: none; stroke: var(--amber); stroke-width: 2; stroke-dasharray: 5 3; }
+.cv-fit { fill: none; stroke: var(--accent); stroke-width: 1.8; stroke-dasharray: 1.5 2.5; }
+.cv-gap { fill: var(--amber); fill-opacity: .13; stroke: none; }
+.cv-act { fill: var(--amber); fill-opacity: .28; stroke: var(--amber); stroke-width: .8; }
+.cv-ghost { fill: var(--muted); fill-opacity: .18; stroke: var(--muted); stroke-width: .8; stroke-dasharray: 3 2; }
+.cv-ins { fill: var(--blue); fill-opacity: .25; stroke: var(--blue); stroke-width: .8; }
+.cv-basal { fill: none; stroke: #a86fc9; stroke-width: 1.1; stroke-dasharray: 3 2; }
+.cv-zero { stroke: var(--muted); stroke-width: .8; }
+.cv-grid { stroke: var(--border); stroke-width: .6; }
+.cv-ex { fill: var(--muted); fill-opacity: .12; }
+.cv-ghostline { stroke: var(--muted); stroke-width: 1.2; stroke-dasharray: 2 2; }
+.cv-autob { stroke: #a86fc9; stroke-width: 1; }
+.cv-cursor { stroke: var(--text); stroke-width: .8; opacity: .55; }
+.cv-read { font-size: 13px; min-height: 2.8em; margin: 6px 4px 0; font-variant-numeric: tabular-nums; line-height: 1.4; }
+.cv-legend { display: flex; flex-wrap: wrap; gap: 4px 12px; font-size: 12px; color: var(--muted); margin: 8px 4px 0; }
+.cv-legend i { display: inline-block; width: 16px; height: 0; border-top: 2px solid; vertical-align: middle; margin-right: 4px; }
+.cv-legend i.dash { border-top-style: dashed; }
+.cv-legend i.dot { border-top-style: dotted; }
+.cv-legend .sw { display: inline-block; width: 12px; height: 10px; opacity: .45; vertical-align: middle; margin-right: 4px; border-radius: 2px; }
+.cv-toggle { display: flex; align-items: center; gap: 6px; font-size: 13px; color: var(--muted); margin: 8px 4px 2px; }
+.cv-mealday { stroke-width: 1; opacity: .55; }
+.cv-up { color: var(--red); }
+.cv-dn { color: var(--blue); }
