@@ -907,6 +907,81 @@
     return out;
   }
 
+  /* ─── Kontrola nastavení: citlivost a sacharidový poměr z dat ─── */
+  // Citlivost (ISF) z korekcí nalačno — stejně jako test korekčního faktoru u diabetologa: korekce
+  // (vaše ≥ 1 U mimo jídlo, nebo shluk korekcí pumpy ≥ 1 U za 20 min), aspoň 4 h po jídle a 3 h bez
+  // jídla po ní, glykémie ≥ 8 a před korekcí ustálená (±1,5 mmol/l za h), bez hypoglykémie a pohybu.
+  // Za 3 h: pokles glykémie / jednotky, které v okně zapůsobily (korekce, další bolusy, bazál proti
+  // sazbě v hodině PŘED korekcí — ne proti dennímu mediánu, ten v sobě nese potřebu bazálu).
+  // Úseky nalačno bez korekce ISF neurčí: automatika tam přidává bazál právě podle potřeby.
+  function correctionEpisodes({ readings, boluses, basal, basalBase, meals, targets, from, to, tp = 75, cgmLag }) {
+    const lag = cgmLag ?? CGM_LAG, W = 180 * MIN, out = [];
+    const rd = (readings || []).filter(r => r.t >= from - 90 * MIN && r.t <= to + W + 15 * MIN).sort((a, b) => a.t - b.t);
+    const at = t => { // CGM v čase t (lineárně, mezera nejvýš 15 min)
+      let i = rd.findIndex(r => r.t >= t);
+      if (i < 0) return null;
+      if (rd[i].t === t || i === 0) return Math.abs(rd[i].t - t) <= 5 * MIN ? rd[i].v : null;
+      const a = rd[i - 1], b = rd[i];
+      return b.t - a.t <= 15 * MIN ? a.v + (b.v - a.v) * (t - a.t) / (b.t - a.t) : null;
+    };
+    const bol = dedupeBoluses(boluses).filter(b => b.t >= from - 5 * 60 * MIN && b.t <= to + W);
+    const ms = (meals || []).map(m => m.ts);
+    const recs = (basal || []).filter(r => r.t >= from - 6 * 60 * MIN && r.t <= to + W + 20 * MIN).sort((a, b) => a.t - b.t);
+    let busyUntil = -Infinity;
+    for (const b of bol) {
+      if (b.t < from || b.t >= to || b.t < busyUntil) continue;
+      const cluster = bol.filter(x => x.t >= b.t && x.t <= b.t + 20 * MIN);
+      const own = b.u >= 1, dose = own ? b.u : cluster.reduce((a, x) => a + x.u, 0);
+      if (dose < 1) continue;
+      if (ms.some(t => t > b.t - 4 * 60 * MIN && t < b.t + W)) continue;                       // jídlo blízko
+      if (bol.some(x => x.u >= 1 && x.t >= b.t - 3 * 60 * MIN && x.t < b.t)) continue;           // předchozí korekce ještě působí
+      if ((targets || []).some(g => g.t <= b.t + W && g.t + ((g.dur || 0) + 120) * MIN >= b.t - 60 * MIN)) continue;
+      const g0 = at(b.t), gPre = at(b.t - 30 * MIN), g1 = at(b.t + W);
+      if (g0 == null || gPre == null || g1 == null || g0 < 8) continue;
+      if (Math.abs(g0 - gPre) * 2 > 1.5) continue;                                                // před korekcí ustálená
+      if (rd.some(r => r.t >= b.t && r.t <= b.t + W && r.v < 4.5)) continue;
+      // bazál: sazba v hodině před korekcí jako výchozí
+      const pre = recs.filter(r => r.t >= b.t - 60 * MIN && r.t < b.t);
+      const preRate = pre.length >= 3 ? pre.reduce((a, r) => a + r.r, 0) / pre.length : basalBase;
+      const acted = (t, u) => u * (insulinActed((b.t + W - lag - t) / MIN, tp) - insulinActed((b.t - lag - t) / MIN, tp));
+      let E = bol.filter(x => x.t <= b.t + W).reduce((a, x) => a + acted(x.t, x.u), 0);
+      if (preRate != null && recs.length) {
+        for (let t = b.t - 5 * 60 * MIN; t < b.t + W; t += 5 * MIN) {
+          const r = recs.find(x => Math.abs(x.t - t) <= 7.5 * MIN);
+          if (r) E += acted(t + 2.5 * MIN, (r.r - preRate) * 5 / 60);
+        }
+      }
+      if (E < 0.5) continue;
+      out.push({ t: b.t, own, dose, bg0: g0, dBG: g1 - g0, E, isf: -(g1 - g0) / E });
+      busyUntil = b.t + W;
+    }
+    return out;
+  }
+  // Souhrn korekcí: medián (odolný vůči jedné zkažené), rozpětí; jisté od 3 korekcí s malým rozptylem.
+  function estimateISF(episodes, isfSet) {
+    const es = (episodes || []).filter(e => isFinite(e.isf));
+    if (!es.length) return { n: 0, set: isfSet };
+    const v = es.map(e => Math.min(8, Math.max(0.1, e.isf))).sort((a, b) => a - b);
+    const q = p => v[Math.min(v.length - 1, Math.max(0, Math.round(p * (v.length - 1))))];
+    const med = median(v);
+    return { n: es.length, own: es.filter(e => e.own).length, isf: med, lo: v[0], hi: v[v.length - 1], set: isfSet,
+      reliable: es.length >= 3 && med > 0.2 && (q(0.75) - q(0.25)) / med <= 0.6 };
+  }
+
+  // Sacharidový poměr z jídel se známým množstvím: inzulin, který jídlo nakonec potřebovalo
+  // (bolus + korekce a bazál pumpy navíc + zbylá glykémie / ISF) vs. známé gramy → g na 1 U.
+  // Rovná se poměru z pumpy / (kolikrát víc sacharidů glykémie „ukázala"). checks: [{ ts, ratio, icr }]
+  function ratioCheck(checks) {
+    const out = {};
+    for (const k of Object.keys(BLOCKS)) {
+      const cs = (checks || []).filter(c => blockOf(c.ts) === k && c.ratio > 0 && c.icr > 0);
+      if (!cs.length) { out[k] = { n: 0 }; continue; }
+      const eff = cs.map(c => c.icr / c.ratio).sort((a, b) => a - b);
+      out[k] = { n: cs.length, eff: Math.exp(median(eff.map(Math.log))), lo: eff[0], hi: eff[eff.length - 1], set: median(cs.map(c => c.icr)) };
+    }
+    return out;
+  }
+
   // Osobní rychlost vstřebávání podle druhu jídla z dobře proložených křivek (log-průměr,
   // smrštěný k celkové hodnotě a ta k 1 — s málo daty se nic nemění).
   // samples: [{ ts, kat, speed }] → { global, cats: { kat: { factor, n } } }
@@ -1134,6 +1209,6 @@
     };
   }
 
-  root.LEARN = { CATS, catKey, GI_DUR, GI_LABEL, giKey, absDuration, absorbedFrac, clusterOf, windowEnd, postFor, isHeavy, fpu, fpuAbs, learnSpeed, BLOCKS, blockOf, segmentOf, evaluateSegment, dedupeBoluses, basalBaseline, ensemble, vendorWeights, vendorShares, vendorOf, VENDOR_LABEL, insulinActed, segmentAt, evaluateMeal, dayCurves, dayStatsOf, weeklyTrend, timeOfDay, calibrate, applyCal, estimateKNone, combine, parseCareLink, REL_SD, MIN };
+  root.LEARN = { CATS, catKey, GI_DUR, GI_LABEL, giKey, absDuration, absorbedFrac, clusterOf, windowEnd, postFor, isHeavy, fpu, fpuAbs, learnSpeed, BLOCKS, blockOf, segmentOf, evaluateSegment, dedupeBoluses, basalBaseline, ensemble, vendorWeights, vendorShares, vendorOf, VENDOR_LABEL, insulinActed, segmentAt, evaluateMeal, dayCurves, dayStatsOf, weeklyTrend, timeOfDay, correctionEpisodes, estimateISF, ratioCheck, calibrate, applyCal, estimateKNone, combine, parseCareLink, REL_SD, MIN };
   if (typeof module !== 'undefined') module.exports = root.LEARN;
 })(typeof window !== 'undefined' ? window : globalThis);

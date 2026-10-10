@@ -97,18 +97,18 @@
 
   // „Křivky": jídla dne (zapsaná, z pumpy, odhalená nezapsaná), CGM, inzulin a nastavení pumpy.
   async function dayData(from, to) {
-    const W = 6 * 60 * MIN;
-    const entries = mealsWithTime().filter(e => e.ts >= from - W && e.ts <= to && (e.s > 0 || e.conf != null));
+    const W = 6 * 60 * MIN, A = 3 * 60 * MIN;
+    const entries = mealsWithTime().filter(e => e.ts >= from - W && e.ts <= to + A && (e.s > 0 || e.conf != null));
     const meals = entries.map(e => ({ ...asMeal(e), n: e.n, implied: e.ev?.implied && LEARN.REL_SD[e.ev.quality] ? e.ev.implied : null,
       fitSpeed: e.ev?.fit?.used ? e.ev.fit.speed : null }));
-    meals.push(...await pumpMeals(entries, from - W, to));
+    meals.push(...await pumpMeals(entries, from - W, to + A));
     for (const e of entries) for (const u of e.ev?.seg?.unlogged || []) {
-      if (u.t >= from - W && u.t <= to && !meals.some(m => m.ghost && Math.abs(m.ts - u.t) < 10 * MIN)) meals.push({ id: 'g' + u.t, ts: u.t, g: u.g, gi: 'střední', kat: 'ostatni', ghost: true });
+      if (u.t >= from - W && u.t <= to + A && !meals.some(m => m.ghost && Math.abs(m.ts - u.t) < 10 * MIN)) meals.push({ id: 'g' + u.t, ts: u.t, g: u.g, gi: 'střední', kat: 'ostatni', ghost: true });
     }
     const [readings, boluses, basal, pumpset, targets] = await Promise.all([
-      CGM.range('cgm', from - 60 * MIN, to + 15 * MIN),
-      CGM.range('bolus', from - 300 * MIN, to),
-      CGM.range('basal', from - DAY, to).catch(() => []),
+      CGM.range('cgm', from - 90 * MIN, to + A + 15 * MIN),
+      CGM.range('bolus', from - 300 * MIN, to + A),
+      CGM.range('basal', from - DAY, to + A).catch(() => []),
       CGM.range('pumpset', from - 30 * DAY, to + 30 * DAY),
       CGM.range('targets', from - 14 * 60 * MIN, to).catch(() => []),
     ]);
@@ -187,7 +187,7 @@
         winEnd: END, rise: ev.rise, tAbove10: ev.tAbove10, bolusLead: ev.bolusLead, final,
       };
       const ck = checks[m.id];
-      if (ck?.implied > 0 && ent.conf > 0) ent.ev.check = { implied: ck.implied, relSd: ck.relSd, quality: ck.quality, ratio: ck.implied / ent.conf };
+      if (ck?.implied > 0 && ent.conf > 0) ent.ev.check = { implied: ck.implied, relSd: ck.relSd, quality: ck.quality, ratio: ck.implied / ent.conf, icr: ck.icr };
     }
     return { ev: e.ev, ...w };
   }
@@ -785,7 +785,7 @@
   }
 
   /* ─── Souhrny dnů pro „Vývoj po týdnech" a „Co chybuje podle denní doby" (cache kal.cvStats) ─── */
-  const STATS_V = 1;
+  const STATS_V = 2; // v23: + korekce nalačno (citlivost)
   let statsBusy = false;
   const midnight = ds => { const [y, m, d] = ds.split('-').map(Number); return new Date(y, m - 1, d).getTime(); };
   async function ensureDayStats(days = 56) {
@@ -805,7 +805,11 @@
         if (old && old.sig === sig && (i > 2 || Date.now() - old.at < 60 * MIN)) continue;
         const dd = await dayData(from, to);
         if (dd.readings.filter(r => r.t >= from && r.t < to).length < 72) st.days[ds] = { sig, at: Date.now(), none: true };
-        else st.days[ds] = { sig, at: Date.now(), from, ...LEARN.dayStatsOf(LEARN.dayCurves({ from, to, ...dd }), dd.readings, from, to, dd.targets) };
+        else {
+          const corr = LEARN.correctionEpisodes({ from, to, ...dd, tp: therapy().insulin === 'ultra' ? 55 : 75 })
+            .map(e => ({ t: e.t, own: e.own, dose: e.dose, bg0: e.bg0, dBG: e.dBG, E: e.E, isf: e.isf }));
+          st.days[ds] = { sig, at: Date.now(), from, ...LEARN.dayStatsOf(LEARN.dayCurves({ from, to, ...dd }), dd.readings, from, to, dd.targets), corr };
+        }
         made++;
       }
       for (const k of Object.keys(st.days)) if (midnight(k) < t0 - (days + 7) * DAY) delete st.days[k];
@@ -813,6 +817,8 @@
       const sa = makeSettingsAt(ps);
       st.set = {};
       for (const [k, hr] of [['rano', 7], ['den', 13], ['vecer', 20]]) { const x = sa(t0 + hr * 3600e3); if (x) st.set[k] = x; }
+      const isfs = [3, 7, 13, 20].map(hr => sa(t0 + hr * 3600e3)?.isf).filter(x => x > 0);
+      st.isfSet = isfs.length ? isfs.sort((a, b) => a - b)[isfs.length >> 1] : null;
       K.store.set('kal.cvStats', st);
     } catch (err) { console.warn('dayStats', err); }
     finally { statsBusy = false; }
@@ -863,6 +869,46 @@
         <div class="tod-verdict${f.length ? ' warn-note' : ''}">${verdict}</div></div>`;
     }
     h += '<p class="muted small-text">Jen popis z vašich dat ve srovnání s nastavením pumpy, ne doporučení k dávkování. Rozlišit počítání od inzulinu umí jen jídla se známým množstvím — stačí 2–3 v každé denní době.</p></div>';
+    h += settingsCard(all, now, st, ds, tod);
+    return h;
+  }
+
+  // Kontrola nastavení pumpy: sacharidový poměr z jídel se známým množstvím (spolehlivé),
+  // citlivost z korekcí nalačno (u uzavřené smyčky jen orientačně — do výpočtů se nepoužívá), bazál.
+  function settingsCard(all, now, st, ds, tod) {
+    const fmtI = v => dec(K.r1(v));
+    const plural = (n, a, b, c) => (n === 1 ? a : n < 5 ? b : c);
+    const checks = all.filter(e => e.ts >= now - 90 * DAY && e.conf != null && e.ev?.check && LEARN.REL_SD[e.ev.check.quality])
+      .map(e => ({ ts: e.ts, ratio: e.ev.check.ratio, icr: e.ev.check.icr ?? e.ev.icr }));
+    const rc = LEARN.ratioCheck(checks);
+    let h = '<div class="card"><div class="card-title">Kontrola nastavení pumpy</div><p class="muted small-text">Z chvil ve vašich datech, které odpovídají běžným testům nastavení. Popis pro diabetologa, ne doporučení ke změně.</p>';
+    h += '<div class="tod-head">Sacharidový poměr (g na 1 U)</div>';
+    for (const [k, o] of Object.entries(rc)) {
+      const set = o.set ?? st?.set?.[k]?.icr;
+      let main = set ? fmtI(set) : '—', sub = 'potřebuje jídla se známým množstvím (obal, vážení)';
+      if (o.n) {
+        main = `${set ? fmtI(set) + ' → ' : ''}~${fmtI(o.eff)}`;
+        const v = o.n < 3 ? 'předběžné, chce to aspoň 3 jídla' : o.eff < 0.9 * o.set ? 'na 1 U připadá méně sacharidů, než počítá pumpa — jídla dostávala méně inzulinu, než potřebovala'
+          : o.eff > 1.1 * o.set ? 'na 1 U připadá víc sacharidů, než počítá pumpa — jídla dostávala víc inzulinu, než potřebovala' : 'sedí s nastavením';
+        sub = `${o.n} ${plural(o.n, 'jídlo', 'jídla', 'jídel')}${o.n > 1 ? ` · rozpětí ${fmtI(o.lo)}–${fmtI(o.hi)}` : ''} · ${v}`;
+      }
+      h += `<div class="learn-row"><span>${LEARN.BLOCKS[k].label}<br><span class="muted small-text">${sub}</span></span><b>${main}</b></div>`;
+    }
+    h += '<p class="muted small-text">Z jídel se známým množstvím: všechen inzulin, který jídlo nakonec potřebovalo (bolus + co pumpa sama přidala nebo ubrala + co zbylo v glykémii), proti známým gramům. Vlevo pumpa, vpravo data.</p>';
+
+    const eps = ds.filter(d => d.from >= now - 90 * DAY).flatMap(d => d.corr || []).sort((a, b) => b.t - a.t);
+    const est = LEARN.estimateISF(eps, st?.isfSet);
+    h += `<div class="tod-head">Citlivost na inzulin (${uLbl()} na 1 U)</div>`;
+    if (!est.n) h += '<p class="muted small-text">Zatím žádná korekce nalačno (vaše ≥ 1 U mimo jídlo nebo shluk korekcí pumpy ≥ 1 U; glykémie ≥ 8 a ustálená, 4 h po jídle, 3 h bez jídla po ní).</p>';
+    else {
+      h += `<div class="learn-row"><span>Korekce nalačno<br><span class="muted small-text">${est.n} ${plural(est.n, 'korekce', 'korekce', 'korekcí')} (${est.own} vašich)${est.n > 1 ? ` · rozpětí ${fmtBG(est.lo)}–${fmtBG(est.hi)}` : ''} · jen orientačně</span></span><b>${est.set ? fmtBG(est.set) + ' → ' : ''}~${fmtBG(est.isf)}</b></div>`;
+      h += eps.slice(0, 5).map(e => `<div class="tod-line small-text">${K.fmtHuman(K.dstr(new Date(e.t)))} ${hhmm(e.t)} · ${e.own ? 'vaše korekce' : 'korekce pumpy'} ${fmtI(e.dose)} U při ${fmtBG(e.bg0)} · za 3 h ${e.dBG > 0 ? '+' : '−'}${fmtBG(Math.abs(e.dBG))} · celkem zapůsobilo ${fmtI(e.E)} U → ${fmtBG(e.isf)}</div>`).join('');
+    }
+    h += `<p class="muted small-text">U 780G jen orientačně: po korekci pumpa sama přidává nebo ubírá inzulin podle toho, jak glykémie klesá, a v noci se mění i potřeba bazálu. Výsledek proto míchá citlivost s automatikou a vychází spíš nižší, než je skutečnost — aplikace ho do svých výpočtů nepoužívá. Spolehlivě citlivost změří řízený test korekce domluvený s diabetologem. V režimu SmartGuard pumpa podle všeho nastavenou citlivost pro automatické korekce nepoužívá (ověřte v manuálu).</p>`;
+
+    h += '<div class="tod-head">Bazál (nalačno, 5 h+ po jídle)</div>';
+    h += Object.entries(tod).map(([k, o]) => `<div class="tod-line">${LEARN.BLOCKS[k].label}: ${o.basal.hours ? `${o.basal.rate > 0.15 ? 'stoupá' : o.basal.rate < -0.15 ? 'klesá' : 'drží'}${Math.abs(o.basal.rate) > 0.15 ? ` ~${fmtBG(Math.abs(o.basal.rate))} ${uLbl()} za h` : ''} (${Math.round(o.basal.hours)} h dat)` : 'zatím bez úseku nalačno'}</div>`).join('');
+    h += '<p class="muted small-text">Proč poměr jen z jídel se známým množstvím: aplikace se učí sacharidy z glykémie podle poměru v pumpě. Když poměr nesedí, její čísla to částečně vyrovnají (zadáte víc nebo méně sacharidů) a odchylka poměru se schová. Známé množství ji odhalí.</p></div>';
     return h;
   }
 
