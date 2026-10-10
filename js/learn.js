@@ -782,7 +782,22 @@
     for (const m of real) { const g = groups[groups.length - 1]; if (g && m.ts - g[0].ts < 30 * MIN) g.push(m); else groups.push([m]); }
     const ivs = [];
     let cur = from;
-    const gaps = until => { for (let g0 = cur; until - g0 >= 20 * MIN; g0 += 4 * 60 * MIN) ivs.push({ a: g0, b: Math.min(until, g0 + 4 * 60 * MIN), kind: 'gap' }); cur = Math.max(cur, until); };
+    // Den začíná ještě v okně jídla z předchozího dne → ten úsek je dobíhání, ne „bez jídla".
+    const prevEnd = Math.max(from, ...ms.filter(m => !m.ghost && m.ts < from).map(m => Math.min(m.ts + postFor(m), from + 4 * 60 * MIN)));
+    if (prevEnd - from >= 20 * MIN) { cur = Math.min(to, snap(prevEnd)); ivs.push({ a: from, b: cur, kind: 'tail' }); }
+    // Mezery po nejvýš 4 h. „Nalačno" (fasting) až 5 h po posledním jídle (i odhaleném nezapsaném) —
+    // dřív v sobě mezera nese dobíhání jídla (tuk, bílkoviny, pomalé sacharidy) a o bazálu by nic neříkala.
+    const lastMealBefore = t => Math.max(-Infinity, ...ms.filter(m => m.ts < t).map(m => m.ts));
+    const gaps = until => {
+      for (let g0 = cur; until - g0 >= 20 * MIN;) {
+        const fast = lastMealBefore(g0 + 1) + 5 * 60 * MIN;
+        let b = Math.min(until, g0 + 4 * 60 * MIN);
+        if (fast - g0 >= 20 * MIN && b - fast >= 20 * MIN) b = snap(fast);
+        ivs.push({ a: g0, b, kind: 'gap', fasting: g0 >= fast - 20 * MIN });
+        g0 = b;
+      }
+      cur = Math.max(cur, until);
+    };
     groups.forEach((g, i) => {
       const a = snap(g[0].ts);
       gaps(a);
@@ -819,6 +834,77 @@
     const stats = withD.length ? { mae: withD.reduce((a, iv) => a + iv.mae, 0) / withD.length, maeFit: withD.reduce((a, iv) => a + iv.maeFit, 0) / withD.length,
       worst: withD.reduce((a, iv) => (Math.abs(iv.max.d) > Math.abs(a.max.d) ? iv : a)) } : null;
     return { grid, actual, carbs, ghosts, ins, insBasal, intervals: ivs, stats, scale: scaleAt(from), lag };
+  }
+
+  /* ─── Vývoj a rozbor podle denní doby (obrazovka Učení) ─── */
+  // Souhrn dne z křivek: CGM (čas v rozmezí, variabilita), přesnost předpovědi u jídel a odchylky bez jídla.
+  // Úseky bez jídla s hypoglykémií (řešení sacharidy, které nikdo nezapíše) nebo s pohybem se vynechají.
+  function dayStatsOf(cv, readings, from, to, targets) {
+    const rd = (readings || []).filter(r => r.t >= from && r.t < to);
+    const st = { n: rd.length, sum: 0, sumsq: 0, inR: 0, low: 0, high: 0, mae: null, maeFit: null, nMeal: 0, gaps: [] };
+    for (const r of rd) { st.sum += r.v; st.sumsq += r.v * r.v; if (r.v < 3.9) st.low++; else if (r.v > 10) st.high++; else st.inR++; }
+    if (!cv || cv.error) return st;
+    const ms = cv.intervals.filter(iv => iv.kind === 'meal' && iv.mae != null);
+    if (ms.length) {
+      st.nMeal = ms.length;
+      st.mae = ms.reduce((a, iv) => a + iv.mae, 0) / ms.length;
+      st.maeFit = ms.reduce((a, iv) => a + iv.maeFit, 0) / ms.length;
+    }
+    const k0 = t => Math.round((t - cv.grid[0]) / (cv.grid[1] - cv.grid[0]));
+    for (const iv of cv.intervals) {
+      if (iv.kind !== 'gap' || !iv.fasting || iv.mae == null || iv.b - iv.a < 2 * 60 * MIN) continue;
+      const act = cv.actual.slice(k0(iv.a), k0(iv.b) + 1);
+      if (act.some(v => v != null && v < 3.9)) continue;
+      if ((targets || []).some(g => g.t <= iv.b && g.t + ((g.dur || 0) + 120) * MIN >= iv.a)) continue;
+      const hours = (iv.endT - iv.a) / (60 * MIN);
+      if (hours >= 1.5) st.gaps.push({ t: (iv.a + iv.b) / 2, rate: iv.endDiff / hours, hours });
+    }
+    return st;
+  }
+
+  // Týdny (od pondělí): čas v rozmezí 3,9–10, variabilita (CV), průměrná odchylka předpovědi od CGM
+  // ze zapsaných sacharidů (mae) a po přepočtu z glykémie (maeFit). days: [{ from, ...dayStatsOf }]
+  function weeklyTrend(days) {
+    const W = {};
+    for (const d of days || []) {
+      if (!d || !(d.n >= 72)) continue; // aspoň ~6 h dat z CGM
+      const ws = new Date(d.from); ws.setDate(ws.getDate() - (ws.getDay() + 6) % 7); ws.setHours(0, 0, 0, 0);
+      const w = (W[+ws] ??= { start: +ws, days: 0, n: 0, sum: 0, sumsq: 0, inR: 0, low: 0, high: 0, maeW: 0, maeFitW: 0, nMeal: 0 });
+      w.days++; w.n += d.n; w.sum += d.sum; w.sumsq += d.sumsq; w.inR += d.inR; w.low += d.low; w.high += d.high;
+      if (d.mae != null) { w.maeW += d.mae * d.nMeal; w.maeFitW += d.maeFit * d.nMeal; w.nMeal += d.nMeal; }
+    }
+    return Object.values(W).sort((a, b) => b.start - a.start).map(w => {
+      const mean = w.sum / w.n, sd = Math.sqrt(Math.max(0, w.sumsq / w.n - mean * mean));
+      return { start: w.start, days: w.days, tir: w.inR / w.n, low: w.low / w.n, high: w.high / w.n, mean, cv: sd / mean,
+        mae: w.nMeal ? w.maeW / w.nMeal : null, maeFit: w.nMeal ? w.maeFitW / w.nMeal : null, nMeal: w.nMeal };
+    });
+  }
+
+  // Co chybuje v které denní době:
+  //  carb  — zadané sacharidy vs. skutečnost (štítek z glykémie nebo potvrzený): ratio > 1 = jídla měla víc
+  //  ins   — jídla se známým množstvím: glykémie se chovala, jako by měla ratio× tolik sacharidů
+  //          (> 1 = inzulin k jídlu v tuto dobu u vás pokrývá méně, než počítá nastavení pumpy)
+  //  basal — bez jídla: glykémie se odchylovala o rate mmol/l za hodinu od předpovědi (> 0 = stoupala)
+  // meals: [{ ts, logged, label }], checks: [{ ts, ratio }], gaps: [{ t, rate, hours }]
+  function timeOfDay({ meals = [], checks = [], gaps = [] }) {
+    const gm = xs => Math.exp(median(xs.map(Math.log)));
+    const out = {};
+    for (const k of Object.keys(BLOCKS)) {
+      const ms = meals.filter(m => blockOf(m.ts) === k && m.logged > 0 && m.label > 0);
+      const cs = checks.filter(c => blockOf(c.ts) === k && c.ratio > 0);
+      const gs = gaps.filter(g => blockOf(g.t) === k);
+      const hours = gs.reduce((a, g) => a + g.hours, 0);
+      const o = out[k] = {
+        carb: ms.length ? { ratio: gm(ms.map(m => m.label / m.logged)), n: ms.length } : { n: 0 },
+        ins: cs.length ? { ratio: gm(cs.map(c => c.ratio)), n: cs.length } : { n: 0 },
+        basal: hours ? { rate: gs.reduce((a, g) => a + g.rate * g.hours, 0) / hours, hours, n: gs.length } : { n: 0, hours: 0 },
+        flags: [],
+      };
+      if (o.carb.n >= 3 && Math.abs(Math.log(o.carb.ratio)) > 0.12) o.flags.push('carb');
+      if (o.ins.n >= 2 && Math.abs(Math.log(o.ins.ratio)) > 0.15) o.flags.push('ins');
+      if (o.basal.hours >= 6 && Math.abs(o.basal.rate) >= 0.3) o.flags.push('basal');
+    }
+    return out;
   }
 
   // Osobní rychlost vstřebávání podle druhu jídla z dobře proložených křivek (log-průměr,
@@ -1048,6 +1134,6 @@
     };
   }
 
-  root.LEARN = { CATS, catKey, GI_DUR, GI_LABEL, giKey, absDuration, absorbedFrac, clusterOf, windowEnd, postFor, isHeavy, fpu, fpuAbs, learnSpeed, BLOCKS, blockOf, segmentOf, evaluateSegment, dedupeBoluses, basalBaseline, ensemble, vendorWeights, vendorShares, vendorOf, VENDOR_LABEL, insulinActed, segmentAt, evaluateMeal, dayCurves, calibrate, applyCal, estimateKNone, combine, parseCareLink, REL_SD, MIN };
+  root.LEARN = { CATS, catKey, GI_DUR, GI_LABEL, giKey, absDuration, absorbedFrac, clusterOf, windowEnd, postFor, isHeavy, fpu, fpuAbs, learnSpeed, BLOCKS, blockOf, segmentOf, evaluateSegment, dedupeBoluses, basalBaseline, ensemble, vendorWeights, vendorShares, vendorOf, VENDOR_LABEL, insulinActed, segmentAt, evaluateMeal, dayCurves, dayStatsOf, weeklyTrend, timeOfDay, calibrate, applyCal, estimateKNone, combine, parseCareLink, REL_SD, MIN };
   if (typeof module !== 'undefined') module.exports = root.LEARN;
 })(typeof window !== 'undefined' ? window : globalThis);
