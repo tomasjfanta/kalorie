@@ -101,7 +101,7 @@ function entryConf(e) {
     r = { sigma: Math.hypot(info.C * LEARN.REL_SD.confirmed, 1), driver: 'confirmed' };
   } else if (e.cs === 'ai-photo' && e.ev?.implied && LEARN.REL_SD[e.ev.quality] && !e.excl) {
     // Glykémie po jídle je další nezávislý důkaz — spojit s AI odhadem a měřit vůči výsledku.
-    const post = LEARN.combine(info.C, r.sigma, e.ev.implied, e.ev.quality);
+    const post = LEARN.combine(info.C, r.sigma, e.ev.implied, e.ev.quality, e.ev.relSd);
     r = { sigma: post.sigma, driver: 'cgm' };
     shift = info.C - post.C;
   }
@@ -974,7 +974,7 @@ window.KAL = {
   days: () => days, day: s => day(s), saveAll, settings: () => settings, saveSettings: () => store.set('kal.settings', settings),
   store, renderDnes, showView, entryConf, groupConf, badge, fmtC, vjTxt, TOL, esc, dstr, todayStr, fmtHuman,
   viewDate: () => viewDate, mealByHour, r0, r1, dec, num,
-  VERSION: 'v17',
+  VERSION: 'v18',
   aiConfig: () => aiCfg,
   setAiModel: m => { aiCfg.model = m; store.set('kal.ai', aiCfg); },  // zapamatuje funkční model ze zálohy
   openQuick,          // prefill rychlého zápisu z AI výsledku

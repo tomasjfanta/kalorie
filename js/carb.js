@@ -38,7 +38,7 @@
   function samples() {
     return photoEntries().filter(e => !e.excl && e.aiRaw).map(e => {
       if (e.conf != null) return { ts: e.ts, kat: e.kat, aiRaw: e.aiRaw, label: e.conf, src: 'confirmed' };
-      if (e.ev?.implied && (e.ev.quality === 'good' || e.ev.quality === 'fair')) return { ts: e.ts, kat: e.kat, aiRaw: e.aiRaw, label: e.ev.implied, src: e.ev.quality };
+      if (e.ev?.implied && (e.ev.quality === 'good' || e.ev.quality === 'fair')) return { ts: e.ts, kat: e.kat, aiRaw: e.aiRaw, label: e.ev.implied, src: e.ev.quality, labSd: e.ev.relSd };
       return null;
     }).filter(Boolean);
   }
@@ -88,23 +88,6 @@
     return out;
   }
 
-  // Data pro okno celého shluku jídel (překrývající se jídla se vyhodnocují společně).
-  async function loadWindow(e, meals) {
-    const cl = LEARN.clusterOf(asMeal(e), meals.filter(m => m.id !== e.id));
-    const T0 = cl[0].ts, END = LEARN.windowEnd(cl);
-    const [readings, boluses, basal, pumpset, targets] = await Promise.all([
-      CGM.range('cgm', T0 - PRE, END),
-      CGM.range('bolus', T0 - 300 * MIN, END),
-      CGM.range('basal', T0 - DAY, END).catch(() => []),
-      CGM.range('pumpset', T0 - 30 * DAY, T0 + 30 * DAY),
-      CGM.range('targets', T0 - 14 * 60 * MIN, END).catch(() => []),
-    ]);
-    // Obvyklý automatický bazál z předchozích 24 h — jen když je dat dost (aspoň ~8 h).
-    const before = basal.filter(r => r.t < T0 - 30 * MIN);
-    const basalBase = before.length >= 96 ? LEARN.basalBaseline(before) : null;
-    return { readings, boluses, basal, basalBase, pumpset, targets };
-  }
-
   // Sacharidy zadané do pumpy (bolusový kalkulátor) bez fotky do 30 min → známé jídlo v bilanci
   // (jinak by se jejich vliv na glykémii připsal vyfocenému jídlu).
   async function pumpMeals(entries, from, to) {
@@ -118,32 +101,60 @@
     return out;
   }
 
+  // Vyhodnotí celý segment, do kterého jídlo patří (navazující jídla společně), a výsledky zapíše
+  // všem jeho jídlům. Bez inzulinu (léčba „bez inzulinu") se jídla vyhodnocují jednotlivě postaru.
   async function evaluate(e) {
-    const entries = mealsWithTime().filter(x => Math.abs(x.ts - e.ts) < DAY);
-    const meals = [...entries.map(asMeal), ...await pumpMeals(entries, e.ts - DAY, e.ts + DAY)];
-    const w = await loadWindow(e, meals);
-    const manual = {};
-    if (e.man?.bg0) manual.bg0 = e.man.bg0;
-    if (e.man?.bg2) manual.bg2 = e.man.bg2;
-    if (e.units) manual.units = e.units;
-    const ev = LEARN.evaluateMeal(
-      { ...asMeal(e), aiRaw: e.aiRaw, speed: catSpeed(e.kat), manual },
-      { readings: w.readings, boluses: w.boluses, basal: w.basal, basalBase: w.basalBase, targets: w.targets,
-        meals: meals.filter(m => m.id !== e.id), settingsAt: makeSettingsAt(w.pumpset) },
-      therapy(), therapy().type === 'none' ? kNone() : null);
-    e.ev = {
-      implied: ev.implied, quality: ev.quality, flags: ev.flags, bg0: ev.bg0, peak: ev.peak, tPeak: ev.tPeak,
-      end: ev.end, iauc: ev.iauc, coverage: ev.coverage, units: ev.units, absorbed: ev.absorbed,
-      icr: ev.icr, isf: ev.isf, n: w.readings.length, at: Date.now(),
-      ins: ev.ins, del: ev.del, coveredCarbs: ev.coveredCarbs, extraCarbs: ev.extraCarbs, basalOk: ev.basalOk,
-      endSlope15: ev.endSlope15, stable: ev.stable, cluster: ev.cluster, share: ev.share, priorCarbs: ev.priorCarbs,
-      dur: ev.dur, gi: ev.gi, manCarbs: ev.manCarbs, pumpMeals: ev.pumpMeals,
-      fit: ev.fit, impliedEnd: ev.impliedEnd, hypo: ev.hypo, exercise: ev.exercise, alcohol: ev.alcohol,
-      heavy: ev.heavy, fpu: ev.fpu, fpuCarbs: ev.fpuCarbs, winEnd: ev.winEnd, rise: ev.rise, tAbove10: ev.tAbove10,
-      bolusLead: ev.bolusLead,
-      final: Date.now() > (ev.winEnd || e.ts + POST) + 10 * MIN,
-    };
-    return { ev, ...w };
+    const entries = mealsWithTime().filter(x => Math.abs(x.ts - e.ts) < 2 * DAY);
+    const all = [...entries.map(asMeal), ...await pumpMeals(entries, e.ts - 2 * DAY, e.ts + 2 * DAY)];
+    const me = all.find(m => m.id === e.id);
+    me.speed = catSpeed(e.kat);
+    const segMeals = LEARN.segmentOf(me, all);
+    const T0 = segMeals[0].ts, END = LEARN.windowEnd(segMeals);
+    const [readings, boluses, basal, pumpset, targets] = await Promise.all([
+      CGM.range('cgm', T0 - PRE, END),
+      CGM.range('bolus', T0 - 300 * MIN, END),
+      CGM.range('basal', T0 - DAY, END).catch(() => []),
+      CGM.range('pumpset', T0 - 30 * DAY, T0 + 30 * DAY),
+      CGM.range('targets', T0 - 14 * 60 * MIN, END).catch(() => []),
+    ]);
+    const before = basal.filter(r => r.t < T0 - 30 * MIN);
+    const basalBase = before.length >= 96 ? LEARN.basalBaseline(before) : null;
+    const w = { readings, boluses };
+    const byId = Object.fromEntries(entries.map(x => [x.id, x]));
+    for (const m of segMeals) {
+      const ent = byId[m.id];
+      if (!ent) continue;
+      const man = {};
+      if (ent.man?.bg0) man.bg0 = ent.man.bg0;
+      if (ent.man?.bg2) man.bg2 = ent.man.bg2;
+      if (ent.units) man.units = ent.units;
+      m.manual = man;
+    }
+    const data = { readings, boluses, basal, basalBase, targets, settingsAt: makeSettingsAt(pumpset),
+      prior: all.filter(m => m.ts < T0 && m.ts >= T0 - 300 * MIN) };
+    let results;
+    if (therapy().type === 'none') {
+      results = {};
+      for (const m of segMeals) if (byId[m.id]) results[m.id] = LEARN.evaluateMeal(m, { ...data, meals: all.filter(x => x.id !== m.id) }, therapy(), kNone());
+    } else {
+      results = LEARN.evaluateSegment(segMeals, data, therapy()).results;
+    }
+    const final = Date.now() > END + 10 * MIN;
+    for (const m of segMeals) {
+      const ent = byId[m.id], ev = results[m.id];
+      if (!ent || !ev) continue;
+      ent.ev = {
+        implied: ev.implied, relSd: ev.relSd, quality: ev.quality, flags: ev.flags, bg0: ev.bg0, peak: ev.peak, tPeak: ev.tPeak,
+        end: ev.end, iauc: ev.iauc, coverage: ev.coverage, units: ev.units, absorbed: ev.absorbed,
+        icr: ev.icr, isf: ev.isf, n: readings.length, at: Date.now(),
+        del: ev.del, coveredCarbs: ev.coveredCarbs, extraCarbs: ev.extraCarbs, manCarbs: ev.manCarbs, basalOk: ev.basalOk,
+        endSlope15: ev.endSlope15, stable: ev.stable, cluster: ev.cluster, share: ev.share, sitting: ev.sitting,
+        unlogged: ev.unlogged, seg: ev.seg, dur: ev.dur, gi: ev.gi, pumpMeals: ev.pumpMeals,
+        fit: ev.fit, hypo: ev.hypo, exercise: ev.exercise, alcohol: ev.alcohol, heavy: ev.heavy, fpu: ev.fpu, fpuCarbs: ev.fpuCarbs,
+        winEnd: END, rise: ev.rise, tAbove10: ev.tAbove10, bolusLead: ev.bolusLead, final,
+      };
+    }
+    return { ev: e.ev, ...w };
   }
 
   /* ─── Průběžná synchronizace a vyhodnocení (bez tlačítek — samo při otevření a každých 5 min) ─── */
@@ -177,10 +188,11 @@
     try {
       prunePhotos();
       await nsAutoSync();
-      const all = photoEntries(), now = Date.now(), changed = [];
+      const all = photoEntries(), now = Date.now(), changed = [], start = Date.now();
       for (const e of all) {
         if (e.ts > now || now - e.ts > 45 * DAY) continue;
         if (e.ev?.final && e.ev.at >= dataAt()) continue;
+        if (e.ev?.at >= start) continue; // už spočítáno v rámci segmentu jiného jídla
         await evaluate(e); changed.push(e);
       }
       if (changed.length) { K.saveAll(); invalidate(); }
@@ -587,6 +599,11 @@
       if (ev?.end != null && ev.endSlope15 != null) {
         h += `<div class="ev-metrics">Na konci okna ${fmtBG(ev.end)} ${uLbl()} — ${ev.stable ? 'ustálená' : ev.endSlope15 > 0 ? 'ještě stoupá' : 'ještě klesá'} (${ev.endSlope15 >= 0 ? '+' : '−'}${fmtBG(Math.abs(ev.endSlope15))} za 15 min).</div>`;
       }
+      if (ev?.seg?.n > 1) h += `<div class="ev-metrics">🔗 Vyhodnoceno společně s ${ev.seg.n - 1} navazujícími jídly (celá křivka, každé jídlo od svého času)${ev.relSd != null ? ` — přesnost tohoto jídla ±${Math.round(ev.relSd * 100)} %` : ''}${ev.sitting ? '; fotky do 20 min od sebe se počítají jako jedno sezení' : ''}.</div>`;
+      if (ev?.unlogged) {
+        h += `<div class="ev-box">🤔 Průběh glykémie naznačuje jídlo, které tu není — kolem <b>${hhmm(ev.unlogged.t)}</b>, asi <b>${r0(ev.unlogged.g)} g</b>. Pokud jste tehdy něco snědli, zapište to — výpočet okolních jídel se zpřesní.
+          <div class="ev-actions"><input id="cm-ul-g" type="text" inputmode="decimal" value="${r0(ev.unlogged.g)}"><span class="unit">g v</span><input id="cm-ul-t" type="time" value="${hhmm(ev.unlogged.t)}"><button id="cm-ul-add" class="btn slim">Zapsat</button></div></div>`;
+      }
       const photoNeighbours = (ev?.cluster || []).filter(t => !(ev.pumpMeals || []).some(p => p.ts === t));
       if (photoNeighbours.length) h += `<div class="ev-metrics">🍽 Vyhodnoceno společně s jídlem v ${photoNeighbours.map(hhmm).join(', ')}${ev.share != null && ev.share < 1 ? ` — podíl tohoto jídla ~${Math.round(ev.share * 100)} %` : ''}.</div>`;
       if (ev?.dur) h += `<div class="ev-metrics">Vstřebávání: ${LEARN.GI_LABEL[ev.gi] || 'podle druhu jídla'}${ev.absorbed != null ? ` — do konce okna ~${Math.round(ev.absorbed * 100)} %` : ''}.</div>`;
@@ -599,7 +616,7 @@
       const wEnd = e.ts + LEARN.postFor(asMeal(e)), pendingWin = Date.now() < wEnd;
       if (ev?.implied && LEARN.REL_SD[ev.quality]) {
         const prior = CONF.entrySigma({ C: e.s, kind: 'ai-photo', jist: e.jist, sMin: e.sMin, sMax: e.sMax, sSd: e.sSd, learnedSd: cal().sd }).sigma;
-        const post = LEARN.combine(e.s, prior, ev.implied, ev.quality);
+        const post = LEARN.combine(e.s, prior, ev.implied, ev.quality, ev.relSd);
         h += `<div class="ev-box">Podle glykémie a inzulinu mělo jídlo nejspíš <b>~${r0(ev.implied)} g</b> sacharidů (spolehlivost výpočtu: ${QLBL[ev.quality]}).<br>Spojeno s odhadem z fotky: <b>${r0(post.C)} g</b> (±${r0(CONF.Z90 * post.sigma)} g).</div>`;
         if (e.conf == null && !e.excl) h += `<div class="ev-actions"><input id="cm-conf" type="text" inputmode="decimal" value="${r0(post.C)}"><span class="unit">g</span><button id="cm-confirm" class="btn slim">✓ Potvrdit jako skutečnost</button></div>`;
       } else if (pendingWin) {
@@ -651,6 +668,14 @@
       e.man = { bg0: toMmol($('#cm-bg0').value), bg2: toMmol($('#cm-bg2').value) };
       if (!e.man.bg0 || !e.man.bg2) { K.toast('Zadejte obě hodnoty'); return; }
       after();
+    });
+    // Doplnění nezapsaného jídla (ruční zápis sacharidů) — v dalším výpočtu je to známá hodnota.
+    $('#cm-ul-add')?.addEventListener('click', () => {
+      const g = K.num($('#cm-ul-g').value);
+      if (!(g > 0)) { K.toast('Zadejte sacharidy'); return; }
+      const ts = tsFromTime(e.ev.unlogged.t, $('#cm-ul-t').value);
+      K.day(K.dstr(new Date(ts))).e.push({ id: 'm' + Date.now(), n: 'Doplněné jídlo', q: 1, s: g, cs: 'manual', ts, meal: 'sv' });
+      after(); K.toast(`Zapsáno: ${r0(g)} g v ${hhmm(ts)} — okolní jídla se přepočítají`);
     });
     $('#cm-units-save')?.addEventListener('click', () => { const u = K.num($('#cm-units').value); if (u > 0) e.units = u; else delete e.units; after(); });
     $('#cm-save')?.addEventListener('click', async () => {
