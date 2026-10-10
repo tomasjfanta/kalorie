@@ -362,6 +362,9 @@
   const SITTING_GAP = 20 * MIN;
   const LOOSE = 1.0;     // předpoklad pro „štítek" k učení: ±100 % kolem odhadu AI (data rozhodují)
   const DRIFT_SD = 0.4;  // mmol/l za hodinu
+  const SPEEDS = [0.71, 0.8, 0.9, 1, 1.12, 1.25, 1.4];
+  const TAIL_D = 240;    // min — pozdní dobíhání předchozího jídla (pomalá složka)
+  const RAMP_SD = 1.0;   // mmol/l za hodinu — chybějící bazál od určité chvíle
 
   // Gaussova eliminace: inverze malé symetrické matice.
   function invert(M) {
@@ -477,13 +480,17 @@
     const tau = pts.map(p => (p.t - T0) / (60 * MIN));
 
     // Jedno řešení pro danou rychlost: Huber-vážené nejmenší čtverce s předpokladem (3 iterace).
-    // ghosts = odhalená nezapsaná jídla [{t, g}] jako další (nejistý) vstup.
+    // extra = další (nejisté) vstupy modelu { f: t → vliv jedné jednotky na glykémii, mu, sd }:
+    // nezapsané jídlo (g), pozdní dobíhání předchozího jídla (g), chybějící bazál (mmol/l za hodinu).
     const ghostMeal = t => ({ ts: t, gi: 'střední', kat: 'ostatni' });
-    function solve(sp, sigFix, ghosts = []) {
+    const ghostTerm = g => ({ f: t => scale(g.t) * absIn(ghostMeal(g.t), t), mu: g.g, sd: 12 });
+    const tailTerm = (m, start, sd) => ({ f: t => scale(m.ts) * (absorbedFrac((t - start) / MIN, TAIL_D) - absorbedFrac(Math.max(0, T0 - start) / MIN, TAIL_D)), mu: 0, sd });
+    const rampTerm = start => ({ f: t => Math.max(0, t - start) / (60 * MIN), mu: 0, sd: RAMP_SD });
+    function solve(sp, sigFix, extra = []) {
       const X = pts.map((p, k) => [...sittings.map(S => S.members.reduce((a, m) => a + scale(m.ts) * est(m) / S.E * absIn(m, p.t, (m.speed > 0 ? m.speed : 1) * sp), 0)), tau[k],
-        ...ghosts.map(g => scale(g.t) * absIn(ghostMeal(g.t), p.t))]);
-      const mu0 = [...sittings.map(S => S.E), 0, ...ghosts.map(g => g.g)];
-      const prec0 = [...sittings.map(S => 1 / (LOOSE * S.E) ** 2), 1 / DRIFT_SD ** 2, ...ghosts.map(() => 1 / 12 ** 2)];
+        ...extra.map(e => e.f(p.t))]);
+      const mu0 = [...sittings.map(S => S.E), 0, ...extra.map(e => e.mu)];
+      const prec0 = [...sittings.map(S => 1 / (LOOSE * S.E) ** 2), 1 / DRIFT_SD ** 2, ...extra.map(e => 1 / e.sd ** 2)];
       const nParam = mu0.length;
       let w = pts.map(() => 1), sig = sigFix || 0.6, beta = mu0, cov = null;
       for (let it = 0; it < 4; it++) {
@@ -510,15 +517,45 @@
     }
     const first = solve(1);
     if (!first) return fail('výpočet se nepodařil');
+    const bestOf = (terms, sig) => {
+      let b = null;
+      for (const sp of SPEEDS) { const r = solve(sp, sig, terms); if (r && (!b || r.J < b.J)) b = r; }
+      return b;
+    };
     let best = first;
-    for (const sp of [0.71, 0.8, 0.9, 1.12, 1.25, 1.4]) {
-      const r = solve(sp, first.sig);
-      if (r && r.J < best.J) best = r;
-    }
+    { const g = bestOf([], first.sig); if (g && g.J < best.J) best = g; }
     const mv = pts.reduce((a, p) => a + p.v, 0) / pts.length;
     const sst = pts.reduce((a, p) => a + (p.v - mv) ** 2, 0);
     const r2 = sst > 0 ? 1 - best.res.reduce((a, r) => a + r * r, 0) / sst : 0;
     const outliers = best.w.filter(x => x < 0.6).length;
+
+    // ── „Nic jsem nejedl" ──
+    // U navrženého nezapsaného jídla uživatel potvrdil, že tehdy nejedl. Vzestup pak musí vysvětlit
+    // něco jiného: (a) předchozí jídlo dobíhalo déle, než model čekal (tuk, bílkoviny, pomalé sacharidy —
+    // dávka k jídlu ho nepokryla celé), nebo (b) bazál od určité chvíle nestačil (stálý tlak nahoru).
+    // Obě vysvětlení jsou v modelu jako nejisté vstupy; které z nich samo sedí výrazně lépe, to se
+    // uživateli řekne. Když se nedají rozlišit, zůstanou v modelu obě a nejistota jídel kolem vzroste.
+    const alts = [], noMeal = [];
+    for (const tR of (data.noMeal || []).filter(t => t > T0 && t < Tend).sort((a, b) => a - b)) {
+      const prev = [...meals, ...(data.prior || [])].filter(m => m.ts <= tR - 20 * MIN && m.ts >= tR - 6 * 60 * MIN).sort((a, b) => b.ts - a.ts)[0];
+      const J = terms => solve(best.sp, first.sig, [...alts, ...terms])?.J ?? Infinity;
+      const pick = list => list.reduce((b, x) => { const j = J([x.term]); return j < b.j ? { ...x, j } : b; }, { j: Infinity });
+      const ramp = pick([60, 30, 0].map(d => tR - d * MIN).filter(st => st >= T0).map(st => ({ st, term: rampTerm(st) })));
+      let tail = { j: Infinity };
+      if (prev) {
+        const g0 = prev.conf != null ? prev.conf : est(prev) || prev.s || 30;
+        tail = pick([30, 60, 90, 120, 150, 180, 240].map(d => prev.ts + d * MIN).filter(st => st <= tR)
+          .map(st => ({ st, term: tailTerm(prev, st, Math.max(10, 0.6 * g0)) })));
+      }
+      const why = !(tail.j < Infinity) ? 'basal' : tail.j + 4 <= ramp.j ? 'tail' : ramp.j + 4 <= tail.j ? 'basal' : 'both';
+      const nm = { t: tR, why, prevTs: prev?.ts ?? null, prevKat: prev?.kat ?? null, prevId: prev?.id ?? null,
+        dJ: tail.j < Infinity && ramp.j < Infinity ? ramp.j - tail.j : null }; // > 0: dobíhání sedí lépe
+      if (why !== 'basal') { nm.tailIdx = alts.length; nm.tailFrom = tail.st; alts.push(tail.term); }
+      if (why !== 'tail' && ramp.j < Infinity) { nm.rampIdx = alts.length; nm.rampFrom = ramp.st; alts.push(ramp.term); }
+      noMeal.push(nm);
+    }
+    if (alts.length) best = bestOf(alts, first.sig) || best;
+    const nearNoMeal = t => (data.noMeal || []).some(x => Math.abs(x - t) <= 60 * MIN);
 
     // ── Nezapsané jídlo? ──
     // S volným předpokladem by vyfocená jídla „spolkla" i sacharidy, které nikdo nezapsal (křivka pak
@@ -528,16 +565,16 @@
     const unlogged = [];
     {
       const cand = [];
-      for (let t = T0 + 20 * MIN; t <= Tend - 60 * MIN; t += 20 * MIN) if (!meals.some(m => Math.abs(m.ts - t) <= 25 * MIN)) cand.push(t);
+      for (let t = T0 + 20 * MIN; t <= Tend - 60 * MIN; t += 20 * MIN) if (!meals.some(m => Math.abs(m.ts - t) <= 25 * MIN) && !nearNoMeal(t)) cand.push(t);
       if (cand.length) {
         const ghost = t => ({ ts: t, gi: 'střední', kat: 'ostatni' });
         const mkX = withC => pts.map((p, k) => [
           ...sittings.map(S => S.members.reduce((a, m) => a + scale(m.ts) * est(m) / S.E * absIn(m, p.t, (m.speed > 0 ? m.speed : 1) * best.sp), 0)),
-          tau[k], ...(withC ? cand.map(c => scale(c) * absIn(ghost(c), p.t)) : [])]);
+          tau[k], ...alts.map(e => e.f(p.t)), ...(withC ? cand.map(c => scale(c) * absIn(ghost(c), p.t)) : [])]);
         const fit = withC => {
           const X = mkX(withC), n = X[0].length;
-          const mu0 = [...sittings.map(S => S.E), 0, ...(withC ? cand.map(() => 0) : [])];
-          const prec0 = [...sittings.map(S => 1 / (0.35 * S.E) ** 2), 1 / DRIFT_SD ** 2, ...(withC ? cand.map(() => 1 / 15 ** 2) : [])];
+          const mu0 = [...sittings.map(S => S.E), 0, ...alts.map(e => e.mu), ...(withC ? cand.map(() => 0) : [])];
+          const prec0 = [...sittings.map(S => 1 / (0.35 * S.E) ** 2), 1 / DRIFT_SD ** 2, ...alts.map(e => 1 / e.sd ** 2), ...(withC ? cand.map(() => 1 / 15 ** 2) : [])];
           const A = Array.from({ length: n }, (_, i) => Array.from({ length: n }, (_, j) => (i === j ? prec0[i] : 0)));
           const b = mu0.map((m, i) => prec0[i] * m);
           for (let k = 0; k < pts.length; k++) {
@@ -552,7 +589,7 @@
         };
         const f0 = fit(false), f1 = fit(true);
         if (f0 && f1 && f0.J - f1.J >= 6) {
-          const u = f1.be.slice(sittings.length + 1);
+          const u = f1.be.slice(sittings.length + 1 + alts.length);
           // sečíst sousední kandidáty (vstup se mezi ně rozloží) a hlásit výrazné shluky
           for (let i = 0; i < cand.length; i++) {
             const win = cand.map((c, j) => ({ c, g: u[j] })).filter(x => Math.abs(x.c - cand[i]) <= 30 * MIN && x.g > 0);
@@ -575,16 +612,21 @@
       const sxx = last.reduce((a, r) => a + (r.t - mt) ** 2, 0);
       endSlope15 = sxx > 0 ? last.reduce((a, r) => a + (r.t - mt) * (r.v - lv), 0) / sxx * 15 * MIN : 0;
     }
-    if (unlogged.length) {
-      const refit = solve(best.sp, null, unlogged);
+    if (unlogged.length || alts.length) {
+      const refit = solve(best.sp, null, [...alts, ...unlogged.map(ghostTerm)]);
       if (refit) {
         best = refit;
-        for (let k = 0; k < unlogged.length; k++) unlogged[k].g = Math.max(0, best.beta[sittings.length + 1 + k]);
+        const o = sittings.length + 1;
+        for (let k = 0; k < unlogged.length; k++) unlogged[k].g = Math.max(0, best.beta[o + alts.length + k]);
+        for (const nm of noMeal) {
+          if (nm.tailIdx != null) nm.tailG = best.beta[o + nm.tailIdx];
+          if (nm.rampIdx != null) nm.slope = best.beta[o + nm.rampIdx];
+        }
       }
     }
     const r2f = sst > 0 ? 1 - best.res.reduce((a, r) => a + r * r, 0) / sst : 0;
     const seg = { T0, Tend, n: pts.length, nMeals: meals.length, sittings: sittings.length, rmse: best.rms, r2: r2f, speed: best.sp,
-      drift: best.beta[sittings.length], outliers, excluded: excl.map(x => x[2]), basalOk, del, unlogged,
+      drift: best.beta[sittings.length], outliers, excluded: excl.map(x => x[2]), basalOk, del, unlogged, noMeal,
       coveredCarbs: s0.icr * del.meal, extraCarbs: s0.icr * (del.auto + del.basal), manCarbs: s0.icr * del.man };
     out.seg = seg;
     const fitOk = best.rms <= 1.2 && r2f >= 0.3;
@@ -594,7 +636,12 @@
       const r = base(m);
       Object.assign(r, { bg0, end, endSlope15, stable: endSlope15 != null ? Math.abs(endSlope15) <= 0.5 : null, basalOk,
         del, coveredCarbs: seg.coveredCarbs, extraCarbs: seg.extraCarbs, manCarbs: seg.manCarbs, icr: s0.icr, isf: s0.isf,
-        seg: { n: seg.nMeals, sittings: seg.sittings, rmse: seg.rmse, r2: r2f, unlogged } });
+        seg: { n: seg.nMeals, sittings: seg.sittings, rmse: seg.rmse, r2: r2f, unlogged, noMeal } });
+      // „nic jsem nejedl" poblíž: čím se vzestup vysvětlil (pro zobrazení u jídla)
+      const nmNear = noMeal.filter(x => x.t >= m.ts - 150 * MIN && x.t <= m.ts + postFor(m)).sort((a, b) => Math.abs(a.t - m.ts) - Math.abs(b.t - m.ts))[0];
+      if (nmNear) r.noMeal = nmNear;
+      const ownTail = noMeal.find(x => x.prevId != null && x.prevId === m.id && x.why === 'tail' && x.tailG >= 3);
+      if (ownTail) r.tail = { g: ownTail.tailG, from: ownTail.tailFrom, at: ownTail.t };
       // ukazatele tohoto jídla
       let peak = null, tPeak = null, above = 0;
       const own = rd.filter(x => x.t > m.ts && x.t <= m.ts + postFor(m));
@@ -636,6 +683,15 @@
       if (m.alc) { r.flags.push('alkohol — ovlivňuje glykémii ještě hodiny, nepoužito k učení'); down('poor'); }
       if (r.heavy) r.flags.push('hodně tuku a bílkovin — okno prodlouženo na 4 h, pozdní vzestup započten');
       if (outliers > pts.length * 0.15) r.flags.push('část průběhu model nevysvětluje (nezapsané jídlo?) — tyto hodnoty mají menší váhu');
+      // „Nic jsem nejedl" v okně tohoto jídla: tvar křivky neodpovídal předpokladu → štítek váží méně.
+      const nmIn = noMeal.find(x => (x.prevId != null && x.prevId === m.id) || (x.t > m.ts && x.t <= m.ts + postFor(m)));
+      if (nmIn) {
+        r.relSd = Math.max(r.relSd, nmIn.why === 'both' ? 0.3 : 0.2);
+        if (r.relSd > 0.2) down('fair');
+        r.flags.push(nmIn.why === 'tail' ? 'jídlo dobíhalo déle, než model čekal — pozdní část započtena zvlášť'
+          : nmIn.why === 'basal' ? 'po jídle chyběl bazál — započteno zvlášť'
+            : 'vzestup bez jídla v okně — dobíhání jídla a chybějící bazál se z jedné křivky rozlišit nedají, výsledek je méně jistý');
+      }
       const ul = unlogged.find(x => Math.abs(x.t - m.ts) <= 150 * MIN);
       if (ul) {
         r.unlogged = ul;

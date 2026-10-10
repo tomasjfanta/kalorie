@@ -88,6 +88,13 @@
     return out;
   }
 
+  // „Nic jsem nejedl": časy, kdy aplikace navrhla nezapsané jídlo a uživatel ho odmítl (uloženo u dne).
+  function noMeals(from, to) {
+    const out = [], D = K.days();
+    for (const d of Object.keys(D)) for (const x of D[d].nm || []) if (x.t >= from && x.t <= to) out.push(x);
+    return out.sort((a, b) => a.t - b.t);
+  }
+
   // Sacharidy zadané do pumpy (bolusový kalkulátor) bez fotky do 30 min → známé jídlo v bilanci
   // (jinak by se jejich vliv na glykémii připsal vyfocenému jídlu).
   async function pumpMeals(entries, from, to) {
@@ -131,7 +138,7 @@
       m.manual = man;
     }
     const data = { readings, boluses, basal, basalBase, targets, settingsAt: makeSettingsAt(pumpset),
-      prior: all.filter(m => m.ts < T0 && m.ts >= T0 - 300 * MIN) };
+      prior: all.filter(m => m.ts < T0 && m.ts >= T0 - 300 * MIN), noMeal: noMeals(T0 - 2 * 60 * MIN, END + 2 * 60 * MIN).map(x => x.t) };
     let results;
     if (therapy().type === 'none') {
       results = {};
@@ -149,7 +156,7 @@
         icr: ev.icr, isf: ev.isf, n: readings.length, at: Date.now(),
         del: ev.del, coveredCarbs: ev.coveredCarbs, extraCarbs: ev.extraCarbs, manCarbs: ev.manCarbs, basalOk: ev.basalOk,
         endSlope15: ev.endSlope15, stable: ev.stable, cluster: ev.cluster, share: ev.share, sitting: ev.sitting,
-        unlogged: ev.unlogged, seg: ev.seg, dur: ev.dur, gi: ev.gi, pumpMeals: ev.pumpMeals,
+        unlogged: ev.unlogged, noMeal: ev.noMeal, tail: ev.tail, seg: ev.seg, dur: ev.dur, gi: ev.gi, pumpMeals: ev.pumpMeals,
         fit: ev.fit, hypo: ev.hypo, exercise: ev.exercise, alcohol: ev.alcohol, heavy: ev.heavy, fpu: ev.fpu, fpuCarbs: ev.fpuCarbs,
         winEnd: END, rise: ev.rise, tAbove10: ev.tAbove10, bolusLead: ev.bolusLead, final,
       };
@@ -602,7 +609,16 @@
       if (ev?.seg?.n > 1) h += `<div class="ev-metrics">🔗 Vyhodnoceno společně s ${ev.seg.n - 1} navazujícími jídly (celá křivka, každé jídlo od svého času)${ev.relSd != null ? ` — přesnost tohoto jídla ±${Math.round(ev.relSd * 100)} %` : ''}${ev.sitting ? '; fotky do 20 min od sebe se počítají jako jedno sezení' : ''}.</div>`;
       if (ev?.unlogged) {
         h += `<div class="ev-box">🤔 Průběh glykémie naznačuje jídlo, které tu není — kolem <b>${hhmm(ev.unlogged.t)}</b>, asi <b>${r0(ev.unlogged.g)} g</b>. Pokud jste tehdy něco snědli, zapište to — výpočet okolních jídel se zpřesní.
-          <div class="ev-actions"><input id="cm-ul-g" type="text" inputmode="decimal" value="${r0(ev.unlogged.g)}"><span class="unit">g v</span><input id="cm-ul-t" type="time" value="${hhmm(ev.unlogged.t)}"><button id="cm-ul-add" class="btn slim">Zapsat</button></div></div>`;
+          <div class="ev-actions"><input id="cm-ul-g" type="text" inputmode="decimal" value="${r0(ev.unlogged.g)}"><span class="unit">g v</span><input id="cm-ul-t" type="time" value="${hhmm(ev.unlogged.t)}"><button id="cm-ul-add" class="btn slim">Zapsat</button></div>
+          <div class="ev-actions"><button id="cm-ul-no" class="btn btn-ghost slim" style="white-space:nowrap">Nic jsem nejedl</button><span class="muted small-text">— pak to vysvětlí dobíhání jídla nebo bazál</span></div></div>`;
+      }
+      if (ev?.noMeal) {
+        const n = ev.noMeal, prev = n.prevTs ? `jídlo z ${hhmm(n.prevTs)}` : 'předchozí jídlo';
+        const why = n.why === 'tail' ? `nejspíš ještě dobíhalo ${prev} (tuk, bílkoviny nebo pomalé sacharidy) a dávka k jídlu ho nepokryla celé${n.tailG >= 3 ? ` — pozdní část ~${r0(n.tailG)} g` : ''}.`
+          : n.why === 'basal' ? `nejspíš od ~${hhmm(n.rampFrom || n.t)} nestačil bazál${n.slope > 0.05 ? ` (glykémie stoupala navíc o ~${fmtBG(n.slope)} ${uLbl()} za hodinu)` : ''}.`
+            : `buď ještě dobíhalo ${prev} (tuk, bílkoviny, pomalé sacharidy), nebo v tu dobu nestačil bazál. Z jedné křivky se to rozlišit nedá — rozhodne opakování: ve stejnou denní dobu po různých jídlech ukazuje spíš na bazál, po stejném druhu jídla spíš na dobíhání (viz Učení).`;
+        h += `<div class="ev-box">🙅 Kolem <b>${hhmm(n.t)}</b> jste podle vás nejedli. Vzestup glykémie v tu dobu: ${why} Okolní jídla s tím počítají a mají menší váhu v učení.
+          <div class="ev-actions"><button id="cm-nm-undo" class="btn btn-ghost slim">Zpět — přece jen jsem jedl</button></div></div>`;
       }
       const photoNeighbours = (ev?.cluster || []).filter(t => !(ev.pumpMeals || []).some(p => p.ts === t));
       if (photoNeighbours.length) h += `<div class="ev-metrics">🍽 Vyhodnoceno společně s jídlem v ${photoNeighbours.map(hhmm).join(', ')}${ev.share != null && ev.share < 1 ? ` — podíl tohoto jídla ~${Math.round(ev.share * 100)} %` : ''}.</div>`;
@@ -676,6 +692,17 @@
       const ts = tsFromTime(e.ev.unlogged.t, $('#cm-ul-t').value);
       K.day(K.dstr(new Date(ts))).e.push({ id: 'm' + Date.now(), n: 'Doplněné jídlo', q: 1, s: g, cs: 'manual', ts, meal: 'sv' });
       after(); K.toast(`Zapsáno: ${r0(g)} g v ${hhmm(ts)} — okolní jídla se přepočítají`);
+    });
+    // „Nic jsem nejedl": navržené jídlo odmítnuto — vzestup vysvětlí dobíhání předchozího jídla nebo bazál.
+    $('#cm-ul-no')?.addEventListener('click', () => {
+      const t = tsFromTime(e.ev.unlogged.t, $('#cm-ul-t').value), d = K.day(K.dstr(new Date(t)));
+      d.nm = [...(d.nm || []).filter(x => Math.abs(x.t - t) > 5 * MIN), { t, g: e.ev.unlogged.g, at: Date.now() }];
+      after(); K.toast(`Rozumím — kolem ${hhmm(t)} jste nejedli. Přepočítávám.`);
+    });
+    $('#cm-nm-undo')?.addEventListener('click', () => {
+      const t = e.ev.noMeal.t, d = K.day(K.dstr(new Date(t)));
+      d.nm = (d.nm || []).filter(x => Math.abs(x.t - t) > 5 * MIN);
+      after();
     });
     $('#cm-units-save')?.addEventListener('click', () => { const u = K.num($('#cm-units').value); if (u > 0) e.units = u; else delete e.units; after(); });
     $('#cm-save')?.addEventListener('click', async () => {
@@ -774,6 +801,26 @@
       h += '<div class="card"><div class="card-title">Bolus a vzestup glykémie</div>' + buckets.map(b =>
         `<div class="learn-row"><span>Bolus ${b.lbl}<br><span class="muted small-text">${b.es.length} jídel · nad 10 mmol/l typicky ${med(b.es.map(e => e.ev.tAbove10 || 0))} min</span></span><b>+${fmtBG(med(b.es.map(e => e.ev.rise)))} ${uLbl()}</b></div>`).join('')
         + '<p class="muted small-text">Souvislost z vašich jídel (čas bolusu z pumpy, čas jídla z fotky) — ne doporučení k dávkování; načasování proberte s diabetologem.</p></div>';
+    }
+    // Vzestupy bez jídla („nic jsem nejedl") — popis opakování, ne doporučení
+    const nmEv = {};
+    for (const e of all) if (e.ev?.noMeal) nmEv[e.ev.noMeal.t] = e.ev.noMeal;
+    const nms = noMeals(now - 60 * DAY, now).map(x => ({ ...x, ...(nmEv[x.t] || {}), block: LEARN.blockOf(x.t) }));
+    if (nms.length) {
+      const by = (f) => { const o = {}; for (const x of nms) { const k = f(x); if (k) (o[k] ??= []).push(x); } return o; };
+      const blocks = by(x => x.block), kats = by(x => (x.prevKat ? LEARN.catKey(x.prevKat) : null));
+      const uniq = xs => new Set(xs).size;
+      const hints = [];
+      for (const [k, xs] of Object.entries(blocks)) if (xs.length >= 3 && uniq(xs.map(x => x.prevKat ? LEARN.catKey(x.prevKat) : '?')) >= 2)
+        hints.push(`${LEARN.BLOCKS[k].label}: ${xs.length}× po různých jídlech → ukazuje to spíš na bazál v tuto dobu.`);
+      for (const [k, xs] of Object.entries(kats)) if (xs.length >= 3 && uniq(xs.map(x => x.block)) >= 2)
+        hints.push(`Po jídle „${LEARN.CATS[k].label}" ${xs.length}× v různou denní dobu → spíš dlouhé dobíhání tohoto druhu jídla.`);
+      h += '<div class="card"><div class="card-title">Vzestupy bez jídla</div>'
+        + `<p class="muted small-text">Kdy glykémie stoupala, i když jste podle vás nejedli (posledních 60 dní, ${nms.length}×).</p>`
+        + Object.entries(blocks).map(([k, xs]) => `<div class="learn-row"><span>${LEARN.BLOCKS[k].label}<br><span class="muted small-text">${xs.map(x => K.fmtHuman(K.dstr(new Date(x.t))) + ' ' + hhmm(x.t)).slice(-4).join(', ')}</span></span><b>${xs.length}×</b></div>`).join('')
+        + (Object.keys(kats).length ? '<div class="learn-row"><span>Předchozí jídlo<br><span class="muted small-text">' + Object.entries(kats).sort((a, b) => b[1].length - a[1].length).map(([k, xs]) => `${LEARN.CATS[k].label} ${xs.length}×`).join(' · ') + '</span></span></div>' : '')
+        + (hints.length ? hints.map(x => `<p>${esc(x)}</p>`).join('') : '<p class="muted small-text">Zatím bez opakování — vzorec se ukáže po víc případech (ve stejnou denní dobu po různých jídlech → spíš bazál; po stejném druhu jídla → spíš dobíhání).</p>')
+        + '<p class="muted small-text">Jen popis z vašich dat, ne doporučení k dávkování. Opakující se vzorec stojí za to probrat s diabetologem.</p></div>';
     }
     const w = vw(), used = [...new Set([...Object.keys(w), ...(K.aiConfig().key ? ['gemini'] : []), ...(AI.claudeReady() ? ['claude'] : [])])];
     if (used.length > 1 || Object.keys(w).length) {
