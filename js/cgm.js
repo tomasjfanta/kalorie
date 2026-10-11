@@ -2,11 +2,12 @@
 // Medtronic nemá veřejné API — automaticky jen přes Nightscout (plněný xDrip+ nebo nightscout-connect).
 'use strict';
 (function () {
-  const DB_NAME = 'kalorie', DB_VER = 5;
+  const DB_NAME = 'kalorie', DB_VER = 6;
   // basal = automatický bazál pumpy (U/h po 5 min), jobs = fotky a popisy čekající na odhad AI,
   // pcarbs = sacharidy zadané do pumpy (bolusový kalkulátor), targets = dočasný cíl pumpy (pohyb).
   // photos = celá fotka jídla (14 dní) pro nový odhad po opravě názvu.
-  const STORES = { cgm: 't', bolus: 't', pumpset: 't', thumbs: 'id', basal: 't', jobs: 'id', pcarbs: 't', targets: 't', photos: 'id' };
+  // bgm = glykémie z glukometru (z pumpy přes Nightscout „BG Check", nebo zapsané v aplikaci) — při výpadku senzoru.
+  const STORES = { cgm: 't', bolus: 't', pumpset: 't', thumbs: 'id', basal: 't', jobs: 'id', pcarbs: 't', targets: 't', photos: 'id', bgm: 't' };
   let dbp = null;
   function db() {
     if (dbp) return dbp;
@@ -125,7 +126,24 @@
         .map(x => ({ t: basalKey(Date.parse(x.created_at)), r: +x.absolute }));
       await put('basal', basal);
     } catch (e) { /* bez automatického bazálu se počítá jako dřív */ }
-    return { readings: readings.length, boluses: boluses.length, basal: basal.length, last: readings.reduce((a, r) => r.t > (a?.t || 0) ? r : a, null) };
+    let bgm = [];
+    try {
+      // Glukometr: hodnota z pumpy (měřič propojený s pumpou nebo zadaná do pumpy). Jednotky Nightscout
+      // u „BG Check" často neuvádí — nad 35 jde o mg/dl.
+      const bc = await nsFetch(cfg, '/api/v1/treatments.json', { ...win, 'find[eventType]': 'BG Check', count: '500' });
+      bgm = (bc || []).filter(x => +x.glucose > 0 && isFinite(Date.parse(x.created_at))).map(x => {
+        const g = +x.glucose, mg = /mg/i.test(x.units || '') || (!/mmol/i.test(x.units || '') && g > 35);
+        return { t: Math.round(Date.parse(x.created_at) / 60000) * 60000, v: mg ? g / MG : g, src: 'pumpa' };
+      });
+      await put('bgm', bgm);
+    } catch (e) { /* glukometr je jen doplněk */ }
+    let status = null;
+    try {
+      // Stav pumpy a senzoru (most ho posílá každých 5 min) — rozliší „senzor nesnímá" od „most neběží".
+      const d = (await nsFetch(cfg, '/api/v1/devicestatus.json', { count: '1' }))?.[0];
+      if (d) status = { t: d.mills || Date.parse(d.created_at), pump: d.pump?.status?.status || null, sensor: d.sensor?.sensorState || null, suspended: !!d.pump?.status?.suspended };
+    } catch (e) { /* stav je jen doplněk */ }
+    return { readings: readings.length, boluses: boluses.length, basal: basal.length, bgm: bgm.length, status, last: readings.reduce((a, r) => r.t > (a?.t || 0) ? r : a, null) };
   }
 
   // Jednorázově: bolusy uložené dřívější verzí (s duplicitami) přeuložit pod nové klíče.

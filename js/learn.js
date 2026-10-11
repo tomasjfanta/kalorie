@@ -412,8 +412,15 @@
       const sxx = pre.reduce((a, r) => a + (r.t - mt) ** 2, 0);
       if (sxx > 0) bg0 = mv + pre.reduce((a, r) => a + (r.t - mt) * (r.v - mv), 0) / sxx * (T0 - mt);
     }
-    if (bg0 == null) return fail('chybí glykémie před jídlem');
-    if (post.length < ((Tend - T0) / (5 * MIN)) * 0.6) return fail('málo hodnot z CGM');
+    // Výpadek CGM: měření z glukometru (data.meter, čas = krev, bez zpoždění senzoru). Stačí hodnota
+    // před jídlem a aspoň jedna 2–3 h po posledním jídle — vyhodnocení je pak hrubší („sparse").
+    const meter = (data.meter || []).filter(r => r.t >= T0 - 45 * MIN && r.t <= Tend + 30 * MIN).sort((a, b) => a.t - b.t);
+    const mPre = meter.filter(r => r.t <= T0 + 10 * MIN).pop(), mPost = meter.filter(r => r.t > T0 + 30 * MIN);
+    if (bg0 == null && mPre) bg0 = mPre.v;
+    if (bg0 == null) return fail(meter.length ? 'chybí glykémie před jídlem — změřte ji glukometrem těsně před jídlem' : 'chybí glykémie před jídlem');
+    const sparse = post.length < ((Tend - T0) / (5 * MIN)) * 0.6;
+    if (sparse && !mPost.some(r => r.t >= meals[meals.length - 1].ts + 100 * MIN))
+      return fail(meter.length ? 'málo měření — z glukometru je potřeba hodnota před jídlem a aspoň jedna 2–3 h po posledním jídle' : 'málo hodnot z CGM');
     if (bg0 < 3.9) return fail('hypoglykémie před jídlem');
     if (therapy.type === 'none') return fail('bez inzulinu umím vyhodnotit jen samostatné jídlo');
     const setAt = t => (data.settingsAt ? data.settingsAt(t) : null);
@@ -425,7 +432,7 @@
 
     // Vynechané úseky: hypoglykémie (a 90 min po ní — nezapsané sacharidy na řešení) a pohyb.
     const excl = [];
-    for (const r of post) if (r.v < 3.9) excl.push([r.t - 10 * MIN, r.t + 90 * MIN, 'hypo']);
+    for (const r of [...post, ...mPost]) if (r.v < 3.9) excl.push([r.t - 10 * MIN, r.t + 90 * MIN, 'hypo']);
     for (const g of data.targets || []) excl.push([g.t, g.t + ((g.dur || 0) + 120) * MIN, 'exercise']);
     const excluded = t => excl.find(x => t >= x[0] && t <= x[1]);
 
@@ -445,7 +452,7 @@
     if (!anyIns && self1) { doses.push({ t: self1.ts, u: self1.manual.units, cls: 'meal' }); del.meal += self1.manual.units; anyIns = true; }
     if (!anyIns) return fail('chybí údaj o inzulinu k jídlu');
     let basalOk = false;
-    if (data.basal && data.basal.length && data.basalBase != null) {
+    if (!sparse && data.basal && data.basal.length && data.basalBase != null) {
       const slot = 5 * MIN, from = T0 - PRIOR_WIN;
       const recs = data.basal.filter(r => r.t >= from - 20 * MIN && r.t <= Tend + 20 * MIN).sort((a, b) => a.t - b.t);
       const rateAt = t => { let best = null; for (const r of recs) if (Math.abs(r.t - t) <= 15 * MIN && (!best || Math.abs(r.t - t) < Math.abs(best.t - t))) best = r; return best ? best.r : null; };
@@ -482,9 +489,12 @@
     if (!sittings.length) return fail('v okně není jídlo s odhadem AI');
 
     // Body k proložení (CGM o zpoždění senzoru dřív), bez vynechaných úseků.
-    const pts = post.filter(r => r.t - lag > T0 && !excluded(r.t)).map(r => ({ t: r.t - lag, v: r.v }));
+    const METER_W = 1.5; // měření z glukometru: přesné a navzájem nezávislé (CGM body jsou provázané)
+    const cgmPts = post.filter(r => r.t - lag > T0 && !excluded(r.t)).map(r => ({ t: r.t - lag, v: r.v, wt: 1 }));
+    const pts = !sparse ? cgmPts
+      : [...cgmPts, ...mPost.filter(r => r.t > T0 && !excluded(r.t)).map(r => ({ t: r.t, v: r.v, wt: METER_W, meter: true }))].sort((a, b) => a.t - b.t);
     const nParam = sittings.length + 1;
-    if (pts.length < Math.max(12, 3 * nParam)) return fail('málo použitelných hodnot z CGM (hypoglykémie nebo pohyb)');
+    if (sparse ? !pts.length : pts.length < Math.max(12, 3 * nParam)) return fail(sparse ? 'málo použitelných měření (hypoglykémie nebo pohyb)' : 'málo použitelných hodnot z CGM (hypoglykémie nebo pohyb)');
     const yBase = pts.map(p => p.v - bg0 - knownAt(p.t) + insulinAt(p.t));
     const tau = pts.map(p => (p.t - T0) / (60 * MIN));
 
@@ -506,7 +516,7 @@
         const A = Array.from({ length: nParam }, (_, i) => Array.from({ length: nParam }, (_, j) => (i === j ? prec0[i] : 0)));
         const b = mu0.map((m, i) => prec0[i] * m);
         for (let k = 0; k < pts.length; k++) {
-          const wk = w[k] / sig ** 2;
+          const wk = w[k] * (pts[k].wt || 1) / sig ** 2;
           for (let i = 0; i < nParam; i++) { b[i] += wk * X[k][i] * yBase[k]; for (let j = 0; j < nParam; j++) A[i][j] += wk * X[k][i] * X[k][j]; }
         }
         cov = invert(A);
@@ -524,7 +534,7 @@
         }
       }
     }
-    const first = solve(1);
+    const first = solve(1, sparse ? 0.9 : undefined);
     if (!first) return fail('výpočet se nepodařil');
     const bestOf = (terms, sig) => {
       let b = null;
@@ -532,7 +542,7 @@
       return b;
     };
     let best = first;
-    { const g = bestOf([], first.sig); if (g && g.J < best.J) best = g; }
+    if (!sparse) { const g = bestOf([], first.sig); if (g && g.J < best.J) best = g; }
     const mv = pts.reduce((a, p) => a + p.v, 0) / pts.length;
     const sst = pts.reduce((a, p) => a + (p.v - mv) ** 2, 0);
     const r2 = sst > 0 ? 1 - best.res.reduce((a, r) => a + r * r, 0) / sst : 0;
@@ -545,7 +555,7 @@
     // Obě vysvětlení jsou v modelu jako nejisté vstupy; které z nich samo sedí výrazně lépe, to se
     // uživateli řekne. Když se nedají rozlišit, zůstanou v modelu obě a nejistota jídel kolem vzroste.
     const alts = [], noMeal = [];
-    for (const tR of (data.noMeal || []).filter(t => t > T0 && t < Tend).sort((a, b) => a - b)) {
+    for (const tR of (sparse ? [] : data.noMeal || []).filter(t => t > T0 && t < Tend).sort((a, b) => a - b)) {
       const prev = [...meals, ...(data.prior || [])].filter(m => m.ts <= tR - 20 * MIN && m.ts >= tR - 6 * 60 * MIN).sort((a, b) => b.ts - a.ts)[0];
       const J = terms => solve(best.sp, first.sig, [...alts, ...terms])?.J ?? Infinity;
       const pick = list => list.reduce((b, x) => { const j = J([x.term]); return j < b.j ? { ...x, j } : b; }, { j: Infinity });
@@ -575,7 +585,7 @@
     {
       const cand = [];
       for (let t = T0 + 20 * MIN; t <= Tend - 60 * MIN; t += 20 * MIN) if (!meals.some(m => Math.abs(m.ts - t) <= 25 * MIN) && !nearNoMeal(t)) cand.push(t);
-      if (cand.length) {
+      if (cand.length && !sparse) {
         const ghost = t => ({ ts: t, gi: 'střední', kat: 'ostatni' });
         const mkX = withC => pts.map((p, k) => [
           ...sittings.map(S => S.members.reduce((a, m) => a + scale(m.ts) * est(m) / S.E * absIn(m, p.t, best.sp), 0)),
@@ -637,7 +647,7 @@
     // Sonda pozdní vlny: kolik sacharidů každého sezení přišlo pomalou vlnou 1–5 h po jídle. Uloží se
     // celkový podíl (už použitá naučená vlna + co přidala sonda), z jídel se pak učí tvar podle druhu.
     // (s vlastní rychlostí hlavní vlny — pomalejší rychlost by jinak pozdní vlnu „schovala")
-    const probe = bestOf([...alts, ...unlogged.map(ghostTerm), ...sittings.map(S => ({
+    const probe = sparse ? null : bestOf([...alts, ...unlogged.map(ghostTerm), ...sittings.map(S => ({
       f: t => S.members.reduce((a, m) => a + scale(m.ts) * est(m) / S.E * (absorbedFrac((t - m.ts) / MIN - TAIL_DELAY, TAIL_DUR) - absorbedFrac(Math.max(0, T0 - m.ts) / MIN - TAIL_DELAY, TAIL_DUR)), 0),
       mu: 0, sd: 0.5 * S.E }))], best.sig);
     const probes = sittings.map((S, i) => {
@@ -664,10 +674,10 @@
       return x.t ? { kind: 'other', t: x.t, d: x.d } : null;
     }
     const seg = { T0, Tend, n: pts.length, nMeals: meals.length, sittings: sittings.length, rmse: best.rms, r2: r2f, speed: best.sp,
-      drift: best.beta[sittings.length], outliers, excluded: excl.map(x => x[2]), basalOk, del, unlogged, noMeal,
+      drift: best.beta[sittings.length], outliers, excluded: excl.map(x => x[2]), basalOk, del, unlogged, noMeal, sparse,
       coveredCarbs: s0.icr * del.meal, extraCarbs: s0.icr * (del.auto + del.basal), manCarbs: s0.icr * del.man };
     out.seg = seg;
-    const fitOk = best.rms <= 1.2 && r2f >= 0.3;
+    const fitOk = sparse || (best.rms <= 1.2 && r2f >= 0.3); // z pár měření se tvar posoudit nedá
 
     // Výsledky po jídlech.
     for (const m of meals) {
@@ -704,8 +714,8 @@
       // v sezení se podíl talířů dělí podle odhadů AI → nejistota rozdělení ±25 %
       if (S.members.length > 1) r.relSd = Math.min(2, Math.hypot(r.relSd, 0.25));
       r.share = r.implied / Math.max(1e-6, sittings.reduce((a, X, i) => a + Math.max(0, best.beta[i]), 0));
-      r.fit = { used: fitOk, speed: (m.speed > 0 ? m.speed : 1) * best.sp, rel: best.sp, rmse: best.rms, r2: r2f, n: pts.length,
-        informative: fitOk && sittings.length === 1 && meals.length === 1 && r.relSd < 0.2 };
+      r.fit = { used: fitOk && !sparse, speed: (m.speed > 0 ? m.speed : 1) * best.sp, rel: best.sp, rmse: best.rms, r2: r2f, n: pts.length,
+        informative: fitOk && !sparse && sittings.length === 1 && meals.length === 1 && r.relSd < 0.2 };
       r.sitting = S.members.length > 1 ? S.members.filter(x => x !== m).map(x => x.ts) : null;
       if (probes[si]) r.tailProbe = probes[si];
       if (!fitOk) r.misfit = misfitOf(m);
@@ -720,9 +730,16 @@
       else if (r.hypo) { r.flags.push('hypoglykémie v okně — její úsek vynechán'); down('fair'); }
       if (r.exercise === 'during' && ownEx <= 0.5) { r.flags.push('dočasný cíl pumpy (pohyb) — jeho úsek vynechán'); down('fair'); }
       if (r.exercise === 'after') { r.flags.push('pohyb během posledních 12 h — citlivost na inzulin může být vyšší'); down('fair'); }
+      if (sparse) {
+        r.meter = pts.filter(p => p.meter).length;
+        r.relSd = Math.max(r.relSd, 0.25);
+        r.flags.push(`vyhodnoceno z glukometru (${r.meter} měření po jídle) — senzor nesnímal, výsledek je hrubší`);
+        r.flags.push('bez senzoru pumpa nejspíš běžela bez automatiky (bazál podle nastavení)');
+        down('fair');
+      }
       if (m.alc) { r.flags.push('alkohol — ovlivňuje glykémii ještě hodiny, nepoužito k učení'); down('poor'); }
       if (r.heavy) r.flags.push('hodně tuku a bílkovin — okno prodlouženo na 4 h, pozdní vzestup započten');
-      if (outliers > pts.length * 0.15) r.flags.push('část průběhu model nevysvětluje (nezapsané jídlo?) — tyto hodnoty mají menší váhu');
+      if (!sparse && outliers > pts.length * 0.15) r.flags.push('část průběhu model nevysvětluje (nezapsané jídlo?) — tyto hodnoty mají menší váhu');
       // „Nic jsem nejedl" v okně tohoto jídla: tvar křivky neodpovídal předpokladu → štítek váží méně.
       const nmIn = noMeal.find(x => (x.prevId != null && x.prevId === m.id) || (x.t > m.ts && x.t <= m.ts + postFor(m)));
       if (nmIn) {
@@ -758,7 +775,7 @@
      rychlost a odhalená nezapsaná jídla. Rozdíl proti CGM ukazuje, kde a o kolik se předpoklad mýlil.
      meals: [{ ts, s, conf, aiRaw, implied, fitSpeed, ghost, g, gi, kat, fat, prot, speed }]
      Vrací { grid, actual, carbs: [{ m, rate }], ins, insBasal, intervals: [{ a, b, kind, logged, fit, … }], stats }. */
-  function dayCurves({ from, to, readings, boluses, basal, basalBase, meals, settingsAt, therapy, cgmLag, step = 5 * MIN }) {
+  function dayCurves({ from, to, readings, boluses, basal, basalBase, meals, settingsAt, therapy, cgmLag, meter, step = 5 * MIN }) {
     const lag = cgmLag ?? CGM_LAG, tp = therapy?.insulin === 'ultra' ? 55 : 75;
     const set = t => (settingsAt ? settingsAt(t) : null);
     if (!set(from) && !set(to)) return { error: 'chybí sacharidový poměr nebo citlivost v nastavení léčby' };
@@ -847,9 +864,12 @@
     gaps(to);
     const idx = t => Math.round((t - from) / step);
     const actual = grid.map(cgmAt);
+    // Glukometr (čas = krev): kotva úseku bez CGM a další srovnání s předpovědí (ta je v čase CGM, tj. +lag).
+    const mtr = (meter || []).filter(r => r.t >= from - 60 * MIN && r.t <= to).sort((a, b) => a.t - b.t);
+    const meterNear = t => mtr.filter(r => r.t >= t - 45 * MIN && r.t <= t + 10 * MIN).sort((a, b) => Math.abs(a.t - t) - Math.abs(b.t - t))[0];
     for (const iv of ivs) {
       const ia = idx(iv.a), ib = Math.min(grid.length - 1, idx(iv.b));
-      const anchor = actual[ia];
+      const anchor = actual[ia] ?? meterNear(grid[ia])?.v;
       if (anchor == null || ib <= ia) { iv.logged = iv.fit = null; continue; }
       iv.logged = []; iv.fit = [];
       for (let k = ia; k <= ib; k++) {
@@ -858,21 +878,24 @@
         iv.fit.push({ t: grid[k], v: anchor + cumF[k] - cumF[ia] - ins0 });
       }
       // jak moc jsme se mýlili: průměr a maximum rozdílu CGM − předpověď, a stav na konci úseku
-      const d = iv.logged.map(p => { const v = actual[idx(p.t)]; return v == null ? null : { t: p.t, d: v - p.v }; }).filter(Boolean);
+      const obs = iv.logged.map((p, j) => (actual[idx(p.t)] == null ? null : { j, v: actual[idx(p.t)] })).filter(Boolean);
+      for (const r of mtr) { const j = idx(r.t + lag) - ia; if (j >= 0 && j < iv.logged.length && !obs.some(o => o.j === j)) obs.push({ j, v: r.v }); }
+      obs.sort((a, b) => a.j - b.j);
+      const d = obs.map(o => ({ t: iv.logged[o.j].t, d: o.v - iv.logged[o.j].v }));
       if (d.length) {
         iv.mae = d.reduce((a, x) => a + Math.abs(x.d), 0) / d.length;
         iv.max = d.reduce((a, x) => (Math.abs(x.d) > Math.abs(a.d) ? x : a));
         const last = d[d.length - 1];
         iv.endDiff = last.d; iv.endT = last.t;
         iv.endG = last.d / scaleAt(iv.a); // ≈ g sacharidů (kladné = glykémie výš, než odpovídá zápisu a inzulinu)
-        const df = iv.fit.map(p => { const v = actual[idx(p.t)]; return v == null ? null : v - p.v; }).filter(x => x != null);
+        const df = obs.map(o => o.v - iv.fit[o.j].v);
         iv.maeFit = df.reduce((a, x) => a + Math.abs(x), 0) / df.length;
       }
     }
     const withD = ivs.filter(iv => iv.mae != null && iv.kind === 'meal');
     const stats = withD.length ? { mae: withD.reduce((a, iv) => a + iv.mae, 0) / withD.length, maeFit: withD.reduce((a, iv) => a + iv.maeFit, 0) / withD.length,
       worst: withD.reduce((a, iv) => (Math.abs(iv.max.d) > Math.abs(a.max.d) ? iv : a)) } : null;
-    return { grid, actual, carbs, ghosts, ins, insBasal, intervals: ivs, stats, scale: scaleAt(from), lag };
+    return { grid, actual, carbs, ghosts, ins, insBasal, intervals: ivs, stats, scale: scaleAt(from), lag, meter: mtr.filter(r => r.t >= from) };
   }
 
   /* ─── Vývoj a rozbor podle denní doby (obrazovka Učení) ─── */

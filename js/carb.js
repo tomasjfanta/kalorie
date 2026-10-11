@@ -146,8 +146,9 @@
       CGM.range('pumpset', from - 30 * DAY, to + 30 * DAY),
       CGM.range('targets', from - 14 * 60 * MIN, to).catch(() => []),
     ]);
+    const meter = await CGM.range('bgm', from - 90 * MIN, to + A).catch(() => []);
     const before = basal.filter(r => r.t < from);
-    return { readings, boluses, basal, basalBase: before.length >= 96 ? LEARN.basalBaseline(before) : null, targets, meals,
+    return { readings, boluses, basal, basalBase: before.length >= 96 ? LEARN.basalBaseline(before) : null, targets, meals, meter,
       settingsAt: makeSettingsAt(pumpset), therapy: therapy(), noMeal: noMeals(from - W, to) };
   }
 
@@ -180,9 +181,10 @@
       CGM.range('pumpset', T0 - 30 * DAY, T0 + 30 * DAY),
       CGM.range('targets', T0 - 14 * 60 * MIN, END).catch(() => []),
     ]);
+    const meter = await CGM.range('bgm', T0 - PRE - 30 * MIN, END + 60 * MIN).catch(() => []);
     const before = basal.filter(r => r.t < T0 - 30 * MIN);
     const basalBase = before.length >= 96 ? LEARN.basalBaseline(before) : null;
-    const w = { readings, boluses };
+    const w = { readings, boluses, meter };
     const byId = Object.fromEntries(entries.map(x => [x.id, x]));
     for (const m of segMeals) {
       const ent = byId[m.id];
@@ -193,7 +195,7 @@
       if (ent.units) man.units = ent.units;
       m.manual = man;
     }
-    const data = { readings, boluses, basal, basalBase, targets, settingsAt: makeSettingsAt(pumpset),
+    const data = { readings, boluses, basal, basalBase, targets, meter, settingsAt: makeSettingsAt(pumpset),
       prior: all.filter(m => m.ts < T0 && m.ts >= T0 - 300 * MIN), noMeal: noMeals(T0 - 2 * 60 * MIN, END + 2 * 60 * MIN).map(x => x.t) };
     let results;
     if (therapy().type === 'none') {
@@ -218,7 +220,7 @@
         endSlope15: ev.endSlope15, stable: ev.stable, cluster: ev.cluster, share: ev.share, sitting: ev.sitting,
         unlogged: ev.unlogged, noMeal: ev.noMeal, tail: ev.tail, seg: ev.seg, dur: ev.dur, gi: ev.gi, pumpMeals: ev.pumpMeals,
         fit: ev.fit, hypo: ev.hypo, exercise: ev.exercise, alcohol: ev.alcohol, heavy: ev.heavy, fpu: ev.fpu, fpuCarbs: ev.fpuCarbs,
-        winEnd: END, rise: ev.rise, tAbove10: ev.tAbove10, bolusLead: ev.bolusLead, final, tailProbe: ev.tailProbe, misfit: ev.misfit,
+        winEnd: END, rise: ev.rise, tAbove10: ev.tAbove10, bolusLead: ev.bolusLead, final, tailProbe: ev.tailProbe, misfit: ev.misfit, meter: ev.meter,
       };
       const ck = checks[m.id];
       if (ck?.implied > 0 && ent.conf > 0) ent.ev.check = { implied: ck.implied, relSd: ck.relSd, quality: ck.quality, ratio: ck.implied / ent.conf, icr: ck.icr };
@@ -242,7 +244,8 @@
       const r = await CGM.nsSync(ns, from, Date.now());
       K.store.set('kal.nsSync', Date.now());
       K.store.set('kal.nsLast', r.last ? { t: r.last.t, v: r.last.v } : K.store.get('kal.nsLast', null));
-      if (r.readings || r.boluses || r.basal) touchData();
+      if (r.status) K.store.set('kal.nsStatus', r.status);
+      if (r.readings || r.boluses || r.basal || r.bgm) touchData();
       if (full) K.store.set('kal.migr4', true);
     } catch (e) { K.store.set('kal.nsErr', { at: Date.now(), msg: e.message }); }
   }
@@ -298,29 +301,86 @@
     return '— ' + (e.ev?.flags?.[0] || 'zatím bez dat z CGM');
   }
   // Glykémie přestaly chodit (most k CareLinku se odhlásil, telefon s pumpou mimo dosah…) → upozornit.
+  // Glykémie ze senzoru nechodí: podle stavu pumpy (devicestatus) rozlišit senzor od mostu k CareLinku.
+  const SENSOR_TXT = { CHANGE_SENSOR: 'pumpa hlásí výměnu senzoru', NO_DATA_FROM_PUMP: 'pumpa ze senzoru nemá data', SENSOR_OFF: 'senzor je vypnutý',
+    WARM_UP: 'nový senzor se zahřívá', CALIBRATION_REQUIRED: 'senzor potřebuje kalibraci', LOST_SENSOR_SIGNAL: 'pumpa ztratila signál senzoru', UNKNOWN: 'stav senzoru je neznámý' };
   function staleTxt() {
-    const ns = K.store.get('kal.ns', null), last = K.store.get('kal.nsLast', null);
+    const ns = K.store.get('kal.ns', null), last = K.store.get('kal.nsLast', null), st = K.store.get('kal.nsStatus', null);
     if (!ns?.url || !last?.t || K.viewDate() !== K.todayStr()) return '';
     const age = Date.now() - last.t;
     if (age < 30 * MIN) return '';
-    return `<div class="result-note warn-note">⚠️ Poslední glykémie z pumpy je z ${hhmm(last.t)} (${age > DAY ? 'před více než dnem' : 'před ' + Math.round(age / MIN) + ' min'}). Když to trvá, odhlásil se nejspíš most k CareLinku — na počítači spusťte znovu přihlášení, případně zkontrolujte, že je telefon s MiniMed Mobile u pumpy.</div>`;
+    const ago = age > DAY ? 'před více než dnem' : age >= 120 * MIN ? `před ${dec(K.r1(age / 3600e3))} h` : `před ${Math.round(age / MIN)} min`;
+    const when = `Poslední glykémie ze senzoru je z ${hhmm(last.t)} (${ago}).`;
+    const tip = 'Aby šla jídla ověřit i bez senzoru, změřte glukometrem glykémii těsně před jídlem a asi 2 a 3 h po něm — hodnoty z glukometru propojeného s pumpou se načtou samy, ostatní zapište tlačítkem 🩸 níže.';
+    const pumpFresh = st?.t && Date.now() - st.t < 30 * MIN;
+    const bad = s => s && s !== 'NO_ERROR_MESSAGE';
+    if (pumpFresh && (bad(st.sensor) || bad(st.pump))) {
+      const what = SENSOR_TXT[st.sensor] || SENSOR_TXT[st.pump] || `pumpa hlásí ${esc(st.sensor || st.pump)}`;
+      return `<div class="result-note warn-note">🩸 Senzor neposílá data — ${what}. ${when} Bez senzoru je pumpa nejspíš v manuálním režimu (bez automatiky); jídla z této doby aplikace vyhodnotí jen hruběji. ${tip}</div>`;
+    }
+    if (pumpFresh) return `<div class="result-note warn-note">🩸 Pumpa data posílá, ale glykémie ze senzoru ne. ${when} Zkontrolujte senzor v pumpě. ${tip}</div>`;
+    return `<div class="result-note warn-note">⚠️ ${when} Z pumpy nepřichází nic — když to trvá, odhlásil se nejspíš most k CareLinku (na počítači spusťte znovu přihlášení), případně není telefon s MiniMed Mobile u pumpy.</div>`;
   }
-  function renderTimeline() {
+  // Měření z glukometru zobrazeného dne (načtou se z IndexedDB; po načtení se časová osa překreslí).
+  let meterDay = { key: null, rows: [] };
+  const dayBounds = key => { const [y, m, d] = key.split('-').map(Number); return [new Date(y, m - 1, d).getTime(), new Date(y, m - 1, d + 1).getTime()]; };
+  async function loadMeterDay() {
+    const key = K.viewDate(), [a, b] = dayBounds(key);
+    const rows = await CGM.range('bgm', a, b - 1).catch(() => []);
+    const sig = rows.map(r => r.t + ':' + r.v).join('|');
+    if (meterDay.key !== key || meterDay.sig !== sig) { meterDay = { key, rows, sig }; renderTimeline(true); }
+  }
+  const meterForm = () => `<div class="meter-row"><button type="button" id="meter-btn" class="btn btn-ghost slim">🩸 Glykémie z glukometru</button>
+    <span id="meter-form" class="ev-actions hidden"><input id="meter-v" type="text" inputmode="decimal" placeholder="${uLbl()}"><input id="meter-t" type="time"><button type="button" id="meter-save" class="btn slim">Uložit</button></span></div>`;
+  async function saveMeter(v, ts) {
+    const mmol = toMmol(v);
+    if (!(mmol > 1 && mmol < 35)) { K.toast('Zadejte glykémii'); return false; }
+    await CGM.put('bgm', [{ t: Math.round(ts / 60000) * 60000, v: mmol, src: 'ruka' }]);
+    touchData(); invalidate();
+    K.toast(`Uloženo: ${fmtBG(mmol)} ${uLbl()} v ${hhmm(ts)} — jídla kolem se přepočítají`);
+    refresh();
+    return true;
+  }
+  function renderTimeline(fromLoad) {
     const box = $('#ctimeline');
     if (!box || !K.isCarb()) return;
+    if (!fromLoad) loadMeterDay();
     const es = [...(K.day().e || [])].sort((a, b) => (b.ts || 0) - (a.ts || 0));
-    if (!es.length) {
-      box.innerHTML = staleTxt() + '<div class="result-note">Zatím žádné jídlo. Vyfoťte talíř — AI odhadne sacharidy a glykémie z CGM pak odhad ověří a zpřesní další.</div>';
+    const mrows = meterDay.key === K.viewDate() ? meterDay.rows : [];
+    if (!es.length && !mrows.length) {
+      box.innerHTML = staleTxt() + meterForm() + '<div class="result-note">Zatím žádné jídlo. Vyfoťte talíř — AI odhadne sacharidy a glykémie z CGM pak odhad ověří a zpřesní další.</div>';
+      bindMeterForm();
       return;
     }
-    box.innerHTML = staleTxt() + es.map(e => {
+    const items = [...es.map(e => ({ t: e.ts || 0, e })), ...mrows.map(r => ({ t: r.t, r }))].sort((a, b) => b.t - a.t);
+    box.innerHTML = staleTxt() + meterForm() + items.map(({ e, r }) => {
+      if (r) return `<button class="ctl-row ctl-bgm" data-bgm="${r.t}"><span class="ctl-thumb bgm-ico">🩸</span><span class="ctl-mid"><span class="ctl-name">Glukometr ${fmtBG(r.v)} ${uLbl()}</span><span class="ctl-sub">${hhmm(r.t)} · ${r.src === 'pumpa' ? 'z pumpy' : 'zapsáno ručně'}</span></span></button>`;
       const c = K.entryConf(e);
       const sub = (e.ts ? hhmm(e.ts) + ' · ' : '') + (e.auto && e.conf == null ? 'uloženo bez potvrzení · ' : '') + (e.cs === 'ai-photo' ? status(e) : 'ruční zápis');
       return `<button class="ctl-row" data-id="${e.id}"><img class="ctl-thumb" data-thumb="${e.id}" alt=""><span class="ctl-mid"><span class="ctl-name">${esc(e.n)}</span><span class="ctl-sub">${sub}</span></span><span class="e-carb"><span class="e-kcal">${K.fmtC(c.C)}</span>${K.badge(c.p)}</span></button>`;
     }).join('');
-    $$('#ctimeline .ctl-row').forEach(b => b.addEventListener('click', () => openMeal(b.dataset.id)));
+    bindMeterForm();
+    $$('#ctimeline .ctl-bgm').forEach(b => b.addEventListener('click', async () => {
+      if (!confirm('Smazat toto měření z glukometru?')) return;
+      await CGM.del('bgm', +b.dataset.bgm).catch(() => {});
+      touchData(); invalidate(); meterDay.key = null; loadMeterDay(); refresh();
+    }));
+    $$('#ctimeline .ctl-row[data-id]').forEach(b => b.addEventListener('click', () => openMeal(b.dataset.id)));
     $$('#ctimeline img[data-thumb]').forEach(img => {
       CGM.get('thumbs', img.dataset.thumb).then(x => { if (x) img.src = x.data; else img.classList.add('empty'); }).catch(() => img.classList.add('empty'));
+    });
+  }
+
+  function bindMeterForm() {
+    $('#meter-btn')?.addEventListener('click', () => {
+      $('#meter-form').classList.toggle('hidden');
+      $('#meter-t').value = hhmm(Date.now()); $('#meter-v').focus();
+    });
+    $('#meter-save')?.addEventListener('click', async () => {
+      const [a] = dayBounds(K.viewDate()), m = /^(\d{1,2}):(\d{2})$/.exec($('#meter-t').value || '');
+      const ts = m ? a + (+m[1] * 60 + +m[2]) * MIN : Date.now();
+      if (ts > Date.now() + 5 * MIN) { K.toast('Čas je v budoucnosti'); return; }
+      if (await saveMeter($('#meter-v').value, ts)) { meterDay.key = null; loadMeterDay(); }
     });
   }
 
@@ -672,12 +732,12 @@
     K.renderDnes();
   }
 
-  function chartSVG(e, readings, boluses) {
-    if (!readings.length) return '';
+  function chartSVG(e, readings, boluses, meter = []) {
+    if (!readings.length && !meter.length) return '';
     const W = 340, H = 150, L = 30, R = 8, T = 8, B = 22;
     const span = LEARN.postFor(asMeal(e)) / MIN, WIN = span * MIN;
     const xs = m => L + (W - L - R) * (m + 30) / (span + 30);
-    const vals = readings.map(r => r.v);
+    const vals = [...readings.map(r => r.v), ...meter.map(r => r.v)];
     const lo = Math.min(3.5, ...vals) - 0.3, hi = Math.max(11, ...vals) + 0.5;
     const ys = v => T + (H - T - B) * (1 - (v - lo) / (hi - lo));
     const pts = readings.map(r => xs((r.t - e.ts) / MIN).toFixed(1) + ',' + ys(r.v).toFixed(1)).join(' ');
@@ -693,7 +753,8 @@
     const ticksX = [-30, 0, 60, 120, ...(span > 150 ? [180] : []), span].map(m => `<text x="${xs(m)}" y="${H - 6}" class="bg-tick" text-anchor="${m === span ? 'end' : m === -30 ? 'start' : 'middle'}">${m === 0 ? '0' : (m > 0 ? '+' : '') + m}</text>`).join('');
     const ticksY = [4, 7, 10].filter(v => v > lo && v < hi).map(v => `<text x="${L - 4}" y="${ys(v) + 3}" class="bg-tick" text-anchor="end">${fmtBG(v)}</text>`).join('');
     const dots = readings.map(r => `<circle cx="${xs((r.t - e.ts) / MIN).toFixed(1)}" cy="${ys(r.v).toFixed(1)}" r="1.6" class="bg-dot"/>`).join('');
-    return `<svg class="bg-chart" viewBox="0 0 ${W} ${H}">${band}${base}${meal}${others}<polyline points="${pts}" class="bg-line"/>${dots}${bol}${ticksX}${ticksY}</svg><div class="muted small-text center">minuty od jídla · glykémie v ${uLbl()} · pás = 3,9–10 mmol/l</div>`;
+    const mdots = meter.filter(r => r.t >= e.ts - PRE && r.t <= e.ts + WIN).map(r => `<circle cx="${xs((r.t - e.ts) / MIN).toFixed(1)}" cy="${ys(r.v).toFixed(1)}" r="3.6" class="bg-meter"/>`).join('');
+    return `<svg class="bg-chart" viewBox="0 0 ${W} ${H}">${band}${base}${meal}${others}<polyline points="${pts}" class="bg-line"/>${dots}${mdots}${bol}${ticksX}${ticksY}</svg><div class="muted small-text center">minuty od jídla · glykémie v ${uLbl()} · pás = 3,9–10 mmol/l</div>`;
   }
 
   const QLBL = { good: 'dobrá', fair: 'střední', poor: 'slabá', none: '—' };
@@ -719,7 +780,7 @@
     if (e.items?.length) h += `<div class="muted small-text">Složky: ${e.items.map(i => `${esc(i.n)} ~${i.g} g${i.c >= 1 ? ` (${r0(i.c)} g)` : ''}${i.vis ? '' : ' — předpoklad'}`).join(' · ')}${e.facts?.length ? `<br>Upřesněno: ${e.facts.map(esc).join(' · ')}` : ''}</div>`;
 
     if (e.cs === 'ai-photo' && e.ts) {
-      h += chartSVG(e, w.readings || [], w.boluses || []);
+      h += chartSVG(e, w.readings || [], w.boluses || [], w.meter || []);
       if (ev && ev.bg0 != null) {
         const pk = ev.peak != null ? ` · maximum ${fmtBG(ev.peak)}${ev.tPeak ? ' (za ' + r0((ev.tPeak - e.ts) / MIN) + ' min)' : ''}` : '';
         h += `<div class="ev-metrics">Před jídlem ${fmtBG(ev.bg0)}${pk}${ev.end != null ? ' · na konci ' + fmtBG(ev.end) : ''} ${uLbl()}${ev.units != null ? ' · účinný inzulin ' + dec(K.r1(ev.units)) + ' U' : ''}</div>`;
@@ -795,8 +856,18 @@
         }
       }
 
-      // Ruční doplnění, když CGM data chybí
-      if (!pendingWin && !(ev?.n > 0) && e.conf == null) {
+      // Výpadek senzoru: měření z glukometru u jídla (stačí před jídlem a 2–3 h po posledním jídle)
+      const cgmGap = ev?.meter || /glukometr|málo hodnot z CGM|málo měření|chybí glykémie/.test((ev?.flags || []).join(' '));
+      if (therapy().type !== 'none' && e.conf == null && cgmGap) {
+        const near = (w.meter || []).filter(r => r.t >= e.ts - 45 * MIN && r.t <= e.ts + 5 * 60 * MIN).sort((a, b) => a.t - b.t);
+        const hasPre = near.some(r => r.t <= e.ts + 10 * MIN), hasPost = near.some(r => r.t >= e.ts + 100 * MIN);
+        const sug = !hasPre ? e.ts - 5 * MIN : !hasPost ? e.ts + 120 * MIN : e.ts + 180 * MIN;
+        h += `<div class="ev-box">🩸 Glukometr u tohoto jídla: ${near.length ? near.map(r => `<b>${fmtBG(r.v)}</b> v ${hhmm(r.t)}`).join(' · ') : 'zatím nic'}.
+          <div class="ev-actions"><input id="cm-m-v" type="text" inputmode="decimal" placeholder="${uLbl()}"><input id="cm-m-t" type="time" value="${hhmm(sug)}"><button id="cm-m-add" class="btn slim">Přidat</button></div>
+          <div class="muted small-text">Senzor tehdy nesnímal. K vyhodnocení stačí hodnota těsně před jídlem a aspoň jedna 2–3 h po posledním jídle (lepší dvě) — výsledek je hrubší než z CGM.</div></div>`;
+      }
+      // Ruční doplnění, když CGM data chybí (léčba bez inzulinu — jednoduchý výpočet z rozdílu)
+      if (!pendingWin && !(ev?.n > 0) && e.conf == null && therapy().type === 'none') {
         h += `<details class="conf-how"><summary>Doplnit glykémii ručně</summary>
           <div class="tri-row"><label class="field">Před jídlem (${uLbl()})<input id="cm-bg0" type="text" inputmode="decimal" value="${e.man?.bg0 ? fmtBG(e.man.bg0) : ''}"></label>
           <label class="field">2,5 h po (${uLbl()})<input id="cm-bg2" type="text" inputmode="decimal" value="${e.man?.bg2 ? fmtBG(e.man.bg2) : ''}"></label></div>
@@ -883,6 +954,11 @@
       const t = e.ev.noMeal.t, d = K.day(K.dstr(new Date(t)));
       d.nm = (d.nm || []).filter(x => Math.abs(x.t - t) > 5 * MIN);
       after();
+    });
+    $('#cm-m-add')?.addEventListener('click', async () => {
+      const ts = tsFromTime(e.ts, $('#cm-m-t').value);
+      if (ts > Date.now() + 5 * MIN) { K.toast('Čas je v budoucnosti'); return; }
+      if (await saveMeter($('#cm-m-v').value, ts)) { delete e.ev; K.saveAll(); openMeal(e.id); }
     });
     $('#cm-units-save')?.addEventListener('click', () => { const u = K.num($('#cm-units').value); if (u > 0) e.units = u; else delete e.units; after(); });
     $('#cm-save')?.addEventListener('click', async () => {

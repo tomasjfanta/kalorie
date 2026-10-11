@@ -58,7 +58,7 @@
     const W = 360, L = 28, R = 6, T = 16, H1 = 210, G = 12, H2 = 110, B = 16, H = H1 + G + H2 + B;
     const x = t => L + (W - L - R) * (t - wa) / (wb - wa);
     const idx = cv.grid.map((t, k) => (inW(t) ? k : -1)).filter(k => k >= 0);
-    const vals = [...idx.map(k => cv.actual[k]), ...cv.intervals.flatMap(iv => (iv.logged || []).filter(p => inW(p.t)).map(p => p.v))].filter(v => v != null);
+    const vals = [...idx.map(k => cv.actual[k]), ...cv.intervals.flatMap(iv => (iv.logged || []).filter(p => inW(p.t)).map(p => p.v)), ...(cv.meter || []).filter(r => inW(r.t)).map(r => r.v)].filter(v => v != null);
     const lo = Math.max(1.5, Math.min(3.5, ...vals) - 0.3), hi = Math.min(22, Math.max(11, ...vals) + 0.5);
     const y1 = v => T + (H1 - T) * (1 - (Math.min(hi, Math.max(lo, v)) - lo) / (hi - lo));
     const poly = pts => pts.map(p => x(p.t).toFixed(1) + ',' + y1(p.v).toFixed(1)).join(' ');
@@ -86,6 +86,7 @@
     const flush = () => { if (run.length > 1) s += `<polyline points="${poly(run)}" class="bg-line"/>`; run = []; };
     for (const k of idx) { if (cv.actual[k] == null) flush(); else run.push({ t: cv.grid[k], v: cv.actual[k] }); }
     flush();
+    for (const r of (cv.meter || []).filter(x => inW(x.t))) s += `<circle cx="${x(r.t).toFixed(1)}" cy="${y1(r.v).toFixed(1)}" r="3.6" class="bg-meter"/>`;
     // jídla, nezapsaná jídla, „nic jsem nejedl", bolusy
     const zoomed = zoom != null;
     let lastLbl = -99;
@@ -140,7 +141,7 @@
       <div id="cv-read" class="cv-read muted">Posuňte prstem po grafu — ukáže hodnoty v daném čase.</div>
       <div class="cv-legend"><span><i style="border-color:var(--blue)"></i>CGM</span><span><i class="dash" style="border-color:var(--amber)"></i>předpověď ze zápisu</span>
       <span><i class="dot" style="border-color:var(--accent)"></i>po přepočtu z glykémie</span><span><b class="sw" style="background:var(--amber)"></b>jídlo</span><span><b class="sw" style="background:var(--blue)"></b>inzulin</span>
-      <span><i class="dash" style="border-color:#a86fc9"></i>bazál nad/pod obvyklým</span><span>? nezapsané jídlo</span></div>
+      <span><i class="dash" style="border-color:#a86fc9"></i>bazál nad/pod obvyklým</span><span>? nezapsané jídlo</span><span><b class="sw" style="background:var(--red);opacity:.9;border-radius:50%"></b>glukometr</span></div>
       <label class="cv-toggle"><input type="checkbox" id="cv-fit"${showFit ? ' checked' : ''}> ukazovat přepočet z glykémie</label></div>`;
 
     // ── Kde a o kolik ──
@@ -180,7 +181,8 @@
       const iv = cv.intervals.find(i => i.logged && tk >= i.a && tk <= i.b);
       const p = iv?.logged.find(q => q.t === tk), a = cv.actual[k];
       const carb = cv.carbs.reduce((s, c) => s + c.rate[k], 0);
-      $('#cv-read').innerHTML = `<b>${hhmm(tk)}</b> · CGM ${fmt(a)}${p ? ` · předpověď ${fmt(p.v)}${a != null ? ` (<b>${sgn(a - p.v)}</b>)` : ''}` : ''} ${uLbl()}<br>sacharidy +${fmt(carb)} · inzulin −${fmt(cv.ins[k])} ${uLbl()} za h${cv.insBasal[k] >= 0.05 ? ` (z toho bazál nad obvyklým −${fmt(cv.insBasal[k])})` : cv.insBasal[k] <= -0.05 ? ` · bazál pod obvyklým +${fmt(-cv.insBasal[k])}` : ''}`;
+      const mt = (cv.meter || []).find(r => Math.abs(r.t - tk) <= 10 * MIN);
+      $('#cv-read').innerHTML = `<b>${hhmm(tk)}</b> · CGM ${fmt(a)}${mt ? ` · glukometr ${fmt(mt.v)} (${hhmm(mt.t)})` : ''}${p ? ` · předpověď ${fmt(p.v)}${a != null ? ` (<b>${sgn(a - p.v)}</b>)` : ''}` : ''} ${uLbl()}<br>sacharidy +${fmt(carb)} · inzulin −${fmt(cv.ins[k])} ${uLbl()} za h${cv.insBasal[k] >= 0.05 ? ` (z toho bazál nad obvyklým −${fmt(cv.insBasal[k])})` : cv.insBasal[k] <= -0.05 ? ` · bazál pod obvyklým +${fmt(-cv.insBasal[k])}` : ''}`;
     };
     svg.addEventListener('pointerdown', show);
     svg.addEventListener('pointermove', ev => { if (ev.pointerType === 'mouse' || ev.buttons || ev.pressure > 0) show(ev); });

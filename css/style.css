@@ -460,3 +460,9 @@ code { font-size: 12.5px; background: var(--track); padding: 1px 5px; border-rad
 .cnew-facts { margin: 6px 0 2px; }
 .cnew-facts .chip { padding: 6px 10px; font-size: 13px; }
 #cnew-facts-list { margin-bottom: 8px; }
+
+/* Glukometr */
+.bg-meter { fill: var(--red); stroke: var(--card); stroke-width: 1.2; }
+.meter-row { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin: 4px 0 10px; }
+.meter-row .ev-actions { margin-top: 0; }
+.bgm-ico { display: flex; align-items: center; justify-content: center; font-size: 22px; background: var(--track); }
