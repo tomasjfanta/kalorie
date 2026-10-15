@@ -1100,7 +1100,9 @@
     return { n: prep.length, global: Math.exp(mu), cats };
   }
 
-  const REL_SD = { confirmed: 0.10, good: 0.25, fair: 0.40, weighed: 0.08 }; // weighed = celé jídlo zvážené, AI naslepo
+  // weighed = celé jídlo zvážené, AI naslepo: váha ~0,08, ale jen 2 běhy AI (hlučnější než 6) → 0,17 celkem.
+  // Jedno zvážené jídlo tak posune opravy zhruba o třetinu cesty — stejné tempo jako u oprav jednotlivých AI.
+  const REL_SD = { confirmed: 0.10, good: 0.25, fair: 0.40, weighed: 0.17 };
   const AI_NOISE = 0.20;   // rozptyl AI mezi jídly (log)
   const PRIOR_G = 0.30, PRIOR_C = 0.20, HALF_LIFE_D = 60;
 

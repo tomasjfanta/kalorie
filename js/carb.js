@@ -37,7 +37,7 @@
   let calCache = null;
   // Zvážené jídlo jako štítek pro opravy AI: jen celé jídlo zvážené, AI naslepo (od v29) a zapsané sacharidy
   // nepřepsané daleko od hodnoty z váhy. Do kalibrace z fotek nejde (ta nese i vyrovnání poměru v pumpě).
-  const weighedLabel = e => (e.weighed?.blind && !e.weighed.what && e.weighed.c > 0 && Math.abs(e.s - e.weighed.c) <= Math.max(3, 0.1 * e.weighed.c) ? e.weighed.c : null);
+  const weighedLabel = e => (e.weighed?.blind && !e.weighed.what && !e.weighed.disagree?.length && e.weighed.c > 0 && Math.abs(e.s - e.weighed.c) <= Math.max(3, 0.1 * e.weighed.c) ? e.weighed.c : null);
   // Jídla z dotazu jiné verze se učí se čtvrtinovou vahou (změna dotazu posouvá odhady).
   const pvW = e => ((e.pv || 1) === LEARN.PROMPT_V ? 1 : 0.25);
   function samples() {
@@ -285,7 +285,7 @@
       updateTails(); // změna naučené pozdní vlny → příští průchod jídla přepočítá
       let sent = false;
       for (const e of all) {
-        if (e.weighed?.blind && e.weighed.per && e.portionSent !== e.weighed.g) {
+        if (e.weighed?.blind && e.weighed.per && !e.weighed.disagree?.length && e.portionSent !== e.weighed.g) {
           JOBS.logAi({ flow: 'portion', vendor: 'all', ok: true, job: e.id, label: e.weighed.g, per: e.weighed.per, msg: e.weighed.what || '', kat: e.kat });
           e.portionSent = e.weighed.g; sent = true;
         }
@@ -580,7 +580,15 @@
       const blind = runs.filter(r => r.cBlind > 0), Eb = blind.length ? LEARN.ensemble(blind.map(r => ({ ...r, c: r.cBlind })), vw()) : null, per = {};
       for (const v of new Set(runs.map(r => LEARN.vendorOf(r.model)))) { const gs = runs.filter(r => LEARN.vendorOf(r.model) === v && r.aiG > 0).map(r => r.aiG).sort((p, q) => p - q); if (gs.length) per[v] = Math.round(gs[gs.length >> 1]); }
       const all = Object.values(per).sort((p, q) => p - q);
-      wInfo = { ...weighed, blind: true, c: Math.round(E.c * 10) / 10, aiC: Eb ? Math.round(Eb.c * 10) / 10 : undefined, ai: all.length ? all[all.length >> 1] : undefined, per };
+      // Se 2 běhy nejde hlasovat o vymyšlených složkách — aspoň poznat neshodu: složky se sacharidy (≥ 3 g),
+      // které uvedl jen jeden běh. Takové jídlo neučí (štítek ani porce) a uživatel ho má zkontrolovat.
+      const keySets = runs.filter(r => r.items).map(r => new Set(r.items.filter(i => i.c >= 3).map(i => i.k)));
+      const disagree = [];
+      if (keySets.length >= 2) for (const r of runs.filter(x => x.items)) for (const i of r.items) {
+        if (i.c >= 3 && keySets.some(ks => !ks.has(i.k)) && !disagree.includes(i.n)) disagree.push(i.n);
+      }
+      wInfo = { ...weighed, blind: true, c: Math.round(E.c * 10) / 10, aiC: Eb ? Math.round(Eb.c * 10) / 10 : undefined, ai: all.length ? all[all.length >> 1] : undefined, per,
+        ...(disagree.length ? { disagree } : {}) };
     }
     return {
       E, errors: res.errors || {}, name: (j.nazev || 'Jídlo').trim() + (j.mnozstvi ? ' (' + String(j.mnozstvi).trim() + ')' : ''),
@@ -710,7 +718,8 @@
     const alcTxt = a.alc ? '<br>🍷 Alkohol — glykémii ovlivní ještě hodiny, toto jídlo se nepoužije k učení.' : '';
     const wd = a.weighed, wPct = wd?.ai > 0 ? Math.round((wd.ai / wd.g - 1) * 100) : null;
     const wTxt = wd ? ` <b>· ⚖️ zváženo ${wd.g} g${wd.what ? ' (' + esc(wd.what) + ')' : ''} → ${r0(wd.c)} g sacharidů</b> (z váhy, bez kalibrace z fotek)`
-      + (wd.ai > 0 ? `<br><span class="muted small-text">AI naslepo odhadla ${wd.what ? 'tuto složku' : 'porci'} na ~${wd.ai} g${Object.keys(wd.per).length > 1 ? ` (${Object.entries(wd.per).map(([v, g]) => `${LEARN.VENDOR_LABEL[v]} ${g} g`).join(' · ')})` : ''} — ${Math.abs(wPct) < 5 ? 'skoro přesně' : `o ${Math.abs(wPct)} % ${wPct < 0 ? 'méně' : 'víc'}`}. Z porovnání s váhou se učí opravy jednotlivých AI.</span>` : '')
+      + (wd.disagree?.length ? `<br><b>⚠️ Claude a Gemini se neshodují na složkách: ${wd.disagree.map(esc).join(', ')} — zkontrolujte, co na talíři opravdu je (část vaší hmotnosti připadla i na ně).</b> Pokud tam nejsou, opravte název jídla; toto jídlo se k učení nepoužije.` : '')
+      + (wd.ai > 0 ? `<br><span class="muted small-text">AI naslepo odhadla ${wd.what ? 'tuto složku' : 'porci'} na ~${wd.ai} g${Object.keys(wd.per).length > 1 ? ` (${Object.entries(wd.per).map(([v, g]) => `${LEARN.VENDOR_LABEL[v]} ${g} g`).join(' · ')})` : ''} — ${Math.abs(wPct) < 5 ? 'skoro přesně' : `o ${Math.abs(wPct)} % ${wPct < 0 ? 'méně' : 'víc'}`}.${wd.disagree?.length ? '' : ' Z porovnání s váhou se učí opravy jednotlivých AI.'}</span>` : '')
       : a.weighMiss ? `<br><b>⚠️ „${esc(a.weighMiss.what)}" není mezi složkami, které AI na fotce našla — hmotnost ${a.weighMiss.g} g nepoužita.</b> Upřesněte název (např. jak je v seznamu složek níže) přes „⚖️ zvážil jsem…", nebo zadejte hmotnost celého jídla.` : '';
     $('#cnew-ai').innerHTML = `AI odhad: ${r0(a.aiRaw)} g${wTxt}${calTxt}${runsTxt}${itemsTxt}${failTxt}${alcTxt}${a.poznamka ? '<br>' + esc(a.poznamka) : ''}`;
     newConf();
@@ -1264,7 +1273,7 @@
         + '<p class="muted small-text">Oproti obecnému glykemickému indexu. Používá se při vyhodnocení dalších jídel.</p></div>';
     }
     // Odhad porcí: AI naslepo vs. váha (zvážená jídla)
-    const wm = all.filter(e => e.weighed?.blind && e.weighed.per && Object.keys(e.weighed.per).length);
+    const wm = all.filter(e => e.weighed?.blind && e.weighed.per && !e.weighed.disagree?.length && Object.keys(e.weighed.per).length);
     if (wm.length) {
       const byV = {};
       for (const e of wm) for (const [v, g] of Object.entries(e.weighed.per)) if (g > 0) (byV[v] ??= []).push(Math.log(g / e.weighed.g));
