@@ -42,9 +42,12 @@
   const pvW = e => ((e.pv || 1) === LEARN.PROMPT_V ? 1 : 0.25);
   function samples() {
     const V = vw();
-    return photoEntries().filter(e => !e.excl && e.aiRaw && !e.weighed).map(e => { // zvážená jídla AI porci neodhadovala
+    // Zvážená jídla jen celá a naslepo (src 'weighed'): v kalibraci zpřesní rozdíly mezi druhy jídla, celkovou
+    // úroveň (s vyrovnáním poměru v pumpě) dál určuje glykémie — viz LEARN.calibrate.
+    return photoEntries().filter(e => !e.excl && e.aiRaw && (!e.weighed || weighedLabel(e))).map(e => {
       // AI hodnota z uložených běhů s dnešní opravou jednotlivých AI → kalibrace se učí jen to, co zbude
       const aiRaw = e.aiRuns?.length ? (LEARN.ensemble(e.aiRuns.map(r => ({ c: r.c, model: r.m })), V).c || e.aiRaw) : e.aiRaw;
+      if (e.weighed) return { ts: e.ts, kat: e.kat, aiRaw, label: weighedLabel(e), src: 'weighed', w: 1 };
       if (e.conf != null) return { ts: e.ts, kat: e.kat, aiRaw, label: e.conf, src: 'confirmed', w: pvW(e) };
       if (e.ev?.implied && (e.ev.quality === 'good' || e.ev.quality === 'fair')) return { ts: e.ts, kat: e.kat, aiRaw, label: e.ev.implied, src: e.ev.quality, labSd: e.ev.relSd, w: pvW(e) };
       return null;
@@ -1240,10 +1243,11 @@
     }
     h += '</div>';
     h += trendCards(all, now);
-    const cats = Object.entries(c.cats || {}).filter(([, v]) => v.n > 0).sort((a, b) => b[1].n - a[1].n);
-    if (cats.length) {
+    const cats = Object.entries(c.cats || {}).filter(([, v]) => v.n > 0 || v.nW > 0).sort((a, b) => (b[1].n + b[1].nW) - (a[1].n + a[1].nW));
+    if (cats.length && c.n) {
       h += '<div class="card"><div class="card-title">Podle druhu jídla</div>' + cats.map(([k, v]) =>
-        `<div class="learn-row"><span>${LEARN.CATS[k].label}<br><span class="muted small-text">${v.n} ověř.</span></span><b>${Math.abs(v.factor - 1) < 0.03 ? 'přesné' : 'korekce ' + pctTxt(v.factor)}</b></div>`).join('') + '</div>';
+        `<div class="learn-row"><span>${LEARN.CATS[k].label}<br><span class="muted small-text">${v.n} ověř.${v.nW ? ` · ${v.nW} zvážených` : ''}</span></span><b>${Math.abs(v.factor - 1) < 0.03 ? 'přesné' : 'korekce ' + pctTxt(v.factor)}</b></div>`).join('')
+        + (c.nWeighed ? '<p class="muted small-text">Zvážená jídla zpřesňují, jak se druhy jídla liší od sebe; celkovou úroveň dál určuje glykémie (zahrnuje i to, jak k vám sedí poměr v pumpě).</p>' : '') + '</div>';
     }
     // Denní doba (zbytková chyba AI po korekci podle druhu jídla)
     const bl = Object.entries(c.blocks || {}).filter(([, v]) => v.n > 0);
@@ -1270,7 +1274,7 @@
           const m = Math.exp(ls.sort((p, q) => p - q)[ls.length >> 1]), pct = Math.round((m - 1) * 100), fx = vwx[v];
           return `<div class="learn-row"><span>${LEARN.VENDOR_LABEL[v]}<br><span class="muted small-text">${ls.length}× · ${fx ? `oprava teď ×${dec(Math.round(Math.exp(fx.a) * 100) / 100)}` : 'oprava zatím žádná'}</span></span><b>${Math.abs(pct) < 5 ? 'skoro přesně' : `porce o ~${Math.abs(pct)} % ${pct < 0 ? 'menší' : 'větší'}`}</b></div>`;
         }).join('')
-        + '<p class="muted small-text">Projeví se samo: AI, která porce odhaduje líp, dostane větší váhu, a typická chyba každé AI (i u velkých porcí) se v dalších odhadech opravuje — znatelně zhruba po 5–10 zvážených jídlech na každou AI. Kalibrace z fotek podle druhu jídla a denní doby se dál učí z glykémie, protože ta zahrnuje i to, jak k vám sedí poměr v pumpě.</p></div>';
+        + '<p class="muted small-text">Projeví se samo: AI, která porce odhaduje líp, dostane větší váhu, a typická chyba každé AI (i u velkých porcí) se v dalších odhadech opravuje — znatelně zhruba po 5–10 zvážených jídlech na každou AI. Zvážená jídla navíc zpřesní korekci podle druhu jídla (karta Podle druhu jídla) — jen rozdíly mezi druhy; celkovou úroveň a denní dobu dál určuje glykémie, protože zahrnuje i to, jak k vám sedí poměr v pumpě.</p></div>';
     }
     // Pozdní vlna po jídle (naučená) a odpovědi na „Co se stalo?"
     const tl = Object.entries(tails().cats).filter(([, x]) => x.n > 0), usedT = K.store.get('kal.tails', {});

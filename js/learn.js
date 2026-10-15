@@ -1114,36 +1114,59 @@
       const v = labSd(s) ** 2 + AI_NOISE ** 2;
       return { ...s, kat: catKey(s.kat), y: Math.log(s.label / s.aiRaw), w: decay / v, decay, lab: labSd(s) ** 2 };
     });
-    const sw = prep.reduce((a, s) => a + s.w, 0);
-    const mu = prep.reduce((a, s) => a + s.w * s.y, 0) / (1 / PRIOR_G ** 2 + sw);
+    // Zvážená jídla (src 'weighed', AI naslepo vs. váha) nesou jen chybu odhadu PORCE — ne vyrovnání poměru
+    // v pumpě, které je ve štítcích z glykémie. Společný odhad: glykémie y = mu + d_k, zvážená y = q + d_k
+    // (q = vlastní úroveň zvážených). Celkovou úroveň mu (s vyrovnáním poměru) tak dál určuje jen glykémie;
+    // zvážená jídla zpřesní jen to, jak se který druh jídla liší od ostatních (d_k). Až ze 2 druhů jídel.
+    const wp = prep.filter(s => s.src === 'weighed');
+    const gp = prep.filter(s => s.src !== 'weighed');
+    const useW = new Set(wp.map(s => s.kat)).size >= 2;
+    const KS = Object.keys(CATS);
+    let mu;
     const cats = {};
-    for (const k of Object.keys(CATS)) {
-      const cs = prep.filter(s => s.kat === k);
-      const cw = cs.reduce((a, s) => a + s.w, 0);
-      const m = (mu / PRIOR_C ** 2 + cs.reduce((a, s) => a + s.w * s.y, 0)) / (1 / PRIOR_C ** 2 + cw);
-      cats[k] = { factor: clamp(Math.exp(m)), n: cs.length, mu: m };
+    if (useW) {
+      const n = KS.length + 2, A = Array.from({ length: n }, (_, i) => Array.from({ length: n }, (_, j) => (i !== j ? 0 : i === 0 ? 1 / PRIOR_G ** 2 : i === 1 ? 1 : 1 / PRIOR_C ** 2))), b = Array(n).fill(0);
+      for (const s of prep) {
+        const x = Array(n).fill(0); x[s.src === 'weighed' ? 1 : 0] = 1; x[2 + KS.indexOf(s.kat)] = 1;
+        for (let i = 0; i < n; i++) { if (!x[i]) continue; b[i] += s.w * s.y; for (let j = 0; j < n; j++) A[i][j] += s.w * x[i] * x[j]; }
+      }
+      const C = invert(A), sol = C ? C.map(r => r.reduce((a, v, j) => a + v * b[j], 0)) : null;
+      if (sol) {
+        mu = sol[0];
+        KS.forEach((k, i) => { const m = sol[0] + sol[2 + i]; cats[k] = { factor: clamp(Math.exp(m)), n: gp.filter(s => s.kat === k).length, nW: wp.filter(s => s.kat === k).length, mu: m }; });
+      }
+    }
+    if (mu == null) {
+      const sw = gp.reduce((a, s) => a + s.w, 0);
+      mu = gp.reduce((a, s) => a + s.w * s.y, 0) / (1 / PRIOR_G ** 2 + sw);
+      for (const k of KS) {
+        const cs = gp.filter(s => s.kat === k);
+        const cw = cs.reduce((a, s) => a + s.w, 0);
+        const m = (mu / PRIOR_C ** 2 + cs.reduce((a, s) => a + s.w * s.y, 0)) / (1 / PRIOR_C ** 2 + cw);
+        cats[k] = { factor: clamp(Math.exp(m)), n: cs.length, nW: 0, mu: m };
+      }
     }
     // Denní doba: co zbude po korekci podle druhu jídla (např. ráno vyšší inzulinová rezistence,
     // kterou nastavení pumpy úplně nepokrývá) — smrštěno k nule, s málo daty bez vlivu.
     const blocks = {};
     for (const b of Object.keys(BLOCKS)) {
-      const bs = prep.filter(s => blockOf(s.ts) === b);
+      const bs = gp.filter(s => blockOf(s.ts) === b);
       const m = bs.reduce((a, s) => a + s.w * (s.y - cats[s.kat].mu), 0) / (1 / PRIOR_B ** 2 + bs.reduce((a, s) => a + s.w, 0));
       blocks[b] = { factor: Math.exp(m), n: bs.length, mu: m };
     }
     const resid = s => s.y - cats[s.kat].mu - blocks[blockOf(s.ts)].mu;
     // Osobní přesnost po kalibraci: rozptyl reziduí minus šum samotných „pravd".
     let sd = null;
-    if (prep.length >= 5) {
-      const dw = prep.reduce((a, s) => a + s.decay, 0);
-      const r2 = prep.reduce((a, s) => a + s.decay * resid(s) ** 2, 0) / dw;
-      const lab = prep.reduce((a, s) => a + s.decay * s.lab, 0) / dw;
+    if (gp.length >= 5) {
+      const dw = gp.reduce((a, s) => a + s.decay, 0);
+      const r2 = gp.reduce((a, s) => a + s.decay * resid(s) ** 2, 0) / dw;
+      const lab = gp.reduce((a, s) => a + s.decay * s.lab, 0) / dw;
       sd = Math.min(0.6, Math.max(0.10, Math.sqrt(Math.max(0, r2 - lab))));
     }
     // Typická chyba AI před kalibrací (pro srovnání na obrazovce Učení).
-    const mapeBefore = prep.length ? median(prep.map(s => Math.abs(Math.exp(s.y) - 1))) : null;
-    const mapeAfter = prep.length ? median(prep.map(s => Math.abs(Math.exp(resid(s)) - 1))) : null;
-    return { n: prep.length, nConfirmed: prep.filter(s => s.src === 'confirmed').length, global: clamp(Math.exp(mu)), cats, blocks, sd, mapeBefore, mapeAfter };
+    const mapeBefore = gp.length ? median(gp.map(s => Math.abs(Math.exp(s.y) - 1))) : null;
+    const mapeAfter = gp.length ? median(gp.map(s => Math.abs(Math.exp(resid(s)) - 1))) : null;
+    return { n: gp.length, nWeighed: useW ? wp.length : 0, nConfirmed: gp.filter(s => s.src === 'confirmed').length, global: clamp(Math.exp(mu)), cats, blocks, sd, mapeBefore, mapeAfter };
   }
   const clamp = f => Math.min(1.6, Math.max(0.6, f));
   // Části dne pro kalibraci (místní čas jídla).
