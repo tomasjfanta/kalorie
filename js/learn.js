@@ -1333,7 +1333,8 @@
   }
   // Zvážené jídlo: hmotnost je přesná, AI jen rozpozná jídlo. w = { g, what }: bez "what" = vše na fotce →
   // viditelné složky se přeškálují na součet g (neviditelné předpoklady zůstanou); s "what" = jedna složka →
-  // ta dostane přesně g (sacharidy podle její hustoty). Když se složka nenajde, platí pro celé jídlo.
+  // ta dostane přesně g (sacharidy podle její hustoty). Když se pojmenovaná složka nenajde, NIC se nemění
+  // (weighMiss) — přeškálovat celý talíř na hmotnost jedné složky by sacharidy podhodnotilo.
   const norm = x => String(x || '').toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '');
   function applyWeight(t, w) {
     if (!t || !(w?.g > 0) || !t.items.length) return t;
@@ -1348,6 +1349,7 @@
       }
     }
     if (target) { target.c *= w.g / target.g; target.g = w.g; }
+    else if (words.length) return { ...t, weighMiss: true };
     else {
       const vis = items.filter(i => i.vis), sum = vis.reduce((a, i) => a + i.g, 0);
       if (sum > 0) for (const i of vis) { const f = w.g / sum; i.g *= f; i.c *= f; }

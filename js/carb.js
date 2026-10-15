@@ -536,7 +536,7 @@
     let min = t ? t.min : +j.sacharidy_min, max = t ? t.max : +j.sacharidy_max;
     if (!(isFinite(min) && isFinite(max)) || min < 0) { min = undefined; max = undefined; }
     else if (min > max) [min, max] = [max, min];
-    return { c: t ? t.c : Math.max(0, +j.sacharidy || 0), items: t?.items, min, max, kat: LEARN.catKey(j.kategorie), gi: j.gi, j, model,
+    return { c: t ? t.c : Math.max(0, +j.sacharidy || 0), items: t?.items, weighMiss: !!(weighed && (!t || t.weighMiss)), min, max, kat: LEARN.catKey(j.kategorie), gi: j.gi, j, model,
       jist: /vys|high/.test(jt) ? 2 : /níz|niz|low/.test(jt) ? 0 : 1 };
   }
   const progress = (k, n) => {
@@ -545,8 +545,13 @@
   };
 
   // Výsledek všech odhadů → hodnoty jídla (stejné pro okno i pro automatické uložení).
-  function buildAi(res, ts, weighed) {
-    const runs = res.runs.map(r => parseRun(r, weighed));
+  function buildAi(res, ts, weighOrig) {
+    let runs = res.runs.map(r => parseRun(r, weighOrig));
+    // Zvážená složka, kterou žádný odhad mezi složkami nemá → hmotnost nepoužít (běžný odhad + upozornění);
+    // když ji mají jen některé odhady, počítá se jen s nimi.
+    const hit = runs.filter(r => !r.weighMiss), weighMiss = weighOrig?.g > 0 && !hit.length ? weighOrig : null;
+    const weighed = weighOrig?.g > 0 && hit.length ? weighOrig : null;
+    if (weighed) runs = hit; else if (weighMiss) runs = res.runs.map(r => parseRun(r, null));
     // Shoda složek: položka, kterou uvede méně než polovina odhadů, se nepočítá (vymyšlená);
     // chybí-li v některém odhadu složka, kterou mají ostatní, doplní se jejich mediánem.
     const cons = LEARN.itemConsensus(runs);
@@ -563,7 +568,7 @@
       sMin: E.min != null ? E.min * c.factor : undefined, sMax: E.max != null ? E.max * c.factor : undefined,
       sSd: E.sd != null ? E.sd * c.factor : undefined, runs: runs.map(r => ({ m: r.model, c: Math.round(r.c * 10) / 10 })),
       items: (cons ? cons.items : E.rep.items || []).map(i => ({ k: i.k, n: i.n, g: Math.round(i.g), c: Math.round(i.c * 10) / 10, vis: i.vis })),
-      dropped: cons?.dropped || [], pv: runs.some(r => r.items) ? LEARN.PROMPT_V : 1, weighed: weighed?.g > 0 ? weighed : undefined,
+      dropped: cons?.dropped || [], pv: runs.some(r => r.items) ? LEARN.PROMPT_V : 1, weighed: weighed?.g > 0 ? weighed : undefined, weighMiss,
       fat: Math.max(0, +j.tuky || 0), kcal: Math.round(+j.kcal || 0), b: Math.round(+j.bilkoviny || 0), t: Math.round(+j.tuky || 0),
     };
   }
@@ -681,7 +686,8 @@
     const failTxt = Object.entries(a.errors).map(([v, e]) =>
       `<br><span class="muted small-text">⚠️ ${LEARN.VENDOR_LABEL[v]} tentokrát neodpověděl: ${esc(AI.errMsg(e))}</span>`).join('');
     const alcTxt = a.alc ? '<br>🍷 Alkohol — glykémii ovlivní ještě hodiny, toto jídlo se nepoužije k učení.' : '';
-    const wTxt = a.weighed ? ` <b>· ⚖️ zváženo ${a.weighed.g} g${a.weighed.what ? ' (' + esc(a.weighed.what) + ')' : ''}</b> — AI jen rozpoznala jídlo, kalibrace z fotek se nepoužila` : '';
+    const wTxt = a.weighed ? ` <b>· ⚖️ zváženo ${a.weighed.g} g${a.weighed.what ? ' (' + esc(a.weighed.what) + ')' : ''}</b> — AI jen rozpoznala jídlo, kalibrace z fotek se nepoužila`
+      : a.weighMiss ? `<br><b>⚠️ „${esc(a.weighMiss.what)}" není mezi složkami, které AI na fotce našla — hmotnost ${a.weighMiss.g} g nepoužita.</b> Upřesněte název (např. jak je v seznamu složek níže) přes „⚖️ zvážil jsem…", nebo zadejte hmotnost celého jídla.` : '';
     $('#cnew-ai').innerHTML = `AI odhad: ${r0(a.aiRaw)} g${wTxt}${calTxt}${runsTxt}${itemsTxt}${failTxt}${alcTxt}${a.poznamka ? '<br>' + esc(a.poznamka) : ''}`;
     newConf();
     $('#cnew-status').textContent = '';
@@ -883,7 +889,7 @@
       if (ev?.dur) h += `<div class="ev-metrics">Vstřebávání: ${LEARN.GI_LABEL[ev.gi] || 'podle druhu jídla'}${catTail(e.kat) ? ` + pozdní vlna ~${Math.round(catTail(e.kat) * 100)} % (naučeno pro ${LEARN.CATS[LEARN.catKey(e.kat)].short})` : ''}${ev.absorbed != null ? ` — do konce okna ~${Math.round(ev.absorbed * 100)} %` : ''}.</div>`;
       if (ev?.fit?.used) {
         const sp = ev.fit.speed, pct = Math.round(Math.abs(sp - 1) * 100);
-        h += `<div class="ev-metrics">📈 Celý průběh glykémie odpovídá modelu (odchylka ±${fmtBG(ev.fit.rmse)} ${uLbl()}); jídlo se u vás vstřebávalo ${sp > 1.08 ? `o ~${pct} % rychleji` : sp < 0.93 ? `o ~${pct} % pomaleji` : 'obvyklou rychlostí'}${ev.fit.informative ? ' — aplikace si to pamatuje pro podobná jídla' : ''}.</div>`;
+        h += `<div class="ev-metrics">📈 Průběh glykémie u tohoto jídla odpovídá modelu (odchylka ±${fmtBG(ev.fit.rmse)} ${uLbl()}); jídlo se u vás vstřebávalo ${sp > 1.08 ? `o ~${pct} % rychleji` : sp < 0.93 ? `o ~${pct} % pomaleji` : 'obvyklou rychlostí'}${ev.fit.informative ? ' — aplikace si to pamatuje pro podobná jídla' : ''}.</div>`;
       }
       if (ev?.heavy) h += `<div class="ev-metrics">🧈 Hodně tuku a bílkovin (~${dec(K.r1(ev.fpu))} FPU) — vyhodnoceno 4 h, jejich pozdní vliv (~${r0(ev.fpuCarbs)} g „sacharidů") je započten zvlášť.</div>`;
       else if (ev?.fpuCarbs > 3) h += `<div class="ev-metrics">🧈 Tuk a bílkoviny přidaly v okně ~${r0(ev.fpuCarbs)} g „sacharidů" — započteno zvlášť.</div>`;

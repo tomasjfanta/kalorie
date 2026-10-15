@@ -50,7 +50,8 @@ for (const [k, es] of Object.entries(acc)) {
   console.log(`${k.padEnd(24)} n=${es.length} · MAE ${mae.toFixed(1)} g · typical error ±${Math.round((Math.exp(Math.sqrt(es.reduce((a, x) => a + x.r * x.r, 0) / es.length)) - 1) * 100)} % · bias ${bias >= 0 ? '+' : ''}${Math.round((Math.exp(bias) - 1) * 100)} %${bigBias != null ? ` · on meals ≥60 g ${bigBias >= 0 ? '+' : ''}${Math.round((Math.exp(bigBias) - 1) * 100)} % (${big.length})` : ''}`);
 }
 const spread = {};
-for (const [, xs] of Object.entries(group(x => x.job && x.ok && x.carbs != null ? `${x.job}|${x.vendor}|${x.pv || 1}` : 'no'))) {
+// zvážená jídla (flow photo-weighed) mají hmotnost danou → rozptyl by vyšel uměle malý
+for (const [, xs] of Object.entries(group(x => x.job && x.ok && x.carbs != null && x.flow !== 'photo-weighed' ? `${x.job}|${x.vendor}|${x.pv || 1}` : 'no'))) {
   if (xs[0]?.job == null || xs.length < 2) continue;
   const cs = xs.map(x => x.carbs).filter(c => c > 0), m = cs.reduce((a, c) => a + c, 0) / cs.length;
   if (cs.length < 2 || !(m > 0)) continue;
