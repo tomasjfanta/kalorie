@@ -1100,7 +1100,7 @@
     return { n: prep.length, global: Math.exp(mu), cats };
   }
 
-  const REL_SD = { confirmed: 0.10, good: 0.25, fair: 0.40 };
+  const REL_SD = { confirmed: 0.10, good: 0.25, fair: 0.40, weighed: 0.08 }; // weighed = celé jídlo zvážené, AI naslepo
   const AI_NOISE = 0.20;   // rozptyl AI mezi jídly (log)
   const PRIOR_G = 0.30, PRIOR_C = 0.20, HALF_LIFE_D = 60;
 
@@ -1348,14 +1348,16 @@
         if (hit > best) { best = hit; target = it; }
       }
     }
-    if (target) { target.c *= w.g / target.g; target.g = w.g; }
+    let aiG; // hmotnost, kterou AI pro zváženou část odhadla sama (naslepo) — pro učení odhadu porcí
+    if (target) { aiG = target.g; target.c *= w.g / target.g; target.g = w.g; }
     else if (words.length) return { ...t, weighMiss: true };
     else {
       const vis = items.filter(i => i.vis), sum = vis.reduce((a, i) => a + i.g, 0);
+      aiG = sum;
       if (sum > 0) for (const i of vis) { const f = w.g / sum; i.g *= f; i.c *= f; }
     }
     const c = items.reduce((a, i) => a + i.c, 0), k = t.c > 0 ? c / t.c : 1;
-    return { ...t, items, c, min: t.min != null ? t.min * k : undefined, max: t.max != null ? t.max * k : undefined, weighed: true };
+    return { ...t, items, c, min: t.min != null ? t.min * k : undefined, max: t.max != null ? t.max * k : undefined, weighed: true, aiG };
   }
 
   // Shoda složek mezi odhady téže fotky: složka (podle klíče) platí, když ji uvede aspoň polovina
@@ -1403,13 +1405,15 @@
       for (const [v, xs] of Object.entries(by)) {
         const med = median(xs);
         if (!(med >= 3)) continue;
-        (acc[v] ??= []).push({ x: Math.log(med / VC_REF), e: Math.log(s.label / med), d: decay, v: (s.labSd > 0 ? Math.min(1, s.labSd) : 0.15) ** 2 + 0.15 ** 2 });
+        // šum jednoho jídla: nejistota štítku + rozptyl AI mezi jídly (jako v kalibraci)
+        (acc[v] ??= []).push({ x: Math.log(med / VC_REF), e: Math.log(s.label / med), d: decay, v: (s.labSd > 0 ? Math.min(1, s.labSd) : 0.15) ** 2 + AI_NOISE ** 2 });
       }
     }
     const out = {};
     for (const [v, rows] of Object.entries(acc)) {
-      // bayesovská přímka s předpokladem a, b ~ N(0; 0,25²) — s málo jídly se oprava skoro nehne
-      const P = [[1 / 0.25 ** 2, 0], [0, 1 / 0.25 ** 2]], q = [0, 0];
+      // bayesovská přímka s předpokladem a, b ~ N(0; 0,15²) — jedno jídlo opravu posune zhruba o třetinu,
+      // 5–10 shodných jídel většinou cesty (oprava jde přes odhady do pumpy, tak ne zbrkle)
+      const P = [[1 / 0.15 ** 2, 0], [0, 1 / 0.15 ** 2]], q = [0, 0];
       for (const r of rows) { const w = r.d / r.v, x = [1, r.x]; for (let i = 0; i < 2; i++) { q[i] += w * x[i] * r.e; for (let j = 0; j < 2; j++) P[i][j] += w * x[i] * x[j]; } }
       const C = invert(P) || [[0, 0], [0, 0]];
       const fa = C[0][0] * q[0] + C[0][1] * q[1], fb = C[1][0] * q[0] + C[1][1] * q[1];

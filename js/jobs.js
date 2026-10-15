@@ -26,7 +26,7 @@
   function logAi(ev) {
     const rec = { at: Date.now(), dev, v: K.VERSION, mode: K.isCarb() ? 'carb' : 'kcal' };
     for (const [k, v] of Object.entries(ev)) if (v !== undefined && v !== null && v !== '') rec[k] = typeof v === 'string' ? scrub(v) : v;
-    if (ev.flow !== 'label') { // ověřené hodnoty jen k rozboru na server, ne do přehledu spolehlivosti
+    if (ev.flow !== 'label' && ev.flow !== 'portion') { // ověřené hodnoty jen k rozboru na server, ne do přehledu spolehlivosti
       const log = K.store.get('kal.aiLog', []); log.push(rec); if (log.length > 600) log.splice(0, log.length - 600);
       K.store.set('kal.aiLog', log);
     }

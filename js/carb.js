@@ -35,6 +35,9 @@
 
   /* ─── Učení: osobní kalibrace AI ─── */
   let calCache = null;
+  // Zvážené jídlo jako štítek pro opravy AI: jen celé jídlo zvážené, AI naslepo (od v29) a zapsané sacharidy
+  // nepřepsané daleko od hodnoty z váhy. Do kalibrace z fotek nejde (ta nese i vyrovnání poměru v pumpě).
+  const weighedLabel = e => (e.weighed?.blind && !e.weighed.what && e.weighed.c > 0 && Math.abs(e.s - e.weighed.c) <= Math.max(3, 0.1 * e.weighed.c) ? e.weighed.c : null);
   // Jídla z dotazu jiné verze se učí se čtvrtinovou vahou (změna dotazu posouvá odhady).
   const pvW = e => ((e.pv || 1) === LEARN.PROMPT_V ? 1 : 0.25);
   function samples() {
@@ -279,7 +282,11 @@
       updateTails(); // změna naučené pozdní vlny → příští průchod jídla přepočítá
       let sent = false;
       for (const e of all) {
-        const lab = e.conf != null ? { label: e.conf, src: 'confirmed' }
+        if (e.weighed?.blind && e.weighed.per && e.portionSent !== e.weighed.g) {
+          JOBS.logAi({ flow: 'portion', vendor: 'all', ok: true, job: e.id, label: e.weighed.g, per: e.weighed.per, msg: e.weighed.what || '', kat: e.kat });
+          e.portionSent = e.weighed.g; sent = true;
+        }
+        const lab = e.conf != null ? { label: e.conf, src: 'confirmed' } : weighedLabel(e) ? { label: weighedLabel(e), src: 'weighed' }
           : e.ev?.final && e.ev.implied && (e.ev.quality === 'good' || e.ev.quality === 'fair') ? { label: e.ev.implied, src: e.ev.quality } : null;
         if (!lab || !e.aiRuns?.length || e.excl) continue;
         const key = `${lab.src}:${Math.round(lab.label)}`;
@@ -522,7 +529,9 @@
   let vwCache = null;
   // Váhy AI podle jejich ověřené přesnosti u vás (viz LEARN.vendorWeights).
   function vw() {
-    if (!vwCache) vwCache = LEARN.vendorWeights(photoEntries().filter(e => !e.excl && e.aiRuns?.length && !e.weighed).map(e => ({
+    if (!vwCache) vwCache = LEARN.vendorWeights(photoEntries().filter(e => !e.excl && e.aiRuns?.length && (!e.weighed || weighedLabel(e))).map(e => e.weighed ? ({
+      ts: e.ts, runs: e.aiRuns, w: 1, labSd: LEARN.REL_SD.weighed, label: weighedLabel(e),
+    }) : ({
       ts: e.ts, runs: e.aiRuns, w: pvW(e), labSd: e.conf != null ? 0.1 : e.ev?.relSd,
       label: e.conf != null ? e.conf : e.ev?.implied && (e.ev.quality === 'good' || e.ev.quality === 'fair') ? e.ev.implied : null,
     })), Date.now());
@@ -532,11 +541,11 @@
   function parseRun({ result: j, model }, weighed) {
     const jt = String(j.jistota || '').toLowerCase();
     // dotaz v2: součet složek (sacharidy z tabulky / od modelu); u zváženého jídla platí zvážená hmotnost
-    const t = weighed ? LEARN.applyWeight(LEARN.v2Totals(j), weighed) : LEARN.v2Totals(j);
+    const t0 = LEARN.v2Totals(j), t = weighed ? LEARN.applyWeight(t0, weighed) : t0;
     let min = t ? t.min : +j.sacharidy_min, max = t ? t.max : +j.sacharidy_max;
     if (!(isFinite(min) && isFinite(max)) || min < 0) { min = undefined; max = undefined; }
     else if (min > max) [min, max] = [max, min];
-    return { c: t ? t.c : Math.max(0, +j.sacharidy || 0), items: t?.items, weighMiss: !!(weighed && (!t || t.weighMiss)), min, max, kat: LEARN.catKey(j.kategorie), gi: j.gi, j, model,
+    return { c: t ? t.c : Math.max(0, +j.sacharidy || 0), cBlind: t0 ? t0.c : undefined, aiG: t?.aiG, items: t?.items, weighMiss: !!(weighed && (!t || t.weighMiss)), min, max, kat: LEARN.catKey(j.kategorie), gi: j.gi, j, model,
       jist: /vys|high/.test(jt) ? 2 : /níz|niz|low/.test(jt) ? 0 : 1 };
   }
   const progress = (k, n) => {
@@ -562,13 +571,21 @@
     const j = E.rep.j;
     const c = weighed ? { C: E.c, factor: 1, blockFactor: 1 } : LEARN.applyCal(E.c, E.kat, cal(), ts);
     const alc = runs.filter(r => r.j.alkohol === true).length > runs.length / 2;
+    // Zvážené: co AI odhadla naslepo (sacharidy i hmotnost porce) — z porovnání s váhou se učí opravy AI.
+    let wInfo;
+    if (weighed) {
+      const blind = runs.filter(r => r.cBlind > 0), Eb = blind.length ? LEARN.ensemble(blind.map(r => ({ ...r, c: r.cBlind })), vw()) : null, per = {};
+      for (const v of new Set(runs.map(r => LEARN.vendorOf(r.model)))) { const gs = runs.filter(r => LEARN.vendorOf(r.model) === v && r.aiG > 0).map(r => r.aiG).sort((p, q) => p - q); if (gs.length) per[v] = Math.round(gs[gs.length >> 1]); }
+      const all = Object.values(per).sort((p, q) => p - q);
+      wInfo = { ...weighed, blind: true, c: Math.round(E.c * 10) / 10, aiC: Eb ? Math.round(Eb.c * 10) / 10 : undefined, ai: all.length ? all[all.length >> 1] : undefined, per };
+    }
     return {
       E, errors: res.errors || {}, name: (j.nazev || 'Jídlo').trim() + (j.mnozstvi ? ' (' + String(j.mnozstvi).trim() + ')' : ''),
-      poznamka: j.poznamka, aiRaw: E.c, C: c.C, kat: E.kat, gi: E.gi, alc, factor: c.factor, blockFactor: c.blockFactor, jist: JIST[E.jist],
+      poznamka: j.poznamka, aiRaw: wInfo?.aiC ?? E.c, C: c.C, kat: E.kat, gi: E.gi, alc, factor: c.factor, blockFactor: c.blockFactor, jist: JIST[E.jist],
       sMin: E.min != null ? E.min * c.factor : undefined, sMax: E.max != null ? E.max * c.factor : undefined,
-      sSd: E.sd != null ? E.sd * c.factor : undefined, runs: runs.map(r => ({ m: r.model, c: Math.round(r.c * 10) / 10 })),
+      sSd: E.sd != null ? E.sd * c.factor : undefined, runs: runs.map(r => ({ m: r.model, c: Math.round((weighed && r.cBlind > 0 ? r.cBlind : r.c) * 10) / 10 })),
       items: (cons ? cons.items : E.rep.items || []).map(i => ({ k: i.k, n: i.n, g: Math.round(i.g), c: Math.round(i.c * 10) / 10, vis: i.vis })),
-      dropped: cons?.dropped || [], pv: runs.some(r => r.items) ? LEARN.PROMPT_V : 1, weighed: weighed?.g > 0 ? weighed : undefined, weighMiss,
+      dropped: cons?.dropped || [], pv: runs.some(r => r.items) ? LEARN.PROMPT_V : 1, weighed: wInfo, weighMiss,
       fat: Math.max(0, +j.tuky || 0), kcal: Math.round(+j.kcal || 0), b: Math.round(+j.bilkoviny || 0), t: Math.round(+j.tuky || 0),
     };
   }
@@ -595,11 +612,13 @@
   // Uživatel opravil, co na fotce je (název, množství) → jeho popis platí, fotka doplní zbytek.
   // Upřesnění od uživatele (název, počet kusů, zvážená hmotnost, doma/restaurace) má přednost před fotkou —
   // přidané údaje mimo fotku chybu odhadu ve studiích snižují nejvíc.
-  const hintPrompt = (h, facts, weighed) => (h || facts?.length || weighed?.g > 0) ? [
+  // Zvážené jídlo: AI hmotnost NEDOSTANE — odhadne porci naslepo (z toho se učí, jak u vás odhaduje porce),
+  // zváženou hmotnost dosadí aplikace sama (LEARN.applyWeight).
+  const hintPrompt = (h, facts, weighed) => (h || facts?.length || weighed?.what) ? [
     h ? `Uživatel upřesnil, co na fotce je: „${h}".` : '',
-    weighed?.g > 0 ? `Uživatel jídlo ZVÁŽIL: ${weighed.what ? `„${weighed.what}"` : 'vše, co je na fotce k jídlu (bez talíře a nádobí)'} = ${weighed.g} g. Tuto hmotnost ber jako přesnou — tvým úkolem je hlavně poznat, co to je, a rozdělit ji mezi složky.` : '',
+    weighed?.what ? `Uživatel zvážil složku „${weighed.what}" — hmotnost ti neříkáme, odhadni ji z fotky sám jako obvykle a uveď ji jako samostatnou složku.` : '',
     facts?.length ? `Doplňující údaje od uživatele: ${facts.join('; ')}.` : '',
-    'Jeho údaje (druh jídla, počet kusů, hmotnost, kde se jídlo připravovalo) ber jako přesné a vycházej z nich; fotku použij jen na to, co neříkají. Rozepiš jídlo na složky.',
+    `Jeho údaje (druh jídla, počet kusů${(facts || []).some(f => /zváženo/.test(f)) ? ', hmotnost' : ''}, kde se jídlo připravovalo) ber jako přesné a vycházej z nich; fotku použij jen na to, co neříkají. Rozepiš jídlo na složky.`,
   ].filter(Boolean).join(' ') : undefined;
   const runArgs = (job, img) => ({ imageBase64: img, imageMedia: 'image/jpeg', extra: examplesText(), text: hintPrompt(job.hint, job.facts, job.weighed), pv: LEARN.PROMPT_V,
     diag: { flow: job.weighed ? 'photo-weighed' : job.hint || job.facts?.length ? 'photo-hint' : 'photo', job: job.id, attempt: job.attempts } });
@@ -686,7 +705,9 @@
     const failTxt = Object.entries(a.errors).map(([v, e]) =>
       `<br><span class="muted small-text">⚠️ ${LEARN.VENDOR_LABEL[v]} tentokrát neodpověděl: ${esc(AI.errMsg(e))}</span>`).join('');
     const alcTxt = a.alc ? '<br>🍷 Alkohol — glykémii ovlivní ještě hodiny, toto jídlo se nepoužije k učení.' : '';
-    const wTxt = a.weighed ? ` <b>· ⚖️ zváženo ${a.weighed.g} g${a.weighed.what ? ' (' + esc(a.weighed.what) + ')' : ''}</b> — AI jen rozpoznala jídlo, kalibrace z fotek se nepoužila`
+    const wd = a.weighed, wPct = wd?.ai > 0 ? Math.round((wd.ai / wd.g - 1) * 100) : null;
+    const wTxt = wd ? ` <b>· ⚖️ zváženo ${wd.g} g${wd.what ? ' (' + esc(wd.what) + ')' : ''} → ${r0(wd.c)} g sacharidů</b> (z váhy, bez kalibrace z fotek)`
+      + (wd.ai > 0 ? `<br><span class="muted small-text">AI naslepo odhadla ${wd.what ? 'tuto složku' : 'porci'} na ~${wd.ai} g${Object.keys(wd.per).length > 1 ? ` (${Object.entries(wd.per).map(([v, g]) => `${LEARN.VENDOR_LABEL[v]} ${g} g`).join(' · ')})` : ''} — ${Math.abs(wPct) < 5 ? 'skoro přesně' : `o ${Math.abs(wPct)} % ${wPct < 0 ? 'méně' : 'víc'}`}. Z porovnání s váhou se učí opravy jednotlivých AI.</span>` : '')
       : a.weighMiss ? `<br><b>⚠️ „${esc(a.weighMiss.what)}" není mezi složkami, které AI na fotce našla — hmotnost ${a.weighMiss.g} g nepoužita.</b> Upřesněte název (např. jak je v seznamu složek níže) přes „⚖️ zvážil jsem…", nebo zadejte hmotnost celého jídla.` : '';
     $('#cnew-ai').innerHTML = `AI odhad: ${r0(a.aiRaw)} g${wTxt}${calTxt}${runsTxt}${itemsTxt}${failTxt}${alcTxt}${a.poznamka ? '<br>' + esc(a.poznamka) : ''}`;
     newConf();
@@ -1237,6 +1258,19 @@
       h += '<div class="card"><div class="card-title">Jak rychle se u vás jídlo vstřebává</div>' + spc.map(([k, v]) =>
         `<div class="learn-row"><span>${LEARN.CATS[k].label}<br><span class="muted small-text">${v.n} jídel s jasným průběhem</span></span><b>${v.factor > 1.05 ? 'rychleji o ' + Math.round((v.factor - 1) * 100) + ' %' : v.factor < 0.95 ? 'pomaleji o ' + Math.round((1 - v.factor) * 100) + ' %' : 'obvykle'}</b></div>`).join('')
         + '<p class="muted small-text">Oproti obecnému glykemickému indexu. Používá se při vyhodnocení dalších jídel.</p></div>';
+    }
+    // Odhad porcí: AI naslepo vs. váha (zvážená jídla)
+    const wm = all.filter(e => e.weighed?.blind && e.weighed.per && Object.keys(e.weighed.per).length);
+    if (wm.length) {
+      const byV = {};
+      for (const e of wm) for (const [v, g] of Object.entries(e.weighed.per)) if (g > 0) (byV[v] ??= []).push(Math.log(g / e.weighed.g));
+      const vwx = vw();
+      h += `<div class="card"><div class="card-title">Odhad porcí: AI vs. váha</div><p class="muted small-text">Z ${wm.length} ${wm.length === 1 ? 'zváženého jídla' : 'zvážených jídel'} — AI porci odhadla naslepo, pak se porovnala s váhou.</p>`
+        + Object.entries(byV).map(([v, ls]) => {
+          const m = Math.exp(ls.sort((p, q) => p - q)[ls.length >> 1]), pct = Math.round((m - 1) * 100), fx = vwx[v];
+          return `<div class="learn-row"><span>${LEARN.VENDOR_LABEL[v]}<br><span class="muted small-text">${ls.length}× · ${fx ? `oprava teď ×${dec(Math.round(Math.exp(fx.a) * 100) / 100)}` : 'oprava zatím žádná'}</span></span><b>${Math.abs(pct) < 5 ? 'skoro přesně' : `porce o ~${Math.abs(pct)} % ${pct < 0 ? 'menší' : 'větší'}`}</b></div>`;
+        }).join('')
+        + '<p class="muted small-text">Projeví se samo: AI, která porce odhaduje líp, dostane větší váhu, a typická chyba každé AI (i u velkých porcí) se v dalších odhadech opravuje — znatelně zhruba po 5–10 zvážených jídlech na každou AI. Kalibrace z fotek podle druhu jídla a denní doby se dál učí z glykémie, protože ta zahrnuje i to, jak k vám sedí poměr v pumpě.</p></div>';
     }
     // Pozdní vlna po jídle (naučená) a odpovědi na „Co se stalo?"
     const tl = Object.entries(tails().cats).filter(([, x]) => x.n > 0), usedT = K.store.get('kal.tails', {});
