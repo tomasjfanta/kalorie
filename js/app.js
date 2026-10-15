@@ -84,7 +84,7 @@ const badge = p => `<span class="cbadge ${CONF.level(p)}">${CONF.pct(p)}</span>`
 // Záznam → podklady pro odhad nejistoty (starší záznamy bez metadat se dopočítají).
 function entryInfo(e) {
   const C = vals(e).s;
-  if (e.q) return { C, kind: e.cs || 'manual', jist: e.jist, sMin: e.sMin, sMax: e.sMax, sSd: e.sSd,
+  if (e.q) return { C, kind: e.cs === 'ai-photo' && e.weighed ? 'ai-weighed' : e.cs || 'manual', jist: e.jist, sMin: e.sMin, sMax: e.sMax, sSd: e.sSd,
     learnedSd: e.cs === 'ai-photo' && window.CARB ? CARB.cal().sd : null };
   let kind = e.cs, cat = e.cat;
   if (!kind) {
@@ -975,7 +975,7 @@ window.KAL = {
   days: () => days, day: s => day(s), saveAll, settings: () => settings, saveSettings: () => store.set('kal.settings', settings),
   store, renderDnes, showView, entryConf, groupConf, badge, fmtC, vjTxt, TOL, esc, dstr, todayStr, fmtHuman,
   viewDate: () => viewDate, mealByHour, r0, r1, dec, num,
-  VERSION: 'v26',
+  VERSION: 'v27',
   aiConfig: () => aiCfg,
   setAiModel: m => { aiCfg.model = m; store.set('kal.ai', aiCfg); },  // zapamatuje funkční model ze zálohy
   openQuick,          // prefill rychlého zápisu z AI výsledku

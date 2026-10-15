@@ -52,7 +52,11 @@
   function entrySigma(info) {
     const C = Math.max(0, info.C || 0);
     let sigma, driver = info.kind;
-    if (info.kind === 'ai-text' || info.kind === 'ai-photo') {
+    if (info.kind === 'ai-weighed') {
+      // Zvážené jídlo z fotky: hmotnost přesná; zbývá rozpoznání a hustota sacharidů (~±10 %).
+      sigma = C * Math.hypot(0.10, PORTION_SD.weighed);
+      if (info.sSd > sigma) { sigma = info.sSd; driver = 'spread'; }
+    } else if (info.kind === 'ai-text' || info.kind === 'ai-photo') {
       const tab = AI_SD[info.kind];
       if (info.learnedSd) {
         // Po zpětné vazbě z CGM známe skutečnou osobní přesnost AI — ta nahrazuje obecné odhady.

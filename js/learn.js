@@ -58,7 +58,9 @@
   // („pizza efekt": tuk a bílkoviny zdrží část sacharidů). sp = rychlost proložení.
   const TAIL_DELAY = 60, TAIL_DUR = 240;
   function mealAbs(m, t, sp = 1) {
-    const f = m.tail > 0 ? Math.min(0.5, m.tail) : 0, main = absorbedFrac(t, absDuration(m) / sp);
+    // celková rychlost (naučená × proložená) v mezích 0,45–2,2× obvyklé
+    const eff = Math.min(2.2, Math.max(0.45, (m.speed > 0 ? m.speed : 1) * sp));
+    const f = m.tail > 0 ? Math.min(0.5, m.tail) : 0, main = absorbedFrac(t, absDuration({ ...m, speed: 1 }) / eff);
     return f ? (1 - f) * main + f * absorbedFrac(t - TAIL_DELAY, TAIL_DUR) : main;
   }
 
@@ -371,7 +373,7 @@
   const SITTING_GAP = 20 * MIN;
   const LOOSE = 1.0;     // předpoklad pro „štítek" k učení: ±100 % kolem odhadu AI (data rozhodují)
   const DRIFT_SD = 0.4;  // mmol/l za hodinu
-  const SPEEDS = [0.71, 0.8, 0.9, 1, 1.12, 1.25, 1.4];
+  const SPEEDS = [0.71, 0.8, 0.9, 1, 1.12, 1.25, 1.4, 1.6, 1.8]; // snídaně u vás sedí na 1,4 → rychlejší strana rozšířena (pomalejší ne: posouvala celé řetězce)
   const TAIL_D = 240;    // min — pozdní dobíhání předchozího jídla (pomalá složka)
   const RAMP_SD = 1.0;   // mmol/l za hodinu — chybějící bazál od určité chvíle
 
@@ -474,10 +476,11 @@
     // Sacharidy: známé (ověřené, zadané do pumpy, dřívější jídla, tuk a bílkoviny) a neznámá sezení.
     const est = m => m.aiRaw > 0 ? m.aiRaw : (m.s > 0 ? m.s : 0);
     const absIn = (m, t, sp = 1) => mealAbs(m, (t - m.ts) / MIN, sp) - mealAbs(m, Math.max(0, T0 - m.ts) / MIN, sp);
-    const isUnknown = m => m.conf == null && !m.pump && m.aiRaw > 0;
+    const isUnknown = m => m.conf == null && !m.pump && !m.weighed && m.aiRaw > 0;
+    const knownC = m => (m.conf != null ? m.conf : m.weighed && m.s > 0 ? m.s : est(m)); // zvážené = známé množství
     const known = [...meals.filter(m => !isUnknown(m)), ...(data.prior || []).filter(m => m.ts < T0 && m.ts >= T0 - PRIOR_WIN)];
     const fpuMeals = [...meals, ...(data.prior || []).filter(m => m.ts < T0 && m.ts >= T0 - PRIOR_WIN)];
-    const knownAt = t => known.reduce((a, m) => a + scale(m.ts) * (m.conf != null ? m.conf : est(m)) * absIn(m, t), 0)
+    const knownAt = t => known.reduce((a, m) => a + scale(m.ts) * knownC(m) * absIn(m, t), 0)
       + fpuMeals.reduce((a, m) => a + scale(m.ts) * (fpuAbs(m, (t - m.ts) / MIN) - fpuAbs(m, Math.max(0, T0 - m.ts) / MIN)), 0);
     const sittings = [];
     for (const m of meals.filter(isUnknown)) {
@@ -542,7 +545,13 @@
       return b;
     };
     let best = first;
-    if (!sparse) { const g = bestOf([], first.sig); if (g && g.J < best.J) best = g; }
+    const grid = [first];
+    if (!sparse) for (const sp of SPEEDS) { const r = solve(sp, first.sig); if (r) grid.push(r); }
+    for (const r of grid) if (r.J < best.J) best = r;
+    // Sacharidy a rychlost se částečně zastoupí: kolik g dávají rychlosti, které sedí skoro stejně dobře
+    // (ΔJ ≤ 2) — tolik nejistoty navíc má každé sezení (jinak by širší rozsah rychlostí „koupil" falešnou přesnost).
+    const Jmin = Math.min(...grid.map(r => r.J)), nearSp = grid.filter(r => r.J <= Jmin + 2);
+    const spdSpread = sittings.map((S, i) => { const cs = nearSp.map(r => Math.max(0, r.beta[i])); return (Math.max(...cs) - Math.min(...cs)) / 2; });
     const mv = pts.reduce((a, p) => a + p.v, 0) / pts.length;
     const sst = pts.reduce((a, p) => a + (p.v - mv) ** 2, 0);
     const r2 = sst > 0 ? 1 - best.res.reduce((a, r) => a + r * r, 0) / sst : 0;
@@ -677,7 +686,17 @@
       drift: best.beta[sittings.length], outliers, excluded: excl.map(x => x[2]), basalOk, del, unlogged, noMeal, sparse,
       coveredCarbs: s0.icr * del.meal, extraCarbs: s0.icr * (del.auto + del.basal), manCarbs: s0.icr * del.man };
     out.seg = seg;
-    const fitOk = sparse || (best.rms <= 1.2 && r2f >= 0.3); // z pár měření se tvar posoudit nedá
+    // Sedí průběh u TOHOTO jídla? Chyba modelu v jeho vlastním okně (robustně vážená), ne v celém řetězci
+    // (nesoulad jinde v dlouhém řetězci dřív shodil všechna jídla). Podíl vysvětleného rozptylu (r²) jen když
+    // se glykémie v okně opravdu hýbala — u ploché křivky (pumpa drží glykémii) r² nic neříká.
+    function localFit(m) {
+      const ks = pts.map((p, k) => k).filter(k => pts[k].t >= m.ts && pts[k].t <= m.ts + postFor(m));
+      if (ks.length < 4) return { ok: best.rms <= 1.2, rms: best.rms };
+      const W = ks.reduce((a, k) => a + best.w[k], 0), rms = Math.sqrt(ks.reduce((a, k) => a + best.w[k] * best.res[k] ** 2, 0) / W);
+      const mv = ks.reduce((a, k) => a + pts[k].v, 0) / ks.length, sd = Math.sqrt(ks.reduce((a, k) => a + (pts[k].v - mv) ** 2, 0) / ks.length);
+      const r2 = sd > 0 ? 1 - rms ** 2 / sd ** 2 : 0;
+      return { ok: rms <= 1.2 && (sd < 1 || r2 >= 0.3), rms, r2, sd };
+    }
 
     // Výsledky po jídlech.
     for (const m of meals) {
@@ -704,7 +723,7 @@
       if (exNear) r.exercise = 'during';
       else if ((data.targets || []).some(g => { const e2 = g.t + (g.dur || 0) * MIN; return e2 < m.ts && e2 >= m.ts - 12 * 60 * MIN; })) r.exercise = 'after';
       if (m.alc) r.alcohol = true;
-      if (!isUnknown(m)) { r.flags.push(m.conf != null ? 'ověřené jídlo — slouží jako známá hodnota' : 'sacharidy zadané do pumpy'); out.results[m.id] = r; continue; }
+      if (!isUnknown(m)) { r.flags.push(m.conf != null ? 'ověřené jídlo — slouží jako známá hodnota' : m.weighed ? 'zvážené jídlo — slouží jako známá hodnota' : 'sacharidy zadané do pumpy'); out.results[m.id] = r; continue; }
       const si = sittings.findIndex(S => S.members.includes(m)), S = sittings[si];
       const C = Math.max(0, best.beta[si]), sd = Math.sqrt(Math.max(0, best.cov[si][si]));
       const share = est(m) / S.E;
@@ -714,7 +733,9 @@
       // v sezení se podíl talířů dělí podle odhadů AI → nejistota rozdělení ±25 %
       if (S.members.length > 1) r.relSd = Math.min(2, Math.hypot(r.relSd, 0.25));
       r.share = r.implied / Math.max(1e-6, sittings.reduce((a, X, i) => a + Math.max(0, best.beta[i]), 0));
-      r.fit = { used: fitOk && !sparse, speed: (m.speed > 0 ? m.speed : 1) * best.sp, rel: best.sp, rmse: best.rms, r2: r2f, n: pts.length,
+      const lf = sparse ? { ok: true, rms: best.rms } : localFit(m), fitOk = lf.ok; // z pár měření se tvar posoudit nedá
+      r.relSd = Math.min(2, Math.hypot(r.relSd, spdSpread[si] / Math.max(1, C)));
+      r.fit = { used: fitOk && !sparse, speed: Math.min(2.2, Math.max(0.45, (m.speed > 0 ? m.speed : 1) * best.sp)), rel: best.sp, rmse: lf.rms, r2: lf.r2 ?? r2f, n: pts.length,
         informative: fitOk && !sparse && sittings.length === 1 && meals.length === 1 && r.relSd < 0.2 };
       r.sitting = S.members.length > 1 ? S.members.filter(x => x !== m).map(x => x.ts) : null;
       if (probes[si]) r.tailProbe = probes[si];
@@ -1310,6 +1331,31 @@
     else { min = undefined; max = undefined; }
     return { c, min, max, items };
   }
+  // Zvážené jídlo: hmotnost je přesná, AI jen rozpozná jídlo. w = { g, what }: bez "what" = vše na fotce →
+  // viditelné složky se přeškálují na součet g (neviditelné předpoklady zůstanou); s "what" = jedna složka →
+  // ta dostane přesně g (sacharidy podle její hustoty). Když se složka nenajde, platí pro celé jídlo.
+  const norm = x => String(x || '').toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '');
+  function applyWeight(t, w) {
+    if (!t || !(w?.g > 0) || !t.items.length) return t;
+    const items = t.items.map(i => ({ ...i })), words = norm(w.what).split(/[^a-z0-9]+/).filter(x => x.length >= 3);
+    let target = null;
+    if (words.length) {
+      let best = 0;
+      for (const it of items) {
+        const hay = norm(it.n + ' ' + (CARB_TABLE[it.k]?.n || '') + ' ' + it.k);
+        const hit = words.filter(x => hay.includes(x.slice(0, Math.max(3, x.length - 2)))).length;
+        if (hit > best) { best = hit; target = it; }
+      }
+    }
+    if (target) { target.c *= w.g / target.g; target.g = w.g; }
+    else {
+      const vis = items.filter(i => i.vis), sum = vis.reduce((a, i) => a + i.g, 0);
+      if (sum > 0) for (const i of vis) { const f = w.g / sum; i.g *= f; i.c *= f; }
+    }
+    const c = items.reduce((a, i) => a + i.c, 0), k = t.c > 0 ? c / t.c : 1;
+    return { ...t, items, c, min: t.min != null ? t.min * k : undefined, max: t.max != null ? t.max * k : undefined, weighed: true };
+  }
+
   // Shoda složek mezi odhady téže fotky: složka (podle klíče) platí, když ji uvede aspoň polovina
   // odhadů — odfiltruje vymyšlené položky; když v některém odhadu chybí, doplní se mediánem ostatních
   // (vynechaná příloha by jinak stáhla celý odhad). Od 3 odhadů se složkami.
@@ -1413,6 +1459,6 @@
     };
   }
 
-  root.LEARN = { mealAbs, learnTail, TAIL_DELAY, TAIL_DUR, PROMPT_V, CARB_TABLE, ITEM_GROUPS, tableText, v2Totals, itemConsensus, vendorFix, CATS, catKey, GI_DUR, GI_LABEL, giKey, absDuration, absorbedFrac, clusterOf, windowEnd, postFor, isHeavy, fpu, fpuAbs, learnSpeed, BLOCKS, blockOf, segmentOf, evaluateSegment, dedupeBoluses, basalBaseline, ensemble, vendorWeights, vendorShares, vendorOf, VENDOR_LABEL, insulinActed, segmentAt, evaluateMeal, dayCurves, dayStatsOf, weeklyTrend, timeOfDay, correctionEpisodes, estimateISF, ratioCheck, calibrate, applyCal, estimateKNone, combine, parseCareLink, REL_SD, MIN };
+  root.LEARN = { applyWeight, mealAbs, learnTail, TAIL_DELAY, TAIL_DUR, PROMPT_V, CARB_TABLE, ITEM_GROUPS, tableText, v2Totals, itemConsensus, vendorFix, CATS, catKey, GI_DUR, GI_LABEL, giKey, absDuration, absorbedFrac, clusterOf, windowEnd, postFor, isHeavy, fpu, fpuAbs, learnSpeed, BLOCKS, blockOf, segmentOf, evaluateSegment, dedupeBoluses, basalBaseline, ensemble, vendorWeights, vendorShares, vendorOf, VENDOR_LABEL, insulinActed, segmentAt, evaluateMeal, dayCurves, dayStatsOf, weeklyTrend, timeOfDay, correctionEpisodes, estimateISF, ratioCheck, calibrate, applyCal, estimateKNone, combine, parseCareLink, REL_SD, MIN };
   if (typeof module !== 'undefined') module.exports = root.LEARN;
 })(typeof window !== 'undefined' ? window : globalThis);

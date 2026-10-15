@@ -559,6 +559,19 @@
     </div>
     <img id="cnew-img" class="ai-photo-preview" alt="">
     <div id="cnew-status" class="muted center"></div>
+    <div id="cnew-pre" class="hidden">
+      <div class="chips cnew-facts" id="cnew-pre-place">
+        <button type="button" class="chip" data-place="doma">🏠 doma</button>
+        <button type="button" class="chip" data-place="restaurace">🍽 restaurace</button>
+      </div>
+      <div class="tri-row">
+        <label class="field">⚖️ Zváženo (g)<input id="cnew-w-g" type="text" inputmode="decimal" placeholder="nepovinné"></label>
+        <label class="field">čeho<input id="cnew-w-what" type="text" placeholder="vše na fotce"></label>
+      </div>
+      <label class="field">🔢 Počet kusů<input id="cnew-pcs" type="text" placeholder="nepovinné, např. 4 plátky knedlíku"></label>
+      <button id="cnew-go" class="btn">Odhadnout</button>
+      <p class="muted small-text">Nic není povinné. Se zváženou hmotností stačí 2 odhady (Claude a Gemini jen rozpoznají jídlo) a kalibrace odhadů z fotek se nepoužije — hmotnost je přesná.</p>
+    </div>
     <div id="cnew-form" class="hidden">
       <label class="field">Co to je
         <input id="cnew-name" type="text">

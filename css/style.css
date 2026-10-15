@@ -466,3 +466,8 @@ code { font-size: 12.5px; background: var(--track); padding: 1px 5px; border-rad
 .meter-row { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin: 4px 0 10px; }
 .meter-row .ev-actions { margin-top: 0; }
 .bgm-ico { display: flex; align-items: center; justify-content: center; font-size: 22px; background: var(--track); }
+
+/* Upřesnění před odhadem */
+#cnew-pre { margin: 8px 0 4px; }
+#cnew-pre .field { margin-top: 6px; }
+#cnew-go { width: 100%; margin-top: 10px; }

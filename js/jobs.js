@@ -133,7 +133,8 @@
     box.classList.remove('hidden');
     box.innerHTML = jobs.map(j => {
       const run = active.has(j.id);
-      const st = j.status === 'ready' ? 'odhad je hotový — ukládám'
+      const st = j.status === 'draft' ? 'čeká na upřesnění (Otevřít) — odhad se spustí sám za pár minut'
+        : j.status === 'ready' ? 'odhad je hotový — ukládám'
         : run ? 'AI právě odhaduje…'
           : `čeká na AI${j.attempts ? ` · pokus ${j.attempts}, další v ${hhmm(Math.max(j.nextAt, Date.now()))}` : ''}`;
       return `<div class="job-row" data-id="${j.id}">${j.thumb ? `<img class="ctl-thumb" src="${j.thumb}" alt="">` : '<span class="job-ico">📝</span>'}
@@ -145,7 +146,7 @@
     }).join('');
     box.querySelectorAll('.job-now').forEach(b => b.addEventListener('click', async () => {
       const id = b.closest('.job-row').dataset.id, j = await get(id);
-      if (j) { j.nextAt = Date.now(); await save(j); attempt(id); }
+      if (j) { if (j.status === 'draft') j.status = 'pending'; j.nextAt = Date.now(); await save(j); attempt(id); }
     }));
     box.querySelectorAll('.job-open').forEach(b => b.addEventListener('click', async () => {
       const j = await get(b.closest('.job-row').dataset.id);
