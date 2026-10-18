@@ -564,6 +564,8 @@
         <button type="button" class="chip" data-place="doma">🏠 doma</button>
         <button type="button" class="chip" data-place="restaurace">🍽 restaurace</button>
       </div>
+      <label id="cnew-place-wrap" class="field hidden">Podnik <span class="muted">— nepovinné, podle něj se příště pozná stejné jídlo</span><input id="cnew-place" type="text" list="place-list" placeholder="např. Bistro U Mlýna" autocomplete="off"></label>
+      <datalist id="place-list"></datalist>
       <div class="tri-row">
         <label class="field">⚖️ Zváženo (g)<input id="cnew-w-g" type="text" inputmode="decimal" placeholder="nepovinné"></label>
         <label class="field">čeho<input id="cnew-w-what" type="text" placeholder="vše na fotce"></label>
@@ -587,6 +589,7 @@
         <input id="cnew-carbs" type="text" inputmode="decimal">
       </label>
       <div id="cnew-ai" class="muted small-text"></div>
+      <div id="cnew-dish" class="small-text cnew-dish"></div>
       <div id="cnew-conf" class="conf-box"></div>
       <div class="tri-row">
         <label class="field">Čas jídla<input id="cnew-time" type="time"></label>

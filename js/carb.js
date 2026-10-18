@@ -37,7 +37,8 @@
   let calCache = null;
   // Zvážené jídlo jako štítek pro opravy AI: jen celé jídlo zvážené, AI naslepo (od v29) a zapsané sacharidy
   // nepřepsané daleko od hodnoty z váhy. Do kalibrace z fotek nejde (ta nese i vyrovnání poměru v pumpě).
-  const weighedLabel = e => (e.weighed?.blind && !e.weighed.what && !e.weighed.disagree?.length && e.weighed.c > 0 && Math.abs(e.s - e.weighed.c) <= Math.max(3, 0.1 * e.weighed.c) ? e.weighed.c : null);
+  // (zapsané se porovná bez opravy podle stejného jídla — dishF; weighed.c zůstává hodnota z váhy a hustoty od AI)
+  const weighedLabel = e => (e.weighed?.blind && !e.weighed.what && !e.weighed.disagree?.length && e.weighed.c > 0 && Math.abs(e.s / (e.dishF || 1) - e.weighed.c) <= Math.max(3, 0.1 * e.weighed.c) ? e.weighed.c : null);
   // Jídla z dotazu jiné verze se učí se čtvrtinovou vahou (změna dotazu posouvá odhady).
   const pvW = e => ((e.pv || 1) === LEARN.PROMPT_V ? 1 : 0.25);
   function samples() {
@@ -54,7 +55,8 @@
     }).filter(Boolean);
   }
   function cal() { if (!calCache) calCache = LEARN.calibrate(samples(), Date.now()); return calCache; }
-  const invalidate = () => { calCache = null; vwCache = null; spCache = null; tailCache = null; };
+  let dishCache = null;
+  const invalidate = () => { calCache = null; vwCache = null; spCache = null; tailCache = null; dishCache = null; };
   // Pozdní vlna podle druhu jídla (LEARN.learnTail) z jídel, kde ji sonda změřila: dobře vysvětlená
   // jídla a ta s odpovědí „nic zvláštního". Do výpočtu jde až změna o ≥ 0,07 proti použité hodnotě
   // (kal.tails), aby se vyhodnocení při drobných posunech pořád nepřepočítávala.
@@ -123,12 +125,171 @@
     return spCache;
   }
   const catSpeed = kat => (spd().n >= 3 ? spd().cats[LEARN.catKey(kat)].factor : 1);
-  const asMeal = e => ({ id: e.id, ts: e.ts, aiRaw: e.excl ? 0 : e.aiRaw, s: e.s, conf: e.conf, kat: e.kat, gi: e.gi,
-    fat: e.fat ?? e.t, prot: e.b, alc: e.alc, speed: e.ev?.fit?.informative ? e.ev.fit.speed : catSpeed(e.kat), tail: catTail(e.kat), weighed: !!e.weighed });
+  // Propojené stejné jídlo: rychlost a pozdní vlna z jeho ostatních výskytů (smrštěné k druhu jídla).
+  const asMeal = e => { const ds = dishShapeOf(e); return { id: e.id, ts: e.ts, aiRaw: e.excl ? 0 : e.aiRaw, s: e.s, conf: e.conf, kat: e.kat, gi: e.gi,
+    fat: e.fat ?? e.t, prot: e.b, alc: e.alc, speed: e.ev?.fit?.informative ? e.ev.fit.speed : ds?.speed ?? catSpeed(e.kat), tail: ds?.tail ?? catTail(e.kat), weighed: !!e.weighed }; };
   function mealsWithTime() {
     const out = [], D = K.days();
     for (const d of Object.keys(D)) for (const e of D[d].e || []) if (e.ts) out.push(e);
     return out;
+  }
+
+  /* ─── Opakovaná jídla: stejné jídlo z historie (často ze stejné restaurace) ───
+     Jídla, která uživatel označí za stejná (potvrdí návrh, nebo jídlo pojmenuje stejně jako dřív), sdílí e.dish.
+     Z jejich výskytů ověřených glykémií se učí, o kolik se skutečnost u tohoto jídla liší od odhadu AI po vaší
+     kalibraci, a tím se upraví další odhad; z jejich křivek rychlost a pozdní vlna. Návrh podle podobnosti
+     sám nic nemění — teprve potvrzené propojení. */
+  const DISH_MIN = 0.55; // od jaké podobnosti jídlo navrhnout (0,5 = např. „rizoto" k „rýži s kuřetem")
+  // Místo jídla: pojmenovaný podnik, restaurace bez názvu, doma, neznámé.
+  const locOf = (place, facts) => place ? 'r:' + LEARN.placeKey(place) : (facts || []).includes(PLACE.doma) ? 'doma' : (facts || []).includes(PLACE.restaurace) ? 'r:' : '';
+  const carbKeys = items => [...new Set((items || []).filter(i => i.c >= 3 && i.k !== 'jine').map(i => i.k))];
+  function dishIdx() {
+    if (!dishCache) {
+      const by = {};
+      for (const e of photoEntries()) if (e.dish) (by[e.dish] ??= []).push(e);
+      dishCache = { by, desc: new Map(), shape: new Map() };
+    }
+    return dishCache;
+  }
+  const dishMembers = id => (id && dishIdx().by[id]) || [];
+  function dishDesc(e) {
+    const c = dishIdx().desc;
+    let d = c.get(e.id);
+    if (!d) { d = { n: e.n, w: LEARN.dishWords(e.n), keys: carbKeys(e.items), loc: locOf(e.place, e.facts) }; c.set(e.id, d); }
+    return d;
+  }
+  // Propojení: { id } = existující skupina, { with, withAll } = dřívější nepropojená jídla se stejným názvem
+  // (skupina vznikne při uložení).
+  function linkInfo(link) {
+    const members = link?.id ? dishMembers(link.id) : link?.with ? (link.withAll || [link.with]).map(id => findEntry(id)?.e).filter(Boolean).sort((p, q) => p.ts - q.ts) : [];
+    const last = members[members.length - 1];
+    return { members, last, n: members.length, label: last?.n || '', place: last?.place || '' };
+  }
+  const linkOk = link => !!link && linkInfo(link).n > 0;
+  function commitLink(e, link) {
+    if (!linkOk(link)) return;
+    if (link.id) { e.dish = link.id; return; }
+    const os = linkInfo(link).members;
+    const id = os.find(o => o.dish)?.dish || 'd' + Date.now().toString(36) + Math.random().toString(36).slice(2, 5);
+    for (const o of os) o.dish = id;
+    e.dish = id;
+  }
+  // Návrhy „stejné jako…": skupiny (propojená jídla jako jedna, jinak jednotlivá jídla) z posledních 180 dní,
+  // podle podobnosti; before = jen jídla před tímto časem, skipDish = skupina, do které jídlo už patří.
+  function dishCands(desc, skip, { max = 3, before = Infinity, skipDish = null } = {}) {
+    const now = Date.now(), best = {};
+    for (const e of photoEntries()) {
+      if (e.id === skip || e.ts >= before || now - e.ts > 180 * DAY || (skipDish && e.dish === skipDish)) continue;
+      const sc = LEARN.dishSim(desc, dishDesc(e));
+      if (sc < DISH_MIN) continue;
+      // nepropojená jídla se stejným názvem a místem = jeden návrh (propojí se všechna)
+      const dd = dishDesc(e), k = e.dish || 'n:' + dd.w.join(' ') + '|' + dd.loc;
+      const g = (best[k] ??= { score: 0, id: e.dish || null, with: null, withAll: e.dish ? undefined : [] });
+      g.score = Math.max(g.score, sc);
+      if (!e.dish) { g.withAll.push(e.id); g.with = e.id; }
+    }
+    return Object.values(best).sort((a, b) => b.score - a.score).slice(0, max).map(g => ({ ...g, ...linkInfo(g) }));
+  }
+  // Stejný název, jaký uživatel dal dřívějšímu jídlu (ne obecný) → propojit bez ptaní; přednost má
+  // existující skupina (největší), jinak nejnovější takové jídlo.
+  function dishByName(desc, skip) {
+    if (LEARN.genericName(desc.n)) return null;
+    const hits = photoEntries().filter(e => e.id !== skip && e.hint && LEARN.sameName(desc, dishDesc(e)));
+    if (!hits.length) return null;
+    const grp = hits.filter(e => e.dish).sort((p, q) => dishMembers(q.dish).length - dishMembers(p.dish).length || q.ts - p.ts)[0];
+    return grp ? { id: grp.dish, with: null, auto: true } : { id: null, with: hits[hits.length - 1].id, withAll: hits.map(e => e.id), auto: true };
+  }
+  const jobLink = (job, a0) => {
+    if (job.dishNo) return null;
+    if (linkOk(job.dishLink)) return job.dishLink;
+    return job.hint ? dishByName({ n: job.hint, keys: carbKeys(a0.items), loc: locOf(job.placeName, job.facts) }) : null;
+  };
+  // Výskyt jídla → o kolik se jeho skutečnost lišila od dnešního odhadu (AI s opravami × kalibrace), v log.
+  // Zvážené s kontrolou z glykémie jako ostatní (glykémie nese i vyrovnání poměru v pumpě); bez ní zvážená
+  // hmotnost proti úrovni zvážených jídel v kalibraci (to je jen chyba odhadu porce).
+  const qOk = q => q === 'good' || q === 'fair';
+  function dishResid(e) {
+    if (e.excl || e.alc || e.ev?.alcohol || !e.aiRuns?.length) return null;
+    const c = cal(), ai = LEARN.ensemble(e.aiRuns.map(r => ({ c: r.c, model: r.m })), vw()).c || e.aiRaw;
+    if (!(ai >= 3)) return null;
+    const gF = LEARN.applyCal(ai, e.kat, c, e.ts).factor, N2 = LEARN.AI_NOISE ** 2, sd = (x, q) => Math.min(1, x > 0 ? x : LEARN.REL_SD[q]) ** 2;
+    if (e.weighed) {
+      const ck = e.ev?.check;
+      if (e.weighed.blind && ck?.implied > 0 && qOk(ck.quality)) return { ts: e.ts, y: Math.log(ck.implied / (ai * gF)), v: sd(ck.relSd, ck.quality) + N2 };
+      const lab = weighedLabel(e);
+      if (!lab) return null;
+      const k = LEARN.catKey(e.kat), wF = Math.min(1.6, Math.max(0.6, Math.exp((c.qW ?? 0) + (c.cats?.[k]?.mu ?? 0) - (c.mu ?? 0))));
+      return { ts: e.ts, y: Math.log(lab / (ai * wF)), v: LEARN.REL_SD.weighed ** 2 + N2 };
+    }
+    if (e.conf > 0) return { ts: e.ts, y: Math.log(e.conf / (ai * gF)), v: LEARN.REL_SD.confirmed ** 2 + N2 };
+    if (e.ev?.implied > 0 && qOk(e.ev.quality)) return { ts: e.ts, y: Math.log(e.ev.implied / (ai * gF)), v: sd(e.ev.relSd, e.ev.quality) + N2 };
+    return null;
+  }
+  // Zvážené celé jídlo: sacharidy na gram podle glykémie u jeho dřívějších zvážených výskytů (kontrola inzulinu
+  // ÷ hodnota z váhy), očištěné o obvyklý rozdíl glykémie proti známému množství v tu denní dobu (ten patří
+  // poměru v pumpě, ne jídlu — s malým množstvím dat se smrští k nule).
+  function ratioOffset(ts) {
+    const now = Date.now(), lr = photoEntries().filter(e => e.ts >= now - 90 * DAY && (e.conf != null || e.weighed) && e.ev?.check?.ratio > 0 && LEARN.REL_SD[e.ev.check.quality])
+      .map(e => ({ b: LEARN.blockOf(e.ts), y: Math.log(e.ev.check.ratio) }));
+    const all = lr.reduce((a, x) => a + x.y, 0) / (lr.length + 2), bs = lr.filter(x => x.b === LEARN.blockOf(ts));
+    return (bs.reduce((a, x) => a + x.y, 0) + 2 * all) / (bs.length + 2);
+  }
+  function densResid(e) {
+    const ck = e.ev?.check;
+    if (e.excl || !e.weighed?.blind || e.weighed.what || !(e.weighed.c > 0) || !(ck?.implied > 0) || !qOk(ck.quality)) return null;
+    // nejistota kontroly aspoň ±15 % (jedno jídlo), recept se mezi výskyty liší ±10 %
+    return { ts: e.ts, y: Math.log(ck.implied / e.weighed.c) - ratioOffset(e.ts), v: Math.min(1, Math.max(0.15, ck.relSd || 0)) ** 2 + 0.1 ** 2 };
+  }
+  // Odhad + propojené stejné jídlo (skip = jídlo samo, nepočítá se do vlastní opravy) → upravené sacharidy.
+  function withDish(a, link, skip) {
+    if (!linkOk(link)) return { ...a, dishF: 1, dishInfo: null };
+    const li = linkInfo(link), others = li.members.filter(e => e.id !== skip), base = { label: li.label, place: li.place, n: others.length };
+    if (a.weighed) {
+      if (a.weighed.what) return { ...a, dishF: 1, dishInfo: { ...base, kind: 'part', k: 0, f: 1 } };
+      const d = LEARN.dishFactor(others.map(densResid).filter(Boolean), Date.now());
+      return { ...a, C: a.C * d.f, dishF: d.f, dishInfo: { ...base, kind: 'dens', k: d.n, f: d.f } };
+    }
+    const d = LEARN.dishFactor(others.map(dishResid).filter(Boolean), Date.now());
+    const tot = Math.min(1.6, Math.max(0.6, (a.factor || 1) * d.f)), f = tot / (a.factor || 1), sc = x => (x != null ? x * f : x);
+    return { ...a, C: a.aiRaw * tot, sMin: sc(a.sMin), sMax: sc(a.sMax), sSd: sc(a.sSd), dishF: f, dishInfo: { ...base, kind: 'photo', k: d.n, f } };
+  }
+  // Tvar křivky z ostatních výskytů jídla (kde ho průběh jasně určil — stejné podmínky jako u druhu jídla).
+  function dishShapeOf(e) {
+    if (!e.dish) return null;
+    const c = dishIdx().shape;
+    if (c.has(e.id)) return c.get(e.id);
+    const occ = [];
+    for (const x of dishMembers(e.dish)) {
+      const ev = x.ev;
+      if (x.id === e.id || x.excl || !ev || ev.hypo || ev.exercise === 'during' || ev.alcohol) continue;
+      occ.push({ speed: ev.fit?.speed > 0 && ((ev.fit.informative && LEARN.REL_SD[ev.quality]) || (x.why === 'nic' && ev.seg?.n === 1)) ? ev.fit.speed : null,
+        tail: ev.tailProbe && !ev.unlogged && (x.why === 'nic' || LEARN.REL_SD[ev.quality]) ? ev.tailProbe : null });
+    }
+    const r = occ.length ? LEARN.dishShape(occ, { speed: catSpeed(e.kat), tail: catTail(e.kat) }) : null;
+    c.set(e.id, r);
+    return r;
+  }
+  function fillPlaces() {
+    const seen = new Set(), out = [];
+    for (const e of photoEntries().reverse()) {
+      if (!e.place || seen.has(e.place.toLowerCase())) continue;
+      seen.add(e.place.toLowerCase()); out.push(e.place);
+      if (out.length >= 30) break;
+    }
+    const dl = $('#place-list');
+    if (dl) dl.innerHTML = out.map(p => `<option value="${esc(p)}">`).join('');
+  }
+  const dmy = t => { const d = new Date(t); return `${d.getDate()}. ${d.getMonth() + 1}.`; };
+  const candLbl = g => `${esc(g.label)}${g.place ? ' · ' + esc(g.place) : ''} · ${g.n > 1 ? g.n + '×, naposledy ' : ''}${dmy(g.last.ts)}`;
+  // Co propojení s jídlem udělá s odhadem (text do okna a detailu).
+  function dishTxt(d, C) {
+    if (!d) return '';
+    if (d.kind === 'part') return ' — zváženou složku počítá váha, odhad beze změny.';
+    const pct = Math.round(Math.abs(d.f - 1) * 100), more = d.f > 1 ? 'víc' : 'méně';
+    if (!d.k) return d.kind === 'dens' ? ' — sacharidy z vaší váhy; na gram se upraví, až glykémie ověří zvážený výskyt.' : ' — zatím bez výskytu ověřeného glykémií, odhad beze změny.';
+    if (pct < 2) return ` — minule to sedělo, odhad beze změny (${d.k}× ověřeno).`;
+    return d.kind === 'dens' ? ` — glykémie u jeho zvážených výskytů ukázala o ~${pct} % ${more} sacharidů na gram, než počítá AI: ×${dec(Math.round(d.f * 100) / 100)} → <b>${r0(C)} g</b> (${d.k}× ověřeno).`
+      : ` — glykémie u něj ukázala o ~${pct} % ${more} sacharidů, než AI s vaší kalibrací odhaduje: ×${dec(Math.round(d.f * 100) / 100)} → <b>${r0(C)} g</b> (${d.k}× ověřeno).`;
   }
 
   // „Nic jsem nejedl": časy, kdy aplikace navrhla nezapsané jídlo a uživatel ho odmítl (uloženo u dne).
@@ -180,7 +341,7 @@
     const entries = mealsWithTime().filter(x => Math.abs(x.ts - e.ts) < 2 * DAY);
     const all = [...entries.map(asMeal), ...await pumpMeals(entries, e.ts - 2 * DAY, e.ts + 2 * DAY)];
     const me = all.find(m => m.id === e.id);
-    me.speed = catSpeed(e.kat);
+    me.speed = dishShapeOf(e)?.speed ?? catSpeed(e.kat);
     const segMeals = LEARN.segmentOf(me, all);
     const T0 = segMeals[0].ts, END = LEARN.windowEnd(segMeals);
     const [readings, boluses, basal, pumpset, targets] = await Promise.all([
@@ -444,8 +605,9 @@
     const job = await JOBS.get(id);
     if (!job || job.status !== 'draft') return job;
     const g = K.num($('#cnew-w-g').value), what = $('#cnew-w-what').value.trim(), pcs = $('#cnew-pcs').value.trim();
-    const facts = [...(place ? [PLACE[place]] : []), ...(pcs ? ['počet kusů: ' + pcs.slice(0, 80)] : [])];
-    Object.assign(job, { status: 'pending', nextAt: Date.now(), facts, ...(g > 0 ? { weighed: { g: Math.round(g), what: what.slice(0, 60) } } : {}) });
+    const pn = place === 'restaurace' ? $('#cnew-place').value.trim().slice(0, 60) : '';
+    const facts = [...(place ? [PLACE[place]] : []), ...(pn ? ['podnik: ' + pn] : []), ...(pcs ? ['počet kusů: ' + pcs.slice(0, 80)] : [])];
+    Object.assign(job, { status: 'pending', nextAt: Date.now(), facts, ...(pn ? { placeName: pn } : {}), ...(g > 0 ? { weighed: { g: Math.round(g), what: what.slice(0, 60) } } : {}) });
     await JOBS.save(job);
     return job;
   }
@@ -453,6 +615,8 @@
     if (!pending) return;
     pending.place = pending.place === b.dataset.place ? null : b.dataset.place;
     $$('#cnew-pre-place .chip').forEach(x => x.classList.toggle('on', x.dataset.place === pending.place));
+    $('#cnew-place-wrap').classList.toggle('hidden', pending.place !== 'restaurace');
+    if (pending.place === 'restaurace') { fillPlaces(); $('#cnew-place').focus(); }
   }));
   $('#cnew-go').addEventListener('click', async () => {
     if (!pending) return;
@@ -472,8 +636,9 @@
     $('#cnew-pre').classList.toggle('hidden', job.status !== 'draft');
     K.openSheet('sheet-cnew');
     if (job.status === 'draft') {
-      for (const id of ['#cnew-w-g', '#cnew-w-what', '#cnew-pcs']) $(id).value = '';
+      for (const id of ['#cnew-w-g', '#cnew-w-what', '#cnew-pcs', '#cnew-place']) $(id).value = '';
       $$('#cnew-pre-place .chip').forEach(x => x.classList.remove('on'));
+      $('#cnew-place-wrap').classList.add('hidden');
       $('#cnew-status').textContent = 'Upřesněte, nebo rovnou Odhadnout:';
       return;
     }
@@ -506,17 +671,19 @@
   $('#sheet-cnew').addEventListener('click', ev => { if (ev.target.id === 'sheet-cnew') onClose(); });
   $('#sheet-cnew .sheet-close').addEventListener('click', onClose);
 
-  // Ověřená jídla uživatele jako kontext pro AI — pomáhá poznat jeho obvyklá jídla a porce.
+  // Jídla, která uživatel jí opakovaně nebo sám pojmenoval — AI jen k rozpoznání. Bez gramů: porci odhaduje
+  // AI z fotky nezávisle (i naslepo u zvážených), zkušenost se stejným jídlem započte aplikace sama (withDish)
+  // — jinak by se započetla dvakrát a odhady AI by přestaly být nezávislé na dřívějších štítcích.
   function examplesText() {
     const seen = new Set(), ex = [];
     for (const e of photoEntries().reverse()) {
-      if (e.conf == null || e.excl) continue;
-      const key = e.n.toLowerCase();
+      if (e.excl || !(e.hint || e.dish) || LEARN.genericName(e.n)) continue;
+      const key = LEARN.dishWords(e.n).join(' ');
       if (seen.has(key)) continue;
-      seen.add(key); ex.push(`„${e.n}" = ${r0(e.conf)} g`);
-      if (ex.length >= 8) break;
+      seen.add(key); ex.push(`„${e.n}"${e.place ? ' (' + e.place + ')' : ''}`);
+      if (ex.length >= 10) break;
     }
-    return ex.length ? ' Jídla tohoto uživatele, jejichž skutečné sacharidy byly ověřeny glykémií — použij je k rozpoznání jeho obvyklých jídel a velikostí porcí: ' + ex.join('; ') + '.' : '';
+    return ex.length ? ' Jídla, která tento uživatel jí opakovaně — jen pro rozpoznání, množství odhadni z fotky: ' + ex.join('; ') + '.' : '';
   }
 
   // Nezávislých odhadů na fotku: Gemini (zdarma) 4× — nejvýš 2 najednou kvůli minutovému limitu
@@ -603,7 +770,7 @@
   const entryFrom = (a, ts, over = {}) => ({
     id: 'p' + Date.now() + Math.random().toString(36).slice(2, 6), n: a.name, q: 1, s: a.C, kcal: a.kcal, b: a.b, t: a.t,
     cs: 'ai-photo', jist: a.jist, sMin: a.sMin, sMax: a.sMax, sSd: a.sSd, meal: 'sv', ts, kat: a.kat, gi: a.gi, fat: a.fat,
-    aiRaw: a.aiRaw, calF: a.factor, aiRuns: a.runs, pv: a.pv, ...(a.items?.length ? { items: a.items } : {}), ...(a.weighed ? { weighed: a.weighed } : {}), ...(a.alc ? { alc: true } : {}), ...over,
+    aiRaw: a.aiRaw, calF: a.factor, aiRuns: a.runs, pv: a.pv, ...(a.dishF && Math.abs(a.dishF - 1) > 0.005 ? { dishF: Math.round(a.dishF * 1000) / 1000 } : {}), ...(a.items?.length ? { items: a.items } : {}), ...(a.weighed ? { weighed: a.weighed } : {}), ...(a.alc ? { alc: true } : {}), ...over,
   });
   async function storeEntry(e, thumb, img) {
     K.day(K.dstr(new Date(e.ts))).e.push(e);
@@ -615,9 +782,11 @@
     K.renderDnes();
   }
   async function autoSave(job) {
-    const a = buildAi(job.result, job.ts, job.weighed);
-    await storeEntry(entryFrom(a, job.ts, { auto: true, ...(job.hint ? { n: job.hint, hint: job.hint } : {}), ...(job.facts?.length ? { facts: job.facts } : {}) }), job.thumb, job.img);
-    K.toast(`Fotka z ${hhmm(job.ts)}: ${r0(a.C)} g — uloženo s odhadem AI (klepnutím upravíte)`);
+    const a0 = buildAi(job.result, job.ts, job.weighed), link = jobLink(job, a0), a = withDish(a0, link);
+    const e = entryFrom(a, job.ts, { auto: true, ...(job.hint ? { n: job.hint, hint: job.hint } : {}), ...(job.facts?.length ? { facts: job.facts } : {}), ...(job.placeName ? { place: job.placeName } : {}) });
+    commitLink(e, link);
+    await storeEntry(e, job.thumb, job.img);
+    K.toast(`Fotka z ${hhmm(job.ts)}: ${r0(a.C)} g — uloženo s odhadem AI${a.dishInfo ? ' a stejného jídla' : ''} (klepnutím upravíte)`);
   }
 
   // Uživatel opravil, co na fotce je (název, množství) → jeho popis platí, fotka doplní zbytek.
@@ -665,14 +834,19 @@
   async function applyReest(job) {
     const f = findEntry(job.entryId);
     if (!f) return;
-    const e = f.e, a = buildAi(job.result, e.ts, job.weighed);
+    const e = f.e, a0 = buildAi(job.result, e.ts, job.weighed);
+    const link = e.dish ? { id: e.dish } : dishByName({ n: job.hint, keys: carbKeys(a0.items), loc: locOf(e.place, e.facts) }, e.id), a = withDish(a0, link, e.id);
+    if (!e.dish) commitLink(e, link);
     Object.assign(e, { aiRaw: a.aiRaw, aiRuns: a.runs, kat: a.kat, fat: a.fat, kcal: a.kcal, b: a.b, t: a.t, jist: a.jist,
       sMin: a.sMin, sMax: a.sMax, sSd: a.sSd, calF: a.factor, hint: job.hint, pv: a.pv });
     if (a.weighed) e.weighed = a.weighed; else delete e.weighed;
     if (a.items?.length) e.items = a.items; else delete e.items;
     if (!e.giUser && a.gi) e.gi = a.gi;
     if (a.alc) e.alc = true; else delete e.alc;
-    if (e.conf == null && !job.keepCarbs) e.s = a.C;
+    if (e.conf == null && !job.keepCarbs) {
+      e.s = a.C;
+      if (a.dishF && Math.abs(a.dishF - 1) > 0.005) e.dishF = Math.round(a.dishF * 1000) / 1000; else delete e.dishF;
+    }
     delete e.ev; delete e.auto;
     K.saveAll(); invalidate(); touchData();
     K.renderDnes();
@@ -695,7 +869,8 @@
   });
 
   function fillForm(job) {
-    const a = buildAi(job.result, job.ts, job.weighed);
+    const a0 = buildAi(job.result, job.ts, job.weighed), link = jobLink(job, a0), a = withDish(a0, link);
+    pending.ai0 = a0; pending.link = link; pending.carbsTouched = false; pending.placeName = job.placeName || null;
     pending.ai = a; pending.filled = true; pending.hint = job.hint || null; pending.facts = job.facts || []; pending.weighed = job.weighed || null;
     renderFacts();
     pending.shownName = job.hint || a.name;
@@ -705,8 +880,17 @@
     $('#cnew-units').value = '';
     $('#cnew-gi').value = a.gi || LEARN.giKey(LEARN.CATS[a.kat]?.dur <= 180 ? 'vysoký' : 'střední') || 'stredni';
     $$('.cnew-ins').forEach(x => x.classList.toggle('hidden', therapy().type === 'none'));
+    $('#cnew-ai').innerHTML = aiHtml(a, job.ts);
+    renderDishSheet();
+    newConf();
+    $('#cnew-status').textContent = '';
+    $('#cnew-retry').classList.add('hidden');
+    $('#cnew-form').classList.remove('hidden');
+  }
+  // Text pod odhadem: AI, kalibrace, jednotlivé běhy, složky, zvážení.
+  function aiHtml(a, ts) {
     const calTxt = Math.abs(a.factor - 1) > 0.02
-      ? ` → podle vašich ověřených jídel (${LEARN.CATS[a.kat].short}${Math.abs(a.blockFactor - 1) > 0.02 ? ', ' + LEARN.BLOCKS[LEARN.blockOf(job.ts)].label.split(' (')[0].toLowerCase() : ''}) ×${dec(Math.round(a.factor * 100) / 100)} = <b>${r0(a.C)} g</b>` : '';
+      ? ` → podle vašich ověřených jídel (${LEARN.CATS[a.kat].short}${Math.abs(a.blockFactor - 1) > 0.02 ? ', ' + LEARN.BLOCKS[LEARN.blockOf(ts)].label.split(' (')[0].toLowerCase() : ''}) ×${dec(Math.round(a.factor * 100) / 100)} = <b>${r0(a.aiRaw * a.factor)} g</b>` : '';
     // Po AI: „Gemini 48 g (5×: 44 · 47 · 48 · 50 · 55)“; u více AI i jejich váha.
     const E = a.E, multi = E.vendors.length > 1;
     const runsTxt = E.n > 1 || E.vendors.some(x => Math.abs(x.fix - 1) > 0.03) ? '<br><span class="muted small-text">' + E.vendors.map(x =>
@@ -721,11 +905,30 @@
       + (wd.disagree?.length ? `<br><b>⚠️ Claude a Gemini se neshodují na složkách: ${wd.disagree.map(esc).join(', ')} — zkontrolujte, co na talíři opravdu je (část vaší hmotnosti připadla i na ně).</b> Pokud tam nejsou, opravte název jídla; toto jídlo se k učení nepoužije.` : '')
       + (wd.ai > 0 ? `<br><span class="muted small-text">AI naslepo odhadla ${wd.what ? 'tuto složku' : 'porci'} na ~${wd.ai} g${Object.keys(wd.per).length > 1 ? ` (${Object.entries(wd.per).map(([v, g]) => `${LEARN.VENDOR_LABEL[v]} ${g} g`).join(' · ')})` : ''} — ${Math.abs(wPct) < 5 ? 'skoro přesně' : `o ${Math.abs(wPct)} % ${wPct < 0 ? 'méně' : 'víc'}`}.${wd.disagree?.length ? '' : ' Z porovnání s váhou se učí opravy jednotlivých AI.'}</span>` : '')
       : a.weighMiss ? `<br><b>⚠️ „${esc(a.weighMiss.what)}" není mezi složkami, které AI na fotce našla — hmotnost ${a.weighMiss.g} g nepoužita.</b> Upřesněte název (např. jak je v seznamu složek níže) přes „⚖️ zvážil jsem…", nebo zadejte hmotnost celého jídla.` : '';
-    $('#cnew-ai').innerHTML = `AI odhad: ${r0(a.aiRaw)} g${wTxt}${calTxt}${runsTxt}${itemsTxt}${failTxt}${alcTxt}${a.poznamka ? '<br>' + esc(a.poznamka) : ''}`;
-    newConf();
-    $('#cnew-status').textContent = '';
-    $('#cnew-retry').classList.add('hidden');
-    $('#cnew-form').classList.remove('hidden');
+    return `AI odhad: ${r0(a.aiRaw)} g${wTxt}${calTxt}${runsTxt}${itemsTxt}${failTxt}${alcTxt}${a.poznamka ? '<br>' + esc(a.poznamka) : ''}`;
+  }
+  // Stejné jídlo v okně: propojené (s tím, co to udělalo s odhadem), jinak návrhy k potvrzení.
+  function renderDishSheet() {
+    const box = $('#cnew-dish'), a = pending?.ai;
+    if (!box || !a) return;
+    if (pending.link) {
+      const li = linkInfo(pending.link);
+      box.innerHTML = `🔁 <b>Stejné jídlo jako „${esc(li.label)}"</b>${li.place ? ' · ' + esc(li.place) : ''} (${li.n}× dřív${pending.link.auto ? ', podle vašeho názvu' : ''})${dishTxt(a.dishInfo, a.C)} <button type="button" id="cnew-dish-off" class="linklike">není to ono</button>`;
+      $('#cnew-dish-off').addEventListener('click', () => setDishLink(null));
+      return;
+    }
+    const c = dishCands({ n: pending.shownName || a.name, keys: carbKeys(a.items), loc: locOf(pending.placeName, pending.facts) });
+    box.innerHTML = c.length ? `🔁 Jedli jste už stejné jídlo? Propojené se porovná s minulými výskyty:<div class="chips">${c.map((g, i) => `<button type="button" class="chip" data-dish="${i}">${candLbl(g)}</button>`).join('')}</div>` : '';
+    $$('#cnew-dish [data-dish]').forEach(b => b.addEventListener('click', () => { const g = c[+b.dataset.dish]; setDishLink({ id: g.id, with: g.with, ...(g.withAll ? { withAll: g.withAll } : {}) }); }));
+  }
+  async function setDishLink(link) {
+    if (!pending?.ai0) return;
+    pending.link = link;
+    pending.ai = withDish(pending.ai0, link);
+    if (!pending.carbsTouched) $('#cnew-carbs').value = r0(pending.ai.C);
+    renderDishSheet(); newConf();
+    const job = await JOBS.get(pending.jobId); // zavření okna uloží jídlo z úlohy → propojení musí být i v ní
+    if (job) { job.dishLink = link; job.dishNo = !link; await JOBS.save(job); }
   }
   // Oprava názvu/množství nebo rychlé upřesnění v okně → nový odhad z téže fotky s údaji uživatele.
   async function rerun(changes, label) {
@@ -751,12 +954,19 @@
     const shown = [...(w?.g > 0 ? [`zváženo ${w.g} g${w.what ? ' ' + w.what : ''}`] : []), ...f];
     $$('#cnew-facts .chip').forEach(b => b.classList.toggle('on', (!!PLACE[b.dataset.fact] && f.includes(PLACE[b.dataset.fact])) || (b.dataset.fact === 'vaha' && w?.g > 0)));
     $('#cnew-facts-list').innerHTML = shown.length ? `Upřesněno: ${shown.map(esc).join(' · ')} <button type="button" id="cnew-facts-clear" class="linklike">zrušit</button>` : '';
-    $('#cnew-facts-clear')?.addEventListener('click', () => rerun({ facts: [], weighed: null }, 'bez upřesnění'));
+    $('#cnew-facts-clear')?.addEventListener('click', () => rerun({ facts: [], weighed: null, placeName: null }, 'bez upřesnění'));
   }
   $$('#cnew-facts .chip').forEach(b => b.addEventListener('click', () => {
     if (!pending?.filled) return;
-    const k = b.dataset.fact, f = (pending.facts || []).filter(x => !Object.values(PLACE).includes(x) || !PLACE[k]);
-    if (PLACE[k]) { if ((pending.facts || []).includes(PLACE[k])) return rerun({ facts: f }, 'bez místa'); f.push(PLACE[k]); }
+    const k = b.dataset.fact, f = (pending.facts || []).filter(x => !PLACE[k] || (!Object.values(PLACE).includes(x) && !/^podnik: /.test(x)));
+    if (PLACE[k]) {
+      if ((pending.facts || []).includes(PLACE[k])) return rerun({ facts: f, placeName: null }, 'bez místa');
+      f.push(PLACE[k]);
+      // název podniku: podle něj se příště pozná stejné jídlo (a AI ví, odkud jídlo je)
+      const pn = k === 'restaurace' ? (prompt('Název podniku? (nepovinné — podle něj se příště pozná stejné jídlo)', pending.placeName || '') || '').trim().slice(0, 60) : '';
+      if (pn) f.push('podnik: ' + pn);
+      return rerun({ facts: f, placeName: pn || null }, f.join('; '));
+    }
     else if (k === 'vaha') {
       const t = prompt('Kolik gramů? Jen číslo = vše na fotce (bez talíře), nebo i čeho, např. „rýže 200“.');
       const m = /(\d+(?:[.,]\d+)?)/.exec(t || '');
@@ -783,7 +993,7 @@
       + (r.driver === 'spread' ? '<br>💡 ' + CONF.TIP.spread
         : cal().sd ? '<br>Počítá s vaší ověřenou přesností AI (±' + r0(cal().sd * 100) + ' %).' : '');
   }
-  $('#cnew-carbs').addEventListener('input', newConf);
+  $('#cnew-carbs').addEventListener('input', () => { if (pending) pending.carbsTouched = true; newConf(); });
 
   function tsFromTime(base, hm) {
     const m = /^(\d{1,2}):(\d{2})$/.exec(hm || '');
@@ -797,13 +1007,15 @@
   $('#cnew-save').addEventListener('click', async () => {
     if (!pending?.ai) return;
     if ($('#cnew-carbs').value.trim() === '') { K.toast('Zadejte sacharidy'); return; }
-    const a = pending.ai, id = pending.jobId, thumb = pending.thumb, hint = pending.hint;
+    const a = pending.ai, id = pending.jobId, thumb = pending.thumb, hint = pending.hint, link = pending.link, place = pending.placeName;
     const img = (await JOBS.get(id))?.img;
     const ts = tsFromTime(pending.ts, $('#cnew-time').value);
     const units = K.num($('#cnew-units').value);
     const C = K.num($('#cnew-carbs').value);
-    const e = entryFrom(a, ts, { n: $('#cnew-name').value.trim() || 'Jídlo', s: C, gi: $('#cnew-gi').value || a.gi, ...(hint ? { hint } : {}), ...(pending.facts?.length ? { facts: pending.facts } : {}) });
+    const e = entryFrom(a, ts, { n: $('#cnew-name').value.trim() || 'Jídlo', s: C, gi: $('#cnew-gi').value || a.gi, ...(hint ? { hint } : {}), ...(pending.facts?.length ? { facts: pending.facts } : {}), ...(place ? { place } : {}) });
     if (units > 0) e.units = units;
+    commitLink(e, link);
+    if (Math.abs(C - a.C) > 0.5) delete e.dishF; // přepsané číslo platí, jak je
     pending = null;
     K.closeSheet('sheet-cnew');
     await JOBS.remove(id);
@@ -875,7 +1087,7 @@
     let h = '';
     if (thumb) h += `<img class="cmeal-photo" src="${thumb.data}" alt="">`;
     h += `<div class="cmeal-head"><div class="ctl-name">${esc(e.n)}</div><div class="e-carb"><span class="e-kcal">${K.fmtC(c.C)}</span>${K.badge(c.p)}</div></div>`;
-    if (e.aiRaw != null) h += `<div class="muted small-text">AI odhad ${r0(e.aiRaw)} g${e.calF && Math.abs(e.calF - 1) > 0.02 ? ' · s vaší kalibrací ×' + dec(Math.round(e.calF * 100) / 100) : ''} · zapsáno ${K.fmtC(e.s)}</div>`;
+    if (e.aiRaw != null) h += `<div class="muted small-text">AI odhad ${r0(e.aiRaw)} g${e.calF && Math.abs(e.calF - 1) > 0.02 ? ' · s vaší kalibrací ×' + dec(Math.round(e.calF * 100) / 100) : ''}${e.dishF ? ' · podle stejného jídla ×' + dec(Math.round(e.dishF * 100) / 100) : ''} · zapsáno ${K.fmtC(e.s)}${e.place ? ' · ' + esc(e.place) : ''}</div>`;
     if (e.items?.length) h += `<div class="muted small-text">Složky: ${e.items.map(i => `${esc(i.n)} ~${i.g} g${i.c >= 1 ? ` (${r0(i.c)} g)` : ''}${i.vis ? '' : ' — předpoklad'}`).join(' · ')}${e.facts?.length ? `<br>Upřesněno: ${e.facts.map(esc).join(' · ')}` : ''}</div>`;
 
     if (e.cs === 'ai-photo' && e.ts) {
@@ -928,11 +1140,12 @@
       else if (ev?.fpuCarbs > 3) h += `<div class="ev-metrics">🧈 Tuk a bílkoviny přidaly v okně ~${r0(ev.fpuCarbs)} g „sacharidů" — započteno zvlášť.</div>`;
       const wEnd = e.ts + LEARN.postFor(asMeal(e)), pendingWin = Date.now() < wEnd;
       if (e.weighed && !pendingWin) {
-        h += `<div class="ev-box">⚖️ Zváženo ${e.weighed.g} g${e.weighed.what ? ' (' + esc(e.weighed.what) + ')' : ''} → ${r0(e.s)} g sacharidů. Slouží jako známé množství — glykémie ho neopravuje, ale ukáže, jak k němu sedí inzulin.</div>`;
+        const dF = e.dishF && e.weighed.c > 0 ? `z váhy ~${r0(e.weighed.c)} g, podle dřívějších výskytů stejného jídla ×${dec(Math.round(e.dishF * 100) / 100)} = ${r0(e.s)} g` : `${r0(e.s)} g`;
+        h += `<div class="ev-box">⚖️ Zváženo ${e.weighed.g} g${e.weighed.what ? ' (' + esc(e.weighed.what) + ')' : ''} → ${dF} sacharidů. Slouží jako známé množství — glykémie ho neopravuje, ale ukáže, jak k němu sedí inzulin.</div>`;
         const ck = ev?.check;
         if (ck && LEARN.REL_SD[ck.quality]) {
           const p = Math.round(Math.abs(ck.ratio - 1) * 100);
-          h += `<div class="ev-metrics">💉 Kontrola inzulinu: se zváženými ${r0(e.s)} g se glykémie chovala jako u ~${r0(ck.implied)} g (±${Math.round(ck.relSd * 100)} %) — ${ck.ratio > 1.1 ? `inzulin k jídlu pokryl o ~${p} % méně, než počítá nastavení pumpy` : ck.ratio < 0.9 ? `inzulin k jídlu pokryl o ~${p} % víc, než počítá nastavení pumpy` : 'inzulin k jídlu odpovídal nastavení pumpy'}.</div>`;
+          h += `<div class="ev-metrics">💉 Kontrola inzulinu: se ${e.dishF ? 'zapsanými' : 'zváženými'} ${r0(e.s)} g se glykémie chovala jako u ~${r0(ck.implied)} g (±${Math.round(ck.relSd * 100)} %) — ${ck.ratio > 1.1 ? `inzulin k jídlu pokryl o ~${p} % méně, než počítá nastavení pumpy` : ck.ratio < 0.9 ? `inzulin k jídlu pokryl o ~${p} % víc, než počítá nastavení pumpy` : 'inzulin k jídlu odpovídal nastavení pumpy'}.</div>`;
         } else if (ev && !ev.check) h += `<div class="muted small-text">Kontrola inzulinu: ${esc((ev.flags || []).filter(f => !/zvážené/.test(f)).join(', ') || 'zatím bez dat')}.</div>`;
       } else if (ev?.implied && LEARN.REL_SD[ev.quality]) {
         const prior = CONF.entrySigma({ C: e.s, kind: 'ai-photo', jist: e.jist, sMin: e.sMin, sMax: e.sMax, sSd: e.sSd, learnedSd: cal().sd }).sigma;
@@ -996,10 +1209,12 @@
       }
       else if (e.excl) h += `<div class="ev-box">Vyřazeno z učení (${esc(e.excl)}).</div><button id="cm-unexcl" class="btn btn-ghost slim">Vrátit do učení</button>`;
       else h += `<div class="ev-actions excl"><select id="cm-excl-why"><option>pohyb nebo sport</option><option>nemoc nebo stres</option><option>jídlo navíc, které tu není</option><option>chyba senzoru</option><option>jiné</option></select><button id="cm-excl" class="btn btn-ghost slim">Vyřadit z učení</button></div>`;
+      h += '<div id="cm-dish"></div>';
     }
 
     h += `<details class="conf-how"><summary>Upravit nebo smazat</summary>
       <label class="field">Název<input id="cm-name" type="text" value="${esc(e.n)}"></label>
+      ${e.cs === 'ai-photo' ? `<label class="field">Podnik <span class="muted">— nepovinné, podle něj se pozná stejné jídlo</span><input id="cm-place" type="text" list="place-list" value="${esc(e.place || '')}"></label>` : ''}
       <div class="tri-row"><label class="field">Sacharidy (g)<input id="cm-carbs" type="text" inputmode="decimal" value="${dec(K.r1(e.s))}"></label>
       <label class="field">Čas<input id="cm-time" type="time" value="${e.ts ? hhmm(e.ts) : ''}"></label></div>
       <label class="field">Rychlost vstřebání<select id="cm-gi"><option value="">podle druhu jídla</option>${Object.entries(LEARN.GI_LABEL).map(([k, l]) => `<option value="${k}"${LEARN.giKey(e.gi) === k ? ' selected' : ''}>${l}</option>`).join('')}</select></label>
@@ -1007,6 +1222,66 @@
       <p class="muted small-text" style="margin-top:10px">Zpětný výpočet z glykémie je orientační (pohyb, stres, tuk a automatika pumpy ho ovlivňují). Nenahrazuje doporučení diabetologa k dávkování inzulinu.</p>`;
     $('#cmeal-body').innerHTML = h;
     bindMeal(e);
+    fillPlaces();
+    renderDishPanel(e);
+  }
+
+  // Detail jídla: dřívější výskyty stejného jídla — jejich křivky přes sebe a čísla (jen popis, ne dávkování);
+  // nepropojené jídlo → návrhy k propojení.
+  function dishChartSVG(rows0, selfId) {
+    const rows = rows0.filter(r => r.readings.length), vals = rows.flatMap(r => r.readings.map(x => x.v));
+    if (!vals.length) return '';
+    const W = 340, H = 150, L = 30, R = 8, T = 8, B = 22;
+    const span = Math.max(...rows.map(r => LEARN.postFor(asMeal(r.e)) / MIN));
+    const xs = m => L + (W - L - R) * (m + 30) / (span + 30);
+    const lo = Math.min(3.5, ...vals) - 0.3, hi = Math.max(11, ...vals) + 0.5;
+    const ys = v => T + (H - T - B) * (1 - (v - lo) / (hi - lo));
+    const band = `<rect x="${L}" y="${ys(10).toFixed(1)}" width="${W - L - R}" height="${(ys(3.9) - ys(10)).toFixed(1)}" class="bg-band"/>`;
+    const meal = `<line x1="${xs(0)}" x2="${xs(0)}" y1="${T}" y2="${H - B}" class="bg-meal"/>`;
+    const cls = (r, i) => (r.e.id === selfId ? 'dl0' : 'dl' + Math.min(4, i + (rows[0].e.id === selfId ? 0 : 1)));
+    const lines = rows.map((r, i) => `<polyline points="${r.readings.filter(x => x.t <= r.e.ts + span * MIN).map(x => xs((x.t - r.e.ts) / MIN).toFixed(1) + ',' + ys(x.v).toFixed(1)).join(' ')}" class="bg-line ${cls(r, i)}"/>`).reverse().join('');
+    const ticksX = [-30, 0, 60, 120, ...(span > 150 ? [180] : []), span].map(m => `<text x="${xs(m)}" y="${H - 6}" class="bg-tick" text-anchor="${m === span ? 'end' : m === -30 ? 'start' : 'middle'}">${m === 0 ? '0' : (m > 0 ? '+' : '') + m}</text>`).join('');
+    const ticksY = [4, 7, 10].filter(v => v > lo && v < hi).map(v => `<text x="${L - 4}" y="${ys(v) + 3}" class="bg-tick" text-anchor="end">${fmtBG(v)}</text>`).join('');
+    const legend = rows.map((r, i) => `<span><i class="dl-key ${cls(r, i)}"></i>${r.e.id === selfId ? 'toto jídlo' : dmy(r.e.ts) + ' ' + hhmm(r.e.ts)}</span>`).join('');
+    return `<svg class="bg-chart" viewBox="0 0 ${W} ${H}">${band}${meal}${lines}${ticksX}${ticksY}</svg><div class="cv-legend">${legend}</div>`;
+  }
+  function occRow(x) {
+    const ev = x.ev, lab = x.conf != null ? `✓ ${r0(x.conf)} g` : x.weighed ? `⚖️ ${r0(x.s)} g${ev?.check?.implied && qOk(ev.check.quality) ? `, glykémie ~${r0(ev.check.implied)} g` : ''}`
+      : ev?.implied && qOk(ev.quality) ? `glykémie ~${r0(ev.implied)} g` : 'bez ověření';
+    const ins = ev?.del?.meal > 0.05 ? ` · bolus ${dec(K.r1(ev.del.meal))} U` : ev?.units > 0 ? ` · inzulin ${dec(K.r1(ev.units))} U` : '';
+    return `<button class="learn-row learn-open" data-id="${x.id}"><span>${dmy(x.ts)} ${hhmm(x.ts)}${x.place ? ' · ' + esc(x.place) : ''}<br><span class="muted small-text">zapsáno ${r0(x.s)} g${ins}${ev?.peak != null ? ` · max ${fmtBG(ev.peak)}` : ''}${ev?.tAbove10 ? ` · nad 10 ${ev.tAbove10} min` : ''}${x.excl ? ' · vyřazeno z učení' : ''}</span></span><b>${lab}</b></button>`;
+  }
+  async function renderDishPanel(e) {
+    const box = $('#cm-dish');
+    if (!box) return;
+    const after = () => { K.saveAll(); invalidate(); touchData(); openMeal(e.id); };
+    const all = dishMembers(e.dish), others = all.filter(x => x.id !== e.id).sort((p, q) => q.ts - p.ts);
+    if (!others.length) {
+      const c = dishCands(dishDesc(e), e.id);
+      box.innerHTML = c.length ? `<div class="ev-box">🔁 Je to stejné jídlo jako dřív? Propojená jídla se porovnávají — další odhad se upraví podle toho, jak u vás dopadla minule.<div class="chips">${c.map((g, i) => `<button type="button" class="chip" data-dl="${i}">${candLbl(g)}</button>`).join('')}</div></div>` : '';
+      $$('#cm-dish [data-dl]').forEach(b => b.addEventListener('click', () => { const g = c[+b.dataset.dl]; commitLink(e, { id: g.id, with: g.with, withAll: g.withAll }); after(); K.toast('Propojeno — porovná se s minulými výskyty'); }));
+      return;
+    }
+    const d = LEARN.dishFactor(all.map(dishResid).filter(Boolean), Date.now()), pct = Math.round(Math.abs(d.f - 1) * 100);
+    const dd = e.weighed && !e.weighed.what ? LEARN.dishFactor(all.map(densResid).filter(Boolean), Date.now()) : null;
+    const next = !d.n ? 'Zatím žádný výskyt ověřený glykémií — oprava se začne učit s prvním ověřeným.'
+      : pct < 2 ? `Podle ${d.n} ${d.n === 1 ? 'ověřeného výskytu' : 'ověřených výskytů'} AI s vaší kalibrací u tohoto jídla odhaduje správně.`
+        : `Podle ${d.n} ${d.n === 1 ? 'ověřeného výskytu' : 'ověřených výskytů'} má toto jídlo o ~${pct} % ${d.f > 1 ? 'víc' : 'méně'} sacharidů, než AI s vaší kalibrací odhaduje — příští fotka se upraví ×${dec(Math.round(d.f * 100) / 100)}.`;
+    const dens = dd?.n ? ` Zvážené: na gram o ~${Math.round(Math.abs(dd.f - 1) * 100)} % ${dd.f > 1 ? 'víc' : 'méně'} sacharidů, než počítá AI (${dd.n}×).` : '';
+    const sh = dishShapeOf(e), shTxt = sh && (sh.nSpeed || sh.nTail) ? ` Křivka: ${sh.nSpeed ? (sh.speed > 1.05 ? `vstřebává se rychleji (×${dec(sh.speed)})` : sh.speed < 0.95 ? `vstřebává se pomaleji (×${dec(sh.speed)})` : 'obvyklá rychlost') : ''}${sh.nTail && sh.tail >= 0.05 ? `${sh.nSpeed ? ', ' : ''}pozdní vlna ~${Math.round(sh.tail * 100)} %` : ''} — počítá se při vyhodnocení.` : '';
+    const more = dishCands(dishDesc(e), e.id, { skipDish: e.dish }); // podobná jídla mimo skupinu → sloučit
+    box.innerHTML = `<div class="ev-box">🔁 <b>Stejné jídlo — ${others.length}× dřív</b><br>${next}${dens}${shTxt}<div id="cm-dish-chart" class="muted small-text">Načítám křivky…</div>
+      ${others.slice(0, 6).map(occRow).join('')}
+      ${more.length ? `<div class="muted small-text" style="margin-top:8px">Podobná jídla zatím mimo — jsou taky stejná?</div><div class="chips">${more.map((g, i) => `<button type="button" class="chip" data-dm="${i}">${candLbl(g)}</button>`).join('')}</div>` : ''}
+      <div class="ev-actions"><button type="button" id="cm-dish-off" class="btn btn-ghost slim">Není to stejné jídlo</button></div>
+      <div class="muted small-text">Jen srovnání z vašich dat — ne doporučení k dávkování.</div></div>`;
+    $('#cm-dish-off').addEventListener('click', () => { delete e.dish; after(); }); // dishF zůstává: popisuje, co je v zapsaném čísle
+    $$('#cm-dish [data-dm]').forEach(b => b.addEventListener('click', () => { for (const x of more[+b.dataset.dm].members) x.dish = e.dish; after(); K.toast('Propojeno se stejným jídlem'); }));
+    $$('#cm-dish .learn-open').forEach(b => b.addEventListener('click', () => openMeal(b.dataset.id)));
+    const show = [e, ...others.filter(x => x.ts < Date.now() - 30 * MIN).slice(0, 4)];
+    const rows = await Promise.all(show.map(async x => ({ e: x, readings: await CGM.range('cgm', x.ts - PRE, x.ts + LEARN.postFor(asMeal(x))).catch(() => []) })));
+    if (openId !== e.id || !$('#cm-dish-chart')) return;
+    $('#cm-dish-chart').outerHTML = dishChartSVG(rows, e.id) || '<div class="muted small-text">Křivky z CGM k těmto jídlům chybí.</div>';
   }
 
   function bindMeal(e) {
@@ -1073,6 +1348,8 @@
       const carbsEdited = K.num($('#cm-carbs').value) !== K.r1(e.s);
       e.n = newName || e.n;
       e.s = K.num($('#cm-carbs').value);
+      if (carbsEdited) delete e.dishF;
+      if ($('#cm-place')) { const p = $('#cm-place').value.trim().slice(0, 60); if (p) e.place = p; else delete e.place; }
       if ($('#cm-gi')) { if ($('#cm-gi').value) { if ($('#cm-gi').value !== LEARN.giKey(e.gi)) e.giUser = true; e.gi = $('#cm-gi').value; } else { delete e.gi; delete e.giUser; } }
       if (renamed && e.cs === 'ai-photo') {
         await JOBS.add({ kind: 'carb-reest', ts: e.ts, entryId: e.id, hint: newName, keepCarbs: carbsEdited, facts: e.facts, weighed: e.weighed, thumb: (await CGM.get('thumbs', e.id).catch(() => null))?.data });
@@ -1257,6 +1534,22 @@
       h += '<div class="card"><div class="card-title">Podle druhu jídla</div>' + cats.map(([k, v]) =>
         `<div class="learn-row"><span>${LEARN.CATS[k].label}<br><span class="muted small-text">${v.n} ověř.${v.nW ? ` · ${v.nW} zvážených` : ''}</span></span><b>${Math.abs(v.factor - 1) < 0.03 ? 'přesné' : 'korekce ' + pctTxt(v.factor)}</b></div>`).join('')
         + (c.nWeighed ? '<p class="muted small-text">Zvážená jídla zpřesňují, jak se druhy jídla liší od sebe; celkovou úroveň dál určuje glykémie (zahrnuje i to, jak k vám sedí poměr v pumpě).</p>' : '') + '</div>';
+    }
+    // Opakovaná jídla: kolik jídel se opakuje a co se z nich aplikace naučila
+    const recentP = all.filter(e => now - e.ts <= 30 * DAY && !e.excl);
+    if (recentP.length) {
+      let linked = 0, likely = 0;
+      for (const e of recentP) {
+        if (dishMembers(e.dish).some(x => x.ts < e.ts)) linked++;
+        else if (dishCands(dishDesc(e), e.id, { max: 1, before: e.ts, skipDish: e.dish }).length) likely++;
+      }
+      const groups = Object.entries(dishIdx().by).filter(([, ms]) => ms.length >= 2).sort((p, q) => q[1].length - p[1].length).slice(0, 12);
+      h += `<div class="card"><div class="card-title">Opakovaná jídla</div><p>Z ${recentP.length} jídel za 30 dní: <b>${linked}</b> propojeno s dřívějším stejným jídlem${likely ? `, <b>${likely}</b> dalších nejspíš stejných (nepropojeno — potvrďte v detailu jídla)` : ''}.</p>`
+        + groups.map(([, ms]) => {
+          const last = ms[ms.length - 1], d = LEARN.dishFactor(ms.map(dishResid).filter(Boolean), now), p = Math.round((d.f - 1) * 100);
+          return `<button class="learn-row learn-open" data-id="${last.id}"><span>${esc(last.n)}<br><span class="muted small-text">${ms.length}×${last.place ? ' · ' + esc(last.place) : ''} · ${d.n} ověř.</span></span><b>${!d.n ? '—' : Math.abs(p) < 2 ? 'sedí' : 'oprava ' + (p > 0 ? '+' : '') + p + ' %'}</b></button>`;
+        }).join('')
+        + '<p class="muted small-text">U propojeného jídla se další odhad upraví podle toho, o kolik se glykémie u jeho dřívějších výskytů lišila od odhadu AI po vaší kalibraci (navíc ke korekci podle druhu jídla, smrštěno: jeden výskyt posune opravu zhruba o třetinu, tři shodné o dvě třetiny). Propojí se jen to, co potvrdíte nebo pojmenujete stejně.</p></div>';
     }
     // Denní doba (zbytková chyba AI po korekci podle druhu jídla)
     const bl = Object.entries(c.blocks || {}).filter(([, v]) => v.n > 0);

@@ -411,6 +411,18 @@ code { font-size: 12.5px; background: var(--track); padding: 1px 5px; border-rad
 .job-btns { display: flex; flex-direction: column; gap: 4px; flex: none; }
 .job-btns .btn { margin-top: 0; padding: 6px 10px; font-size: 13px; }
 .bg-meal2 { stroke-dasharray: 3 2; opacity: .8; }
+/* Opakovaná jídla: dřívější výskyty přes sebe */
+.cnew-dish { margin: 8px 0 4px; line-height: 1.5; }
+.cnew-dish .chips, #cm-dish .chips { margin: 6px 0 2px; }
+.cnew-dish .chip, #cm-dish .chip { font-size: 13px; padding: 6px 10px; text-align: left; }
+#cm-dish .chip { background: var(--card); }
+#cm-dish .learn-row { font-size: 13.5px; padding: 7px 0; }
+.bg-line.dl1 { stroke: var(--amber); stroke-width: 1.6; }
+.bg-line.dl2 { stroke: #a86fc9; stroke-width: 1.6; }
+.bg-line.dl3 { stroke: var(--accent); stroke-width: 1.4; }
+.bg-line.dl4 { stroke: var(--muted); stroke-width: 1.4; }
+.dl-key { display: inline-block; width: 14px; height: 3px; border-radius: 2px; margin-right: 5px; vertical-align: middle; background: var(--blue); }
+.dl-key.dl1 { background: var(--amber); } .dl-key.dl2 { background: #a86fc9; } .dl-key.dl3 { background: var(--accent); } .dl-key.dl4 { background: var(--muted); }
 #sheet-cnew .btn-row { margin-top: 10px; }
 
 .warn-note { background: var(--c-mid-bg); color: var(--text); margin-bottom: 8px; }

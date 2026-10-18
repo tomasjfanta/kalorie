@@ -1124,7 +1124,7 @@
     const gp = prep.filter(s => s.src !== 'weighed');
     const useW = new Set(wp.map(s => s.kat)).size >= 2;
     const KS = Object.keys(CATS);
-    let mu;
+    let mu, qW;
     const cats = {};
     if (useW) {
       const n = KS.length + 2, A = Array.from({ length: n }, (_, i) => Array.from({ length: n }, (_, j) => (i !== j ? 0 : i === 0 ? 1 / PRIOR_G ** 2 : i === 1 ? 1 : 1 / PRIOR_C ** 2))), b = Array(n).fill(0);
@@ -1134,7 +1134,7 @@
       }
       const C = invert(A), sol = C ? C.map(r => r.reduce((a, v, j) => a + v * b[j], 0)) : null;
       if (sol) {
-        mu = sol[0];
+        mu = sol[0]; qW = sol[1];
         KS.forEach((k, i) => { const m = sol[0] + sol[2 + i]; cats[k] = { factor: clamp(Math.exp(m)), n: gp.filter(s => s.kat === k).length, nW: wp.filter(s => s.kat === k).length, mu: m }; });
       }
     }
@@ -1147,6 +1147,9 @@
         const m = (mu / PRIOR_C ** 2 + cs.reduce((a, s) => a + s.w * s.y, 0)) / (1 / PRIOR_C ** 2 + cw);
         cats[k] = { factor: clamp(Math.exp(m)), n: cs.length, nW: 0, mu: m };
       }
+      // Úroveň zvážených jídel (bez společného odhadu): smrštěná k úrovni z glykémie.
+      const ww = wp.reduce((a, s) => a + s.w, 0);
+      qW = (mu / PRIOR_G ** 2 + wp.reduce((a, s) => a + s.w * (s.y - (cats[s.kat].mu - mu)), 0)) / (1 / PRIOR_G ** 2 + ww);
     }
     // Denní doba: co zbude po korekci podle druhu jídla (např. ráno vyšší inzulinová rezistence,
     // kterou nastavení pumpy úplně nepokrývá) — smrštěno k nule, s málo daty bez vlivu.
@@ -1168,7 +1171,7 @@
     // Typická chyba AI před kalibrací (pro srovnání na obrazovce Učení).
     const mapeBefore = gp.length ? median(gp.map(s => Math.abs(Math.exp(s.y) - 1))) : null;
     const mapeAfter = gp.length ? median(gp.map(s => Math.abs(Math.exp(resid(s)) - 1))) : null;
-    return { n: gp.length, nWeighed: useW ? wp.length : 0, nConfirmed: gp.filter(s => s.src === 'confirmed').length, global: clamp(Math.exp(mu)), cats, blocks, sd, mapeBefore, mapeAfter };
+    return { n: gp.length, nWeighed: useW ? wp.length : 0, nConfirmed: gp.filter(s => s.src === 'confirmed').length, global: clamp(Math.exp(mu)), cats, blocks, sd, mapeBefore, mapeAfter, mu, qW };
   }
   const clamp = f => Math.min(1.6, Math.max(0.6, f));
   // Části dne pro kalibraci (místní čas jídla).
@@ -1490,6 +1493,73 @@
     };
   }
 
-  root.LEARN = { applyWeight, mealAbs, learnTail, TAIL_DELAY, TAIL_DUR, PROMPT_V, CARB_TABLE, ITEM_GROUPS, tableText, v2Totals, itemConsensus, vendorFix, CATS, catKey, GI_DUR, GI_LABEL, giKey, absDuration, absorbedFrac, clusterOf, windowEnd, postFor, isHeavy, fpu, fpuAbs, learnSpeed, BLOCKS, blockOf, segmentOf, evaluateSegment, dedupeBoluses, basalBaseline, ensemble, vendorWeights, vendorShares, vendorOf, VENDOR_LABEL, insulinActed, segmentAt, evaluateMeal, dayCurves, dayStatsOf, weeklyTrend, timeOfDay, correctionEpisodes, estimateISF, ratioCheck, calibrate, applyCal, estimateKNone, combine, parseCareLink, REL_SD, MIN };
+  /* ─── Opakovaná jídla: stejné jídlo z historie (často ze stejné restaurace) ───
+     Stejné jídlo pozná uživatel (potvrdí návrh nebo jídlo pojmenuje stejně); aplikace jen navrhuje podle
+     názvu, složek se sacharidy a podniku. U propojeného jídla se učí, o kolik se jeho skutečnost liší od
+     odhadu AI po kalibraci (co kalibrace podle druhu jídla a denní doby nevysvětlí), a jeho tvar křivky. */
+  // Slova názvu bez diakritiky, množství a výplňových slov; češtině (řízek/řízkem, kaše/kaší) stačí první 3 písmena.
+  const DISH_STOP = new Set(['jidlo', 'obed', 'vecere', 'snidane', 'svacina', 'porce', 'porci', 'talir', 'miska', 'misce', 'domaci', 'maly', 'mala',
+    'male', 'velky', 'velka', 'velke', 'nebo', 'bez', 'pro', 'jako', 'cca', 'kus', 'kusy', 'kusu', 'trochu', 'jidla', 'jidelna', 'restaurace']);
+  const dishWords = n => [...new Set(norm(String(n || '').replace(/\([^)]*\)/g, ' ')).split(/[^a-z0-9]+/)
+    .filter(w => w.length >= 3 && !DISH_STOP.has(w) && !/\d/.test(w)).map(w => w.slice(0, 3)))].sort();
+  // Obecný název („Jídlo", „Oběd") — podle něj se jídla nespojují.
+  const genericName = n => !dishWords(n).length;
+  const jac = (A, B) => { if (!A.length || !B.length) return 0; const S = new Set(B), i = A.filter(x => S.has(x)).length; return i / (A.length + B.length - i); };
+  // Místo: 'r:<podnik>' (pojmenovaný podnik), 'r:' (restaurace bez názvu), 'doma', '' (neznámé).
+  const placeKey = p => norm(p).replace(/[^a-z0-9]+/g, ' ').trim();
+  // a, b = { n, w?, keys (klíče složek se sacharidy), loc } → podobnost 0–1. Stejný pojmenovaný podnik přidá,
+  // jiný pojmenovaný podnik ubere; „doma" nepřidává (doma se jí všechno), doma × restaurace mírně ubere.
+  function dishSim(a, b) {
+    const wn = jac(a.w || dishWords(a.n), b.w || dishWords(b.n)), ka = a.keys || [], kb = b.keys || []; // w = předpočítaná slova
+    let s = ka.length && kb.length ? 0.75 * wn + 0.25 * jac(ka, kb) : wn; // klíče složek jsou hrubé (rýže je ve stovce jídel)
+    const la = a.loc || '', lb = b.loc || '';
+    if (la.length > 2 && lb.length > 2 && la.startsWith('r:') && lb.startsWith('r:')) s = la === lb ? Math.min(1, s + 0.15) : s * 0.6;
+    else if ((la === 'doma' && lb.startsWith('r:')) || (lb === 'doma' && la.startsWith('r:'))) s *= 0.8;
+    return s;
+  }
+  // Druh jídla bez bližšího určení („Polévka", „Pizza", „Salát") — dvě různé polévky by se spojily.
+  const DISH_TYPES = new Set(['pol', 'sal', 'piz', 'sen', 'tes', 'chl', 'kas', 'dez', 'bur', 'bag', 'toa', 'dor', 'kol', 'jog', 'mus', 'ovo', 'oma', 'ryz', 'mas', 'bra',
+    'sus', 'wra', 'tor', 'pal', 'vaj', 'vej', 'ome', 'pec', 'zel', 'ryb']);
+  const typeOnly = w => w.length > 0 && w.every(x => DISH_TYPES.has(x));
+  // Stejný název od uživatele (ne obecný) a slučitelné místo → stejné jídlo bez ptaní. Jen druh jídla
+  // („Polévka") stačí, jen když je to i ze stejného pojmenovaného podniku.
+  const sameName = (a, b) => {
+    const wa = dishWords(a.n);
+    if (!wa.length || wa.join(' ') !== dishWords(b.n).join(' ')) return false;
+    const named = a.loc?.length > 2 && b.loc?.length > 2;
+    if (named && a.loc !== b.loc) return false;
+    return !typeOnly(wa) || (named && a.loc === b.loc);
+  };
+
+  // Oprava pro jedno jídlo: occ = [{ ts, y = log(skutečnost / odhad po kalibraci), v = rozptyl výskytu }] →
+  // vážený průměr smrštěný k 0 (= jen kalibrace). Předpoklad N(0; 0,25²), rozptyl výskytu = nejistota štítku²
+  // + AI_NOISE²: jeden výskyt posune opravu zhruba o třetinu, 3 shodné o dvě třetiny, 5 o tři čtvrtiny.
+  const DISH_PRIOR = 0.25;
+  function dishFactor(occ, now) {
+    let P = 1 / DISH_PRIOR ** 2, q = 0, n = 0;
+    for (const o of occ || []) {
+      if (!isFinite(o.y) || !(o.v > 0)) continue;
+      const w = Math.pow(0.5, Math.max(0, (now - o.ts) / 86400000) / HALF_LIFE_D) / o.v;
+      P += w; q += w * o.y; n++;
+    }
+    const m = q / P;
+    return { n, m, sd: Math.sqrt(1 / P), f: clamp(Math.exp(m)) };
+  }
+  // Rychlost a pozdní vlna jednoho jídla z jeho výskytů, smrštěné k hodnotám pro druh jídla (base):
+  // stejné předpoklady jako learnSpeed / learnTail, jen kolem hodnoty druhu jídla místo obecné.
+  // occ = [{ speed?, tail?: { f, sd } }] → { speed|null, nSpeed, tail|null, nTail }
+  function dishShape(occ, base = {}) {
+    const l0 = Math.log(base.speed > 0 ? base.speed : 1), t0 = base.tail > 0 ? base.tail : 0;
+    let Ps = 1 / 0.2 ** 2, qs = 0, ns = 0, Pt = 1 / 0.12 ** 2, qt = 0, nt = 0;
+    for (const o of occ || []) {
+      if (o.speed > 0) { const w = 1 / 0.3 ** 2; Ps += w; qs += w * (Math.log(o.speed) - l0); ns++; }
+      if (o.tail && isFinite(o.tail.f) && o.tail.sd >= 0) { const w = 1 / (o.tail.sd ** 2 + 0.1 ** 2); Pt += w; qt += w * (o.tail.f - t0); nt++; }
+    }
+    const sp = Math.min(1.8, Math.max(0.55, Math.exp(l0 + qs / Ps))), tl = Math.min(0.5, Math.max(0, t0 + qt / Pt));
+    // zaokrouhleno (jako naučená vlna pro druh jídla), aby drobné posuny nepřepočítávaly vyhodnocení
+    return { speed: ns ? Math.round(sp * 20) / 20 : null, nSpeed: ns, tail: nt ? (tl >= 0.05 ? Math.round(tl * 20) / 20 : 0) : null, nTail: nt };
+  }
+
+  root.LEARN = { dishWords, genericName, dishSim, sameName, placeKey, dishFactor, dishShape, AI_NOISE, HALF_LIFE_D, applyWeight, mealAbs, learnTail, TAIL_DELAY, TAIL_DUR, PROMPT_V, CARB_TABLE, ITEM_GROUPS, tableText, v2Totals, itemConsensus, vendorFix, CATS, catKey, GI_DUR, GI_LABEL, giKey, absDuration, absorbedFrac, clusterOf, windowEnd, postFor, isHeavy, fpu, fpuAbs, learnSpeed, BLOCKS, blockOf, segmentOf, evaluateSegment, dedupeBoluses, basalBaseline, ensemble, vendorWeights, vendorShares, vendorOf, VENDOR_LABEL, insulinActed, segmentAt, evaluateMeal, dayCurves, dayStatsOf, weeklyTrend, timeOfDay, correctionEpisodes, estimateISF, ratioCheck, calibrate, applyCal, estimateKNone, combine, parseCareLink, REL_SD, MIN };
   if (typeof module !== 'undefined') module.exports = root.LEARN;
 })(typeof window !== 'undefined' ? window : globalThis);
