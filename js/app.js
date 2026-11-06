@@ -890,6 +890,7 @@ $('#save-ai').addEventListener('click', () => {
   aiCfg = { key: $('#set-ai-key').value.trim(), model: $('#set-ai-model').value,
     claudeUrl: $('#set-claude-url').value.trim().replace(/\/+$/, '') };
   store.set('kal.ai', aiCfg);
+  const health = store.get('kal.aiHealth', {}); delete health.gemini; delete health.claude; store.set('kal.aiHealth', health);
   $('#ai-key-note').textContent = aiCfg.key ? '✓ Klíč uložen — AI odhady jsou připravené.' : 'Bez klíče AI odhady nefungují.';
   toast('Uloženo');
   window.JOBS?.retryAll();
@@ -963,7 +964,7 @@ $('#import-file').addEventListener('change', async e => {
 });
 $('#wipe-btn').addEventListener('click', () => {
   if (!confirm('Opravdu smazat úplně všechna data (deník, váhu, nastavení)? Tohle nejde vrátit.')) return;
-  ['kal.settings', 'kal.days', 'kal.custom', 'kal.products', 'kal.favs', 'kal.recent', 'kal.ai', 'kal.ns', 'kal.nsSync', 'kal.nsLast', 'kal.nsErr', 'kal.clImport', 'kal.dataAt', 'kal.aiLog', 'kal.aiOut', 'kal.migr2', 'kal.migr3', 'kal.migr4', 'kal.migr5', 'kal.cvStats', 'kal.tails', 'kal.nsStatus'].forEach(k => localStorage.removeItem(k));
+  ['kal.settings', 'kal.days', 'kal.custom', 'kal.products', 'kal.favs', 'kal.recent', 'kal.ai', 'kal.ns', 'kal.nsSync', 'kal.nsLast', 'kal.nsErr', 'kal.clImport', 'kal.dataAt', 'kal.aiLog', 'kal.aiOut', 'kal.migr2', 'kal.migr3', 'kal.migr4', 'kal.migr5', 'kal.cvStats', 'kal.tails', 'kal.nsStatus', 'kal.nsUpTo', 'kal.nsTries', 'kal.migr6', 'kal.aiHealth'].forEach(k => localStorage.removeItem(k));
   Promise.resolve(window.CGM?.clearAll()).catch(() => {}).finally(() => location.reload());
 });
 
@@ -975,7 +976,7 @@ window.KAL = {
   days: () => days, day: s => day(s), saveAll, settings: () => settings, saveSettings: () => store.set('kal.settings', settings),
   store, renderDnes, showView, entryConf, groupConf, badge, fmtC, vjTxt, TOL, esc, dstr, todayStr, fmtHuman,
   viewDate: () => viewDate, mealByHour, r0, r1, dec, num,
-  VERSION: 'v32',
+  VERSION: 'v33',
   aiConfig: () => aiCfg,
   setAiModel: m => { aiCfg.model = m; store.set('kal.ai', aiCfg); },  // zapamatuje funkční model ze zálohy
   openQuick,          // prefill rychlého zápisu z AI výsledku

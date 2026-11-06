@@ -401,6 +401,7 @@
 
   /* ─── Průběžná synchronizace a vyhodnocení (bez tlačítek — samo při otevření a každých 5 min) ─── */
   let busy = false;
+  const SYNC_DAYS = 45, SYNC_CHUNK = 7 * DAY; // 7 dní: ~288 hodnot denně, občas dvojitě, a limit 5000 na dotaz
   async function nsAutoSync() {
     // Jednorázově (verze s automatickým bazálem): přeuložit bolusy bez duplicit a stáhnout 3 dny znovu.
     const full = !K.store.get('kal.migr4', false);
@@ -409,16 +410,50 @@
     if (!ns?.url) { if (full) K.store.set('kal.migr4', true); return; }
     const last = +(K.store.get('kal.nsSync', 0) || 0);
     if (!full && Date.now() - last < 5 * MIN) return;
-    const lastR = await CGM.lastKey('cgm').catch(() => null);
-    const from = full ? Date.now() - 3 * DAY : Math.max(Date.now() - 3 * DAY, (lastR?.t || 0) - 60 * MIN);
+    const lastR = await CGM.lastKey('cgm').catch(() => null), now = Date.now();
+    // Odkud stahovat. kal.nsUpTo = dokud je Nightscout stažený (posouvá se jen po úspěchu), takže výpadek se dožene
+    // celý, i když mezitím přišla novější data. Běžně stačí hodina zpět; když nová data nechodí, tak 26 h zpět —
+    // most po novém přihlášení dopošle poslední den. Nové zařízení jen 3 dny; jednorázově (v33) 45 dní zpět,
+    // protože dřívější verze doháněla jen 3 dny (stejně daleko se přepočítávají jídla).
+    const upTo = +(K.store.get('kal.nsUpTo', 0) || 0), backfill = !K.store.get('kal.migr6', false);
+    const from = full || !lastR ? now - 3 * DAY : backfill || !upTo ? now - SYNC_DAYS * DAY
+      : Math.max(now - SYNC_DAYS * DAY, Math.min(upTo, Math.max(lastR.t - 60 * MIN, upTo - 26 * 60 * MIN)));
     try {
-      const r = await CGM.nsSync(ns, from, Date.now());
+      // Po úsecích od nejstaršího: Nightscout vrátí na dotaz jen omezený počet řádků a výpadek uprostřed nic neztratí.
+      let changed = false, frozen = false;
+      for (let a = from; a < now; a += SYNC_CHUNK) {
+        const b = Math.min(now, a + SYNC_CHUNK);
+        let r;
+        // Starší úsek, který selže, nesmí zastavit čerstvá data: přeskočit a příště zkusit znovu (mark se neposune).
+        try { r = await CGM.nsSync(ns, a, b, { status: b === now }); }
+        catch (e) { if (e.message === 'auth' || b === now) throw e; frozen = true; continue; }
+        const had = K.store.get('kal.nsLast', null);
+        if (r.last && r.last.t > (had?.t || 0)) K.store.set('kal.nsLast', { t: r.last.t, v: r.last.v });
+        if (r.status) K.store.set('kal.nsStatus', r.status);
+        if (r.readings || r.boluses || r.basal || r.bgm) { changed = true; if (a < now - 2 * DAY) dropDayStats(a, b); }
+        if (r.partial) frozen = true; // nenačtené bolusy nebo bazál → tento úsek příště znovu
+        if (!frozen) K.store.set('kal.nsUpTo', b);
+      }
       K.store.set('kal.nsSync', Date.now());
-      K.store.set('kal.nsLast', r.last ? { t: r.last.t, v: r.last.v } : K.store.get('kal.nsLast', null));
-      if (r.status) K.store.set('kal.nsStatus', r.status);
-      if (r.readings || r.boluses || r.basal || r.bgm) touchData();
+      K.store.set('kal.nsErr', null);
+      if (changed) touchData();
       if (full) K.store.set('kal.migr4', true);
-    } catch (e) { K.store.set('kal.nsErr', { at: Date.now(), msg: e.message }); }
+      // Úsek, který selhává pořád, nesmí každých 5 min znovu stahovat celé dny: po 3 pokusech se přeskočí.
+      const tries = frozen ? +(K.store.get('kal.nsTries', 0) || 0) + 1 : 0;
+      K.store.set('kal.nsTries', tries >= 3 ? 0 : tries);
+      if (!frozen || tries >= 3) { K.store.set('kal.nsUpTo', now); K.store.set('kal.migr6', true); }
+    } catch (e) {
+      const prev = K.store.get('kal.nsErr', null);
+      K.store.set('kal.nsErr', { at: Date.now(), msg: e.message, since: prev?.msg === e.message && prev.since ? prev.since : Date.now() });
+    }
+  }
+  // Doplněná data za starší dny: souhrny těch dnů (Vývoj po týdnech) spočítat znovu — jejich podpis data z CGM neobsahuje.
+  function dropDayStats(a, b) {
+    const st = K.store.get('kal.cvStats', null);
+    if (!st?.days) return;
+    let hit = false;
+    for (let t = a; t < b + DAY; t += DAY) { const k = K.dstr(new Date(t)); if (st.days[k]) { delete st.days[k]; hit = true; } }
+    if (hit) K.store.set('kal.cvStats', st);
   }
   async function prunePhotos() {
     if (Date.now() - (+(K.store.get('kal.photoPrune', 0) || 0)) < DAY) return;
@@ -487,8 +522,8 @@
     if (!ns?.url || !last?.t || K.viewDate() !== K.todayStr()) return '';
     const age = Date.now() - last.t;
     if (age < 30 * MIN) return '';
-    const ago = age > DAY ? 'před více než dnem' : age >= 120 * MIN ? `před ${dec(K.r1(age / 3600e3))} h` : `před ${Math.round(age / MIN)} min`;
-    const when = `Poslední glykémie ze senzoru je z ${hhmm(last.t)} (${ago}).`;
+    const ago = age >= 2 * DAY ? `před ${Math.floor(age / DAY)} dny` : age > DAY ? 'před více než dnem' : age >= 120 * MIN ? `před ${dec(K.r1(age / 3600e3))} h` : `před ${Math.round(age / MIN)} min`;
+    const when = `Poslední glykémie ze senzoru je z ${K.dstr(new Date(last.t)) === K.todayStr() ? '' : dmy(last.t) + ' '}${hhmm(last.t)} (${ago}).`;
     const tip = 'Aby šla jídla ověřit i bez senzoru, změřte glukometrem glykémii těsně před jídlem a asi 2 a 3 h po něm — hodnoty z glukometru propojeného s pumpou se načtou samy, ostatní zapište tlačítkem 🩸 níže.';
     const pumpFresh = st?.t && Date.now() - st.t < 30 * MIN;
     const bad = s => s && s !== 'NO_ERROR_MESSAGE';
@@ -499,6 +534,29 @@
     if (pumpFresh) return `<div class="result-note warn-note">🩸 Pumpa data posílá, ale glykémie ze senzoru ne. ${when} Zkontrolujte senzor v pumpě. ${tip}</div>`;
     return `<div class="result-note warn-note">⚠️ ${when} Z pumpy nepřichází nic — když to trvá, odhlásil se nejspíš most k CareLinku (na počítači spusťte znovu přihlášení), případně není telefon s MiniMed Mobile u pumpy.</div>`;
   }
+  // Nightscout teď nejde stáhnout (poslední pokus selhal a od té doby se nepovedl žádný).
+  const nsFailing = () => { const e = K.store.get('kal.nsErr', null); return e && e.at > (+(K.store.get('kal.nsSync', 0) || 0)) ? e : null; };
+  // Co se samo nespraví a čeká na uživatele. Varování zmizí samo, jakmile to znovu funguje.
+  function alertsTxt() {
+    if (K.viewDate() !== K.todayStr()) return '';
+    const ns = K.store.get('kal.ns', null), nsE = ns?.url ? nsFailing() : null, h = K.store.get('kal.aiHealth', {});
+    const c = AI.claudeReady() ? h.claude : null, g = K.aiConfig().key ? h.gemini : null;
+    const od = t => `od ${K.dstr(new Date(t)) === K.todayStr() ? '' : dmy(t) + ' '}${hhmm(t)}`;
+    const box = (x, go) => `<div class="result-note warn-note">${x}${go ? ` <button type="button" class="linklike" data-goto="nastaveni">Otevřít Nastavení</button> → ${go}.` : ''}</div>`;
+    const out = [];
+    const data = 'Data z CGM a pumpy', tail = ' Token se změní pokaždé, když se změní heslo Nightscoutu. Čekající fotky se po opravě dokončí samy.';
+    if (nsE?.msg === 'auth') out.push(box(`🔑 <b>Nightscout odmítá token aplikace</b> (${od(nsE.since || nsE.at)}). Nenačítají se glykémie ani inzulin a Claude fotky neodhaduje.${tail}`, data));
+    else if (c?.error === 'claude-auth') out.push(box(`🔑 <b>Server Claude nepřijal token Nightscoutu</b> (${od(c.since)}). Fotky teď odhaduje nanejvýš Gemini.${tail}`, data));
+    if (c?.error === 'claude-login') out.push(box(`🔑 <b>Server Claude není přihlášený k předplatnému</b> (${od(c.since)}). Fotky teď odhaduje nanejvýš Gemini. Oprava je na počítači: nový CLAUDE_CODE_OAUTH_TOKEN na Railway (claude setup-token).`));
+    if (g?.error === 'auth') out.push(box(`🔑 <b>Google odmítl API klíč pro Gemini</b> (${od(g.since)}).`, 'AI odhady'));
+    // Výpadek spojení bývá krátký — hlásit až po půl hodině a jen když je telefon online.
+    if (nsE && nsE.msg !== 'auth' && navigator.onLine !== false && nsE.at - (nsE.since || nsE.at) >= 30 * MIN) {
+      out.push(box(`⚠️ <b>Nightscout neodpovídá</b> (${od(nsE.since)}${/^http/.test(nsE.msg) ? ', chyba ' + esc(nsE.msg.slice(5)) : ''}). Aplikace to zkouší dál sama a chybějící data si dožene.`));
+    }
+    return out.join('');
+  }
+  // Staré údaje vysvětlovat mostem k CareLinku jen tehdy, když Nightscout odpovídá — jinak je příčina jinde.
+  const topNotes = () => alertsTxt() + (nsFailing() ? '' : staleTxt());
   // Měření z glukometru zobrazeného dne (načtou se z IndexedDB; po načtení se časová osa překreslí).
   let meterDay = { key: null, rows: [] };
   const dayBounds = key => { const [y, m, d] = key.split('-').map(Number); return [new Date(y, m - 1, d).getTime(), new Date(y, m - 1, d + 1).getTime()]; };
@@ -526,12 +584,12 @@
     const es = [...(K.day().e || [])].sort((a, b) => (b.ts || 0) - (a.ts || 0));
     const mrows = meterDay.key === K.viewDate() ? meterDay.rows : [];
     if (!es.length && !mrows.length) {
-      box.innerHTML = staleTxt() + meterForm() + '<div class="result-note">Zatím žádné jídlo. Vyfoťte talíř — AI odhadne sacharidy a glykémie z CGM pak odhad ověří a zpřesní další.</div>';
+      box.innerHTML = topNotes() + meterForm() + '<div class="result-note">Zatím žádné jídlo. Vyfoťte talíř — AI odhadne sacharidy a glykémie z CGM pak odhad ověří a zpřesní další.</div>';
       bindMeterForm();
       return;
     }
     const items = [...es.map(e => ({ t: e.ts || 0, e })), ...mrows.map(r => ({ t: r.t, r }))].sort((a, b) => b.t - a.t);
-    box.innerHTML = staleTxt() + meterForm() + items.map(({ e, r }) => {
+    box.innerHTML = topNotes() + meterForm() + items.map(({ e, r }) => {
       if (r) return `<button class="ctl-row ctl-bgm" data-bgm="${r.t}"><span class="ctl-thumb bgm-ico">🩸</span><span class="ctl-mid"><span class="ctl-name">Glukometr ${fmtBG(r.v)} ${uLbl()}</span><span class="ctl-sub">${hhmm(r.t)} · ${r.src === 'pumpa' ? 'z pumpy' : 'zapsáno ručně'}</span></span></button>`;
       const c = K.entryConf(e);
       const sub = (e.ts ? hhmm(e.ts) + ' · ' : '') + (e.auto && e.conf == null ? 'uloženo bez potvrzení · ' : '') + (e.cs === 'ai-photo' ? status(e) : 'ruční zápis');
@@ -823,6 +881,7 @@
     },
     save: autoSave,
     failed: job => {
+      renderTimeline(); // varování na Dnes (odmítnutý token…)
       if (!pending || pending.jobId !== job.id || !sheetOpen()) return;
       $('#cnew-status').innerHTML = esc(job.lastErr) + `<br><b>📌 Fotka je uložená.</b> Další pokus sám v ${hhmm(job.nextAt)}.`;
       $('#cnew-retry').classList.remove('hidden');
@@ -866,6 +925,7 @@
     },
     present: () => false, // výsledek se rovnou zapíše do jídla
     save: applyReest,
+    failed: () => renderTimeline(),
   });
 
   function fillForm(job) {
@@ -1640,7 +1700,7 @@
     }
     const ns = K.store.get('kal.ns', null), nsLast = K.store.get('kal.nsLast', null), cl = K.store.get('kal.clImport', null), nsErr = K.store.get('kal.nsErr', null);
     h += '<div class="card"><div class="card-title">Zdroj glykémie</div>';
-    if (ns?.url) h += `<p>Nightscout: ${nsLast ? 'poslední hodnota ' + fmtBG(nsLast.v) + ' ' + uLbl() + ' v ' + hhmm(nsLast.t) + ' (' + K.fmtHuman(K.dstr(new Date(nsLast.t))) + ')' : 'zatím bez dat'}${nsErr && nsErr.at > (K.store.get('kal.nsSync', 0) || 0) ? ' · <span class="warn">chyba spojení</span>' : ''}</p>`;
+    if (ns?.url) h += `<p>Nightscout: ${nsLast ? 'poslední hodnota ' + fmtBG(nsLast.v) + ' ' + uLbl() + ' v ' + hhmm(nsLast.t) + ' (' + K.fmtHuman(K.dstr(new Date(nsLast.t))) + ')' : 'zatím bez dat'}${nsErr && nsErr.at > (K.store.get('kal.nsSync', 0) || 0) ? ` · <span class="warn">${nsErr.msg === 'auth' ? 'token odmítnut' : 'chyba spojení'}</span>` : ''}</p>`;
     if (cl) h += `<p>Export z CareLinku: ${cl.readings} hodnot${cl.first ? ' (' + K.fmtHuman(K.dstr(new Date(cl.first))) + ' – ' + K.fmtHuman(K.dstr(new Date(cl.last))) + ')' : ''}.</p>`;
     if (!ns?.url && !cl) h += `<p class="muted">Není nastavený žádný zdroj. Bez glykémie se aplikace učit nemůže.</p><button class="btn btn-ghost" data-goto="nastaveni">Nastavit zdroj dat</button>`;
     h += `<p class="muted small-text">Čeká na 2,5 h po jídle: ${pend} · bez dat k ověření: ${noData}</p></div>`;
@@ -1701,8 +1761,12 @@
       const rows = await CGM.nsFetch(cfg, '/api/v1/entries/sgv.json', { count: '1' });
       K.store.set('kal.ns', cfg);
       K.store.set('kal.nsSync', 0);
+      // Nový token platí: varování pryč a čekající fotky hned znovu (jinak by čekaly až hodinu).
+      K.store.set('kal.nsErr', null);
+      const h = K.store.get('kal.aiHealth', {}); delete h.claude; K.store.set('kal.aiHealth', h);
+      JOBS.retryAll();
       const r = rows?.[0];
-      $('#ns-status').textContent = r ? `✓ Připojeno — poslední glykémie ${fmtBG(r.sgv / MG)} ${uLbl()} (${hhmm(r.date)}).` : '✓ Připojeno, ale Nightscout zatím nemá žádné hodnoty.';
+      $('#ns-status').textContent = r ? `✓ Připojeno — poslední glykémie ${fmtBG(r.sgv / MG)} ${uLbl()} (${hhmm(r.date)}).` : '✓ Připojeno, token platí. Nightscout ale v posledních dnech nemá žádné hodnoty — nejspíš neběží most k CareLinku (na počítači spusťte znovu přihlášení).';
       refresh();
     } catch (e) {
       $('#ns-status').textContent = e.message === 'auth' ? 'Token nemá oprávnění ke čtení — v Nightscoutu vytvořte token s rolí „readable".'

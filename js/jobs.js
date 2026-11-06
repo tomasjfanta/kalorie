@@ -163,7 +163,7 @@
   const ERR_LABEL = {
     quota: 'limit vyčerpán', model: 'model nedostupný', network: 'síť / časový limit', truncated: 'odpověď useknutá',
     blocked: 'odmítnuto filtrem', empty: 'prázdná odpověď', parse: 'nečitelná odpověď', auth: 'neplatný klíč',
-    nokey: 'chybí klíč', api: 'chyba serveru AI', 'claude-auth': 'Claude: token Nightscoutu', 'claude-login': 'Claude: nepřihlášen',
+    nokey: 'chybí klíč', api: 'chyba serveru AI', 'claude-auth': 'Claude: token Nightscoutu', 'claude-login': 'Claude: nepřihlášen', 'claude-ns': 'Claude: Nightscout nedostupný',
     noclaude: 'Claude nenastaven', app: 'chyba aplikace',
   };
   function renderDiag() {

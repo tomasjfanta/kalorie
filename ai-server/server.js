@@ -89,6 +89,8 @@ async function authorized(token) {
   const until = authCache.get(token);
   if (until && until > Date.now()) return true;
   const r = await fetch(`${NS_URL}/api/v1/verifyauth?token=${encodeURIComponent(token)}`, { signal: AbortSignal.timeout(10000) });
+  // Nightscout mimo provoz není špatný token: aplikace by hlásila „token odmítnut" (volající odpoví 503 nightscout).
+  if (!r.ok && r.status !== 401 && r.status !== 403) throw new Error('nightscout ' + r.status);
   const ok = r.ok && (await r.json().catch(() => ({})))?.message?.canRead === true;
   if (ok) authCache.set(token, Date.now() + 30 * 60 * 1000);
   return ok;

@@ -80,16 +80,17 @@
   const modelUnavailable = (status, msg) =>
     (status === 404) || /no longer available|not available for free|not supported|not found/i.test(msg || '');
 
-  async function callModel(model, key, body) {
+  async function callModel(model, key, body, stop) {
     let r;
+    const timeout = AbortSignal.timeout(60000); // zaseknutý požadavek nesmí blokovat ostatní odhady
     try {
       r = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${encodeURIComponent(key)}`, {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify(body),
-        signal: AbortSignal.timeout(60000), // zaseknutý požadavek nesmí blokovat ostatní odhady
+        signal: stop && AbortSignal.any ? AbortSignal.any([timeout, stop]) : timeout,
       });
-    } catch (e) { return { error: 'network' }; }
+    } catch (e) { return { error: stop?.aborted ? 'cancelled' : 'network' }; }
     if (!r.ok) {
       let msg = '';
       try { msg = (await r.json()).error?.message || ''; } catch (e) { /* ignore */ }
@@ -99,7 +100,8 @@
       if (r.status === 429) return { error: 'quota' };
       return { error: 'api', status: r.status, msg };
     }
-    return { response: await r.json() };
+    try { return { response: await r.json() }; }
+    catch (e) { if (stop?.aborted) return { error: 'cancelled' }; throw e; }
   }
 
   // Zápis pokusu do deníku AI (jobs.js) — každý model zvlášť, s dobou trvání a důvodem chyby.
@@ -131,7 +133,8 @@
     let out = null, retired = false, tries = 0;
     for (let i = 0; i < chain.length;) {
       const model = chain[i], t0 = Date.now();
-      out = await callModel(model, c.key, body);
+      out = await callModel(model, c.key, body, args.signal);
+      if (out.error === 'cancelled') return out; // zrušeno (Claude už odpověděl) — není to chyba Gemini, do deníku nepatří
       if (out.response) {
         if (model !== c.model && retired) window.KAL.setAiModel(model); // zapamatuj funkční model
         const parsed = parseAnswer(out.response);
@@ -147,6 +150,7 @@
       if (Date.now() + wait + 8000 > deadline) break;
       if (quota && tries === 2) i = (i + 1) % chain.length; // limit drží → jeden pokus s jiným modelem (vlastní limit)
       await sleep(wait);
+      if (args.signal?.aborted) return { error: 'cancelled' };
     }
     return out;
   }
@@ -178,32 +182,58 @@
       diag(args, { vendor: 'claude', model: j.model, ok: true, ms: Date.now() - t0, tok: j.usage, pv: args.pv, ...runInfo(j.result) });
       return { result: j.result, model: j.model };
     }
-    const out = { error: r.status === 401 ? 'claude-auth' : j.error === 'not-logged-in' ? 'claude-login'
+    const out = { error: r.status === 401 ? 'claude-auth' : j.error === 'not-logged-in' ? 'claude-login' : j.error === 'nightscout' ? 'claude-ns'
       : r.status === 429 ? 'quota' : 'api', status: r.status, msg: j.detail || j.error };
     diag(args, { vendor: 'claude', ok: false, err: out.error, status: r.status, msg: out.msg, ms: Date.now() - t0, pv: args.pv });
     return out;
   }
 
+  // Chyby, které se samy nespraví (na rozdíl od limitu, přetížení nebo sítě) — čekají na uživatele.
+  const LASTING = ['claude-auth', 'claude-login', 'auth', 'nokey', 'noclaude'];
   // Několik nezávislých odhadů téže fotky najednou, i od různých AI (souběžně, takže skoro stejně
   // rychle jako jeden). Jediný odhad z jedné fotky se při opakování znatelně liší — medián je
   // stabilnější a rozptyl ukazuje, jak nejistá je právě tahle fotka. plan: { gemini: 5, claude: 2 }.
   // Vrací { runs: [{ result, model }], errors: { gemini?, claude? } }, nebo chybu, když neuspělo nic.
+  // Jakmile doběhnou běhy Claude a aspoň jeden uspěl, na Gemini se nečeká a jeho další pokusy se zruší (přetížený
+  // bezplatný klíč by fotku zdržel až o minutu a dál by čerpal limit); počítá se, co Gemini do té doby stihl.
+  // Když Claude neuspěje, čeká se na Gemini jako dřív.
   async function callRuns(args, plan, onProgress) {
-    const jobs = [];
+    const jobs = [], stop = new AbortController();
     let active = 0;
     const queue = [], gate = () => new Promise(res => { if (active < 2) { active++; res(); } else queue.push(res); });
     const release = () => { const next = queue.shift(); if (next) next(); else active--; };
     for (let i = 0; i < (plan.gemini || 0); i++) jobs.push(['gemini', async () => {
       await sleep(i * 700); await gate();
-      try { return await callGemini({ ...args, temperature: null }); } finally { release(); }
+      try { return stop.signal.aborted ? { error: 'cancelled' } : await callGemini({ ...args, temperature: null, signal: stop.signal }); } finally { release(); }
     }]);
     for (let i = 0; i < (plan.claude || 0); i++) jobs.push(['claude', () => callClaude(args)]);
-    let done = 0;
-    const all = await Promise.all(jobs.map(([v, run]) => run().then(r => { onProgress?.(++done, jobs.length); return { ...r, v }; })));
+    let done = 0, over = false;
+    const finished = [];
+    const running = jobs.map(([v, run], i) => run().then(r => {
+      const x = { ...r, v, i };
+      if (!over) { finished.push(x); onProgress?.(++done, jobs.length); } // pozdní běh už nesmí přepsat hotové okno
+      return x;
+    }));
+    const never = new Promise(() => {}), claudes = running.filter((_, i) => jobs[i][0] === 'claude');
+    const claudeAnswered = claudes.length ? Promise.all(claudes).then(rs => (rs.some(r => r.result) ? true : never)) : never;
+    await Promise.race([Promise.all(running), claudeAnswered]);
+    over = true; stop.abort();
+    const all = finished.filter(r => r.error !== 'cancelled').sort((p, q) => p.i - q.i);
     const ok = all.filter(r => r.result), errors = {};
     // Chyba se hlásí jen u AI, která neodpověděla ani jednou (jeden vypadlý běh z pěti nevadí).
     for (const r of all) if (!r.result && !errors[r.v] && !ok.some(o => o.v === r.v)) errors[r.v] = r;
-    return ok.length ? { runs: ok, errors } : (errors.gemini || errors.claude || { error: 'empty' });
+    // Trvalá chyba se zapamatuje pro varování na Dnes (carb.js); první úspěch té AI ji smaže.
+    const store = window.KAL.store, health = store.get('kal.aiHealth', {});
+    for (const v of new Set(all.map(r => r.v))) {
+      const rs = all.filter(r => r.v === v), bad = rs.find(r => LASTING.includes(r.error));
+      if (rs.some(r => r.result)) delete health[v];
+      else if (bad) health[v] = { error: bad.error, since: health[v]?.error === bad.error ? health[v].since : Date.now() };
+    }
+    store.set('kal.aiHealth', health);
+    if (ok.length) return { runs: ok, errors };
+    // Selhalo všechno: ukázat chybu, kterou jde opravit — „limit vyčerpán" od Gemini by jinak schoval odmítnutý token.
+    const lasting = LASTING.map(x => Object.values(errors).find(e => e.error === x)).find(Boolean);
+    return lasting || errors.gemini || errors.claude || { error: 'empty' };
   }
 
   // Přečte odpověď Gemini. Pro deník chyb vrací i důvod konce, spotřebu tokenů (včetně
@@ -247,6 +277,7 @@
       case 'noclaude': return 'Claude není nastavený (Nastavení → AI odhady → adresa serveru Claude a token Nightscoutu).';
       case 'claude-auth': return 'Server Claude nepřijal token Nightscoutu — zkontrolujte ho v Nastavení → Data z CGM a pumpy.';
       case 'claude-login': return 'Server Claude není přihlášený k vašemu předplatnému (proměnná CLAUDE_CODE_OAUTH_TOKEN na Railway).';
+      case 'claude-ns': return 'Server Claude se teď nemůže spojit s Nightscoutem, aby ověřil token. Zkusí se to znovu samo.';
       case 'auth': return 'API klíč je neplatný. Zkontrolujte ho v Nastavení → AI odhady.';
       case 'quota': return 'Bezplatný limit je teď vyčerpaný (příliš požadavků). Zkuste to za minutu, případně zítra.';
       case 'model': return 'Žádný z AI modelů teď není pro bezplatný klíč dostupný. Zkuste to později.';

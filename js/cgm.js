@@ -94,20 +94,22 @@
   const normBolus = b => ({ ...b, t: bolusKey(b.t, b.u), t0: b.t });
 
   // Stáhne glykémie, bolusy a automatický bazál za období a uloží je; vrací počty.
-  async function nsSync(cfg, from, to) {
+  // opts.status === false: bez stavu pumpy (při dohánění ho chce jen nejnovější úsek). partial = nenačetly se
+  // bolusy nebo bazál — výpočet na nich stojí, takže se ten úsek má stáhnout znovu.
+  async function nsSync(cfg, from, to, opts = {}) {
     const sgv = await nsFetch(cfg, '/api/v1/entries/sgv.json', {
       'find[date][$gte]': String(from), 'find[date][$lte]': String(to), count: '5000',
     });
     const readings = (sgv || []).filter(x => x.sgv > 0 && x.date).map(x => ({ t: x.date, v: x.sgv / MG }));
     await put('cgm', readings);
     const win = { 'find[created_at][$gte]': new Date(from).toISOString(), 'find[created_at][$lte]': new Date(to).toISOString() };
-    let boluses = [], basal = [];
+    let boluses = [], basal = [], partial = false;
     try {
       const tr = await nsFetch(cfg, '/api/v1/treatments.json', { ...win, 'find[insulin][$gt]': '0', count: '3000' });
       boluses = (tr || []).filter(x => x.insulin > 0).map(x => normBolus({ t: Date.parse(x.created_at), u: +x.insulin, src: 'ns:' + (x.eventType || '') }))
         .filter(b => isFinite(b.t));
       await put('bolus', boluses);
-    } catch (e) { /* ošetření nejsou povinná — glykémie stačí pro náhled */ }
+    } catch (e) { partial = true; /* ošetření nejsou povinná — glykémie stačí pro náhled */ }
     try {
       const tc = await nsFetch(cfg, '/api/v1/treatments.json', { ...win, 'find[carbs][$gt]': '0', count: '2000' });
       await put('pcarbs', (tc || []).filter(x => x.carbs > 0 && isFinite(Date.parse(x.created_at)))
@@ -125,7 +127,7 @@
       basal = (tb || []).filter(x => x.absolute != null && isFinite(Date.parse(x.created_at)))
         .map(x => ({ t: basalKey(Date.parse(x.created_at)), r: +x.absolute }));
       await put('basal', basal);
-    } catch (e) { /* bez automatického bazálu se počítá jako dřív */ }
+    } catch (e) { partial = true; /* bez automatického bazálu se počítá jako dřív */ }
     let bgm = [];
     try {
       // Glukometr: hodnota z pumpy (měřič propojený s pumpou nebo zadaná do pumpy). Jednotky Nightscout
@@ -138,12 +140,12 @@
       await put('bgm', bgm);
     } catch (e) { /* glukometr je jen doplněk */ }
     let status = null;
-    try {
+    if (opts.status !== false) try {
       // Stav pumpy a senzoru (most ho posílá každých 5 min) — rozliší „senzor nesnímá" od „most neběží".
       const d = (await nsFetch(cfg, '/api/v1/devicestatus.json', { count: '1' }))?.[0];
       if (d) status = { t: d.mills || Date.parse(d.created_at), pump: d.pump?.status?.status || null, sensor: d.sensor?.sensorState || null, suspended: !!d.pump?.status?.suspended };
     } catch (e) { /* stav je jen doplněk */ }
-    return { readings: readings.length, boluses: boluses.length, basal: basal.length, bgm: bgm.length, status, last: readings.reduce((a, r) => r.t > (a?.t || 0) ? r : a, null) };
+    return { readings: readings.length, boluses: boluses.length, basal: basal.length, bgm: bgm.length, status, partial, last: readings.reduce((a, r) => r.t > (a?.t || 0) ? r : a, null) };
   }
 
   // Jednorázově: bolusy uložené dřívější verzí (s duplicitami) přeuložit pod nové klíče.
